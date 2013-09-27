@@ -7,7 +7,7 @@
  *
  * This file is released under the GPLv2.
  *
- * In the file "/sys/module/dm_verity/parameters/prefetch_cluster" you can set
+ * In the file "/sys/module/dm_mintegrity/parameters/prefetch_cluster" you can set
  * default prefetch value. Data are read in "prefetch_cluster" chunks from the
  * hash device. Setting this greatly improves performance when data and hash
  * are on the same disk on different partitions on devices with poor random
@@ -20,19 +20,19 @@
 #include <linux/device-mapper.h>
 #include <crypto/hash.h>
 
-#define DM_MSG_PREFIX			"verity"
+#define DM_MSG_PREFIX			"mintegrity"
 
-#define DM_VERITY_IO_VEC_INLINE		16
-#define DM_VERITY_MEMPOOL_SIZE		4
-#define DM_VERITY_DEFAULT_PREFETCH_SIZE	262144
+#define DM_MINTEGRITY_IO_VEC_INLINE		16
+#define DM_MINTEGRITY_MEMPOOL_SIZE		4
+#define DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE	262144
 
-#define DM_VERITY_MAX_LEVELS		63
+#define DM_MINTEGRITY_MAX_LEVELS		63
 
-static unsigned dm_verity_prefetch_cluster = DM_VERITY_DEFAULT_PREFETCH_SIZE;
+static unsigned dm_mintegrity_prefetch_cluster = DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE;
 
-module_param_named(prefetch_cluster, dm_verity_prefetch_cluster, uint, S_IRUGO | S_IWUSR);
+module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRUGO | S_IWUSR);
 
-struct dm_verity {
+struct dm_mintegrity {
 	struct dm_dev *data_dev;
 	struct dm_dev *hash_dev;
 	struct dm_target *ti;
@@ -60,11 +60,11 @@ struct dm_verity {
 	struct workqueue_struct *verify_wq;
 
 	/* starting blocks for each tree level. 0 is the lowest level. */
-	sector_t hash_level_block[DM_VERITY_MAX_LEVELS];
+	sector_t hash_level_block[DM_MINTEGRITY_MAX_LEVELS];
 };
 
-struct dm_verity_io {
-	struct dm_verity *v;
+struct dm_mintegrity_io {
+	struct dm_mintegrity *v;
 
 	/* original values of bio->bi_end_io and bio->bi_private */
 	bio_end_io_t *orig_bi_end_io;
@@ -80,7 +80,7 @@ struct dm_verity_io {
 	struct work_struct work;
 
 	/* A space for short vectors; longer vectors are allocated separately. */
-	struct bio_vec io_vec_inline[DM_VERITY_IO_VEC_INLINE];
+	struct bio_vec io_vec_inline[DM_MINTEGRITY_IO_VEC_INLINE];
 
 	/*
 	 * Three variably-size fields follow this struct:
@@ -93,24 +93,24 @@ struct dm_verity_io {
 	 */
 };
 
-struct dm_verity_prefetch_work {
+struct dm_mintegrity_prefetch_work {
 	struct work_struct work;
-	struct dm_verity *v;
+	struct dm_mintegrity *v;
 	sector_t block;
 	unsigned n_blocks;
 };
 
-static struct shash_desc *io_hash_desc(struct dm_verity *v, struct dm_verity_io *io)
+static struct shash_desc *io_hash_desc(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 {
 	return (struct shash_desc *)(io + 1);
 }
 
-static u8 *io_real_digest(struct dm_verity *v, struct dm_verity_io *io)
+static u8 *io_real_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 {
 	return (u8 *)(io + 1) + v->shash_descsize;
 }
 
-static u8 *io_want_digest(struct dm_verity *v, struct dm_verity_io *io)
+static u8 *io_want_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 {
 	return (u8 *)(io + 1) + v->shash_descsize + v->digest_size;
 }
@@ -144,7 +144,7 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 /*
  * Translate input sector number to the sector number on the target device.
  */
-static sector_t verity_map_sector(struct dm_verity *v, sector_t bi_sector)
+static sector_t mintegrity_map_sector(struct dm_mintegrity *v, sector_t bi_sector)
 {
 	return v->data_start + dm_target_offset(v->ti, bi_sector);
 }
@@ -155,16 +155,16 @@ static sector_t verity_map_sector(struct dm_verity *v, sector_t bi_sector)
  * The lowest "hash_per_block_bits"-bits of the result denote hash position
  * inside a hash block. The remaining bits denote location of the hash block.
  */
-static sector_t verity_position_at_level(struct dm_verity *v, sector_t block,
+static sector_t mintegrity_position_at_level(struct dm_mintegrity *v, sector_t block,
 					 int level)
 {
 	return block >> (level * v->hash_per_block_bits);
 }
 
-static void verity_hash_at_level(struct dm_verity *v, sector_t block, int level,
+static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, int level,
 				 sector_t *hash_block, unsigned *offset)
 {
-	sector_t position = verity_position_at_level(v, block, level);
+	sector_t position = mintegrity_position_at_level(v, block, level);
 	unsigned idx;
 
 	*hash_block = v->hash_level_block[level] + (position >> v->hash_per_block_bits);
@@ -190,10 +190,10 @@ static void verity_hash_at_level(struct dm_verity *v, sector_t block, int level,
  * If "skip_unverified" is false, unverified buffer is hashed and verified
  * against current value of io_want_digest(v, io).
  */
-static int verity_verify_level(struct dm_verity_io *io, sector_t block,
+static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			       int level, bool skip_unverified)
 {
-	struct dm_verity *v = io->v;
+	struct dm_mintegrity *v = io->v;
 	struct dm_buffer *buf;
 	struct buffer_aux *aux;
 	u8 *data;
@@ -201,7 +201,7 @@ static int verity_verify_level(struct dm_verity_io *io, sector_t block,
 	sector_t hash_block;
 	unsigned offset;
 
-	verity_hash_at_level(v, block, level, &hash_block, &offset);
+	mintegrity_hash_at_level(v, block, level, &hash_block, &offset);
 
 	data = dm_bufio_read(v->bufio, hash_block, &buf);
 	if (unlikely(IS_ERR(data)))
@@ -279,11 +279,11 @@ release_ret_r:
 }
 
 /*
- * Verify one "dm_verity_io" structure.
+ * Verify one "dm_mintegrity_io" structure.
  */
-static int verity_verify_io(struct dm_verity_io *io)
+static int mintegrity_verify_io(struct dm_mintegrity_io *io)
 {
-	struct dm_verity *v = io->v;
+	struct dm_mintegrity *v = io->v;
 	unsigned b;
 	int i;
 	unsigned vector = 0, offset = 0;
@@ -302,7 +302,7 @@ static int verity_verify_io(struct dm_verity_io *io)
 			 * function returns 0 and we fall back to whole
 			 * chain verification.
 			 */
-			int r = verity_verify_level(io, io->block + b, 0, true);
+			int r = mintegrity_verify_level(io, io->block + b, 0, true);
 			if (likely(!r))
 				goto test_block_hash;
 			if (r < 0)
@@ -312,7 +312,7 @@ static int verity_verify_io(struct dm_verity_io *io)
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
 
 		for (i = v->levels - 1; i >= 0; i--) {
-			int r = verity_verify_level(io, io->block + b, i, false);
+			int r = mintegrity_verify_level(io, io->block + b, i, false);
 			if (unlikely(r))
 				return r;
 		}
@@ -392,9 +392,9 @@ test_block_hash:
 /*
  * End one "io" structure with a given error.
  */
-static void verity_finish_io(struct dm_verity_io *io, int error)
+static void mintegrity_finish_io(struct dm_mintegrity_io *io, int error)
 {
-	struct dm_verity *v = io->v;
+	struct dm_mintegrity *v = io->v;
 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
 
 	bio->bi_end_io = io->orig_bi_end_io;
@@ -406,23 +406,23 @@ static void verity_finish_io(struct dm_verity_io *io, int error)
 	bio_endio(bio, error);
 }
 
-static void verity_work(struct work_struct *w)
+static void mintegrity_work(struct work_struct *w)
 {
-	struct dm_verity_io *io = container_of(w, struct dm_verity_io, work);
+	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
 
-	verity_finish_io(io, verity_verify_io(io));
+	mintegrity_finish_io(io, mintegrity_verify_io(io));
 }
 
-static void verity_end_io(struct bio *bio, int error)
+static void mintegrity_end_io(struct bio *bio, int error)
 {
-	struct dm_verity_io *io = bio->bi_private;
+	struct dm_mintegrity_io *io = bio->bi_private;
 
 	if (error) {
-		verity_finish_io(io, error);
+		mintegrity_finish_io(io, error);
 		return;
 	}
 
-	INIT_WORK(&io->work, verity_work);
+	INIT_WORK(&io->work, mintegrity_work);
 	queue_work(io->v->verify_wq, &io->work);
 }
 
@@ -431,20 +431,20 @@ static void verity_end_io(struct bio *bio, int error)
  * The root buffer is not prefetched, it is assumed that it will be cached
  * all the time.
  */
-static void verity_prefetch_io(struct work_struct *work)
+static void mintegrity_prefetch_io(struct work_struct *work)
 {
-	struct dm_verity_prefetch_work *pw =
-		container_of(work, struct dm_verity_prefetch_work, work);
-	struct dm_verity *v = pw->v;
+	struct dm_mintegrity_prefetch_work *pw =
+		container_of(work, struct dm_mintegrity_prefetch_work, work);
+	struct dm_mintegrity *v = pw->v;
 	int i;
 
 	for (i = v->levels - 2; i >= 0; i--) {
 		sector_t hash_block_start;
 		sector_t hash_block_end;
-		verity_hash_at_level(v, pw->block, i, &hash_block_start, NULL);
-		verity_hash_at_level(v, pw->block + pw->n_blocks - 1, i, &hash_block_end, NULL);
+		mintegrity_hash_at_level(v, pw->block, i, &hash_block_start, NULL);
+		mintegrity_hash_at_level(v, pw->block + pw->n_blocks - 1, i, &hash_block_end, NULL);
 		if (!i) {
-			unsigned cluster = ACCESS_ONCE(dm_verity_prefetch_cluster);
+			unsigned cluster = ACCESS_ONCE(dm_mintegrity_prefetch_cluster);
 
 			cluster >>= v->data_dev_block_bits;
 			if (unlikely(!cluster))
@@ -466,17 +466,17 @@ no_prefetch_cluster:
 	kfree(pw);
 }
 
-static void verity_submit_prefetch(struct dm_verity *v, struct dm_verity_io *io)
+static void mintegrity_submit_prefetch(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 {
-	struct dm_verity_prefetch_work *pw;
+	struct dm_mintegrity_prefetch_work *pw;
 
-	pw = kmalloc(sizeof(struct dm_verity_prefetch_work),
+	pw = kmalloc(sizeof(struct dm_mintegrity_prefetch_work),
 		GFP_NOIO | __GFP_NORETRY | __GFP_NOMEMALLOC | __GFP_NOWARN);
 
 	if (!pw)
 		return;
 
-	INIT_WORK(&pw->work, verity_prefetch_io);
+	INIT_WORK(&pw->work, mintegrity_prefetch_io);
 	pw->v = v;
 	pw->block = io->block;
 	pw->n_blocks = io->n_blocks;
@@ -484,16 +484,16 @@ static void verity_submit_prefetch(struct dm_verity *v, struct dm_verity_io *io)
 }
 
 /*
- * Bio map function. It allocates dm_verity_io structure and bio vector and
+ * Bio map function. It allocates dm_mintegrity_io structure and bio vector and
  * fills them. Then it issues prefetches and the I/O.
  */
-static int verity_map(struct dm_target *ti, struct bio *bio)
+static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 {
-	struct dm_verity *v = ti->private;
-	struct dm_verity_io *io;
+	struct dm_mintegrity *v = ti->private;
+	struct dm_mintegrity_io *io;
 
 	bio->bi_bdev = v->data_dev->bdev;
-	bio->bi_sector = verity_map_sector(v, bio->bi_sector);
+	bio->bi_sector = mintegrity_map_sector(v, bio->bi_sector);
 
 	if (((unsigned)bio->bi_sector | bio_sectors(bio)) &
 	    ((1 << (v->data_dev_block_bits - SECTOR_SHIFT)) - 1)) {
@@ -517,17 +517,17 @@ static int verity_map(struct dm_target *ti, struct bio *bio)
 	io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
 	io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
 
-	bio->bi_end_io = verity_end_io;
+	bio->bi_end_io = mintegrity_end_io;
 	bio->bi_private = io;
 	io->io_vec_size = bio_segments(bio);
-	if (io->io_vec_size < DM_VERITY_IO_VEC_INLINE)
+	if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
 		io->io_vec = io->io_vec_inline;
 	else
 		io->io_vec = mempool_alloc(v->vec_mempool, GFP_NOIO);
 	memcpy(io->io_vec, bio_iovec(bio),
 	       io->io_vec_size * sizeof(struct bio_vec));
 
-	verity_submit_prefetch(v, io);
+	mintegrity_submit_prefetch(v, io);
 
 	generic_make_request(bio);
 
@@ -537,10 +537,10 @@ static int verity_map(struct dm_target *ti, struct bio *bio)
 /*
  * Status: V (valid) or C (corruption found)
  */
-static void verity_status(struct dm_target *ti, status_type_t type,
+static void mintegrity_status(struct dm_target *ti, status_type_t type,
 			  unsigned status_flags, char *result, unsigned maxlen)
 {
-	struct dm_verity *v = ti->private;
+	struct dm_mintegrity *v = ti->private;
 	unsigned sz = 0;
 	unsigned x;
 
@@ -571,10 +571,10 @@ static void verity_status(struct dm_target *ti, status_type_t type,
 	}
 }
 
-static int verity_ioctl(struct dm_target *ti, unsigned cmd,
+static int mintegrity_ioctl(struct dm_target *ti, unsigned cmd,
 			unsigned long arg)
 {
-	struct dm_verity *v = ti->private;
+	struct dm_mintegrity *v = ti->private;
 	int r = 0;
 
 	if (v->data_start ||
@@ -585,32 +585,32 @@ static int verity_ioctl(struct dm_target *ti, unsigned cmd,
 				     cmd, arg);
 }
 
-static int verity_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
+static int mintegrity_merge(struct dm_target *ti, struct bvec_merge_data *bvm,
 			struct bio_vec *biovec, int max_size)
 {
-	struct dm_verity *v = ti->private;
+	struct dm_mintegrity *v = ti->private;
 	struct request_queue *q = bdev_get_queue(v->data_dev->bdev);
 
 	if (!q->merge_bvec_fn)
 		return max_size;
 
 	bvm->bi_bdev = v->data_dev->bdev;
-	bvm->bi_sector = verity_map_sector(v, bvm->bi_sector);
+	bvm->bi_sector = mintegrity_map_sector(v, bvm->bi_sector);
 
 	return min(max_size, q->merge_bvec_fn(q, bvm, biovec));
 }
 
-static int verity_iterate_devices(struct dm_target *ti,
+static int mintegrity_iterate_devices(struct dm_target *ti,
 				  iterate_devices_callout_fn fn, void *data)
 {
-	struct dm_verity *v = ti->private;
+	struct dm_mintegrity *v = ti->private;
 
 	return fn(ti, v->data_dev, v->data_start, ti->len, data);
 }
 
-static void verity_io_hints(struct dm_target *ti, struct queue_limits *limits)
+static void mintegrity_io_hints(struct dm_target *ti, struct queue_limits *limits)
 {
-	struct dm_verity *v = ti->private;
+	struct dm_mintegrity *v = ti->private;
 
 	if (limits->logical_block_size < 1 << v->data_dev_block_bits)
 		limits->logical_block_size = 1 << v->data_dev_block_bits;
@@ -621,9 +621,9 @@ static void verity_io_hints(struct dm_target *ti, struct queue_limits *limits)
 	blk_limits_io_min(limits, limits->logical_block_size);
 }
 
-static void verity_dtr(struct dm_target *ti)
+static void mintegrity_dtr(struct dm_target *ti)
 {
-	struct dm_verity *v = ti->private;
+	struct dm_mintegrity *v = ti->private;
 
 	if (v->verify_wq)
 		destroy_workqueue(v->verify_wq);
@@ -665,9 +665,9 @@ static void verity_dtr(struct dm_target *ti)
  *	<digest>
  *	<salt>		Hex string or "-" if no salt.
  */
-static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
+static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 {
-	struct dm_verity *v;
+	struct dm_mintegrity *v;
 	unsigned num;
 	unsigned long long num_ll;
 	int r;
@@ -675,9 +675,9 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	sector_t hash_position;
 	char dummy;
 
-	v = kzalloc(sizeof(struct dm_verity), GFP_KERNEL);
+	v = kzalloc(sizeof(struct dm_mintegrity), GFP_KERNEL);
 	if (!v) {
-		ti->error = "Cannot allocate verity structure";
+		ti->error = "Cannot allocate mintegrity structure";
 		return -ENOMEM;
 	}
 	ti->private = v;
@@ -821,7 +821,7 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		       (v->hash_per_block_bits * v->levels))
 			v->levels++;
 
-	if (v->levels > DM_VERITY_MAX_LEVELS) {
+	if (v->levels > DM_MINTEGRITY_MAX_LEVELS) {
 		ti->error = "Too many tree levels";
 		r = -E2BIG;
 		goto bad;
@@ -858,9 +858,9 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	ti->per_bio_data_size = roundup(sizeof(struct dm_verity_io) + v->shash_descsize + v->digest_size * 2, __alignof__(struct dm_verity_io));
+	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) + v->shash_descsize + v->digest_size * 2, __alignof__(struct dm_mintegrity_io));
 
-	v->vec_mempool = mempool_create_kmalloc_pool(DM_VERITY_MEMPOOL_SIZE,
+	v->vec_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
 					BIO_MAX_PAGES * sizeof(struct bio_vec));
 	if (!v->vec_mempool) {
 		ti->error = "Cannot allocate vector mempool";
@@ -869,7 +869,7 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
-	v->verify_wq = alloc_workqueue("kverityd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	v->verify_wq = alloc_workqueue("kmintegrityd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
 	if (!v->verify_wq) {
 		ti->error = "Cannot allocate workqueue";
 		r = -ENOMEM;
@@ -879,43 +879,43 @@ static int verity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	return 0;
 
 bad:
-	verity_dtr(ti);
+	mintegrity_dtr(ti);
 
 	return r;
 }
 
-static struct target_type verity_target = {
-	.name		= "verity",
+static struct target_type mintegrity_target = {
+	.name		= "mintegrity",
 	.version	= {1, 2, 0},
 	.module		= THIS_MODULE,
-	.ctr		= verity_ctr,
-	.dtr		= verity_dtr,
-	.map		= verity_map,
-	.status		= verity_status,
-	.ioctl		= verity_ioctl,
-	.merge		= verity_merge,
-	.iterate_devices = verity_iterate_devices,
-	.io_hints	= verity_io_hints,
+	.ctr		= mintegrity_ctr,
+	.dtr		= mintegrity_dtr,
+	.map		= mintegrity_map,
+	.status		= mintegrity_status,
+	.ioctl		= mintegrity_ioctl,
+	.merge		= mintegrity_merge,
+	.iterate_devices = mintegrity_iterate_devices,
+	.io_hints	= mintegrity_io_hints,
 };
 
-static int __init dm_verity_init(void)
+static int __init dm_mintegrity_init(void)
 {
 	int r;
 
-	r = dm_register_target(&verity_target);
+	r = dm_register_target(&mintegrity_target);
 	if (r < 0)
 		DMERR("register failed %d", r);
 
 	return r;
 }
 
-static void __exit dm_verity_exit(void)
+static void __exit dm_mintegrity_exit(void)
 {
-	dm_unregister_target(&verity_target);
+	dm_unregister_target(&mintegrity_target);
 }
 
-module_init(dm_verity_init);
-module_exit(dm_verity_exit);
+module_init(dm_mintegrity_init);
+module_exit(dm_mintegrity_exit);
 
 MODULE_AUTHOR("Mikulas Patocka <mpatocka@redhat.com>");
 MODULE_AUTHOR("Mandeep Baines <msb@chromium.org>");
