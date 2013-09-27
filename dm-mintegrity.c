@@ -1,8 +1,8 @@
 /*
  * Copyright (C) 2012 Red Hat, Inc.
  *
- * Author: Mikulas Patocka <mpatocka@redhat.com>
- *
+ * dm-mintegrity Author: Jan Kasiak <j.kasiak@gmail.com>
+ * Based on dm-verity driver by: Mikulas Patocka <mpatocka@redhat.com>
  * Based on Chromium dm-verity driver (C) 2011 The Chromium OS Authors
  *
  * This file is released under the GPLv2.
@@ -917,8 +917,9 @@ static void __exit dm_mintegrity_exit(void)
 module_init(dm_mintegrity_init);
 module_exit(dm_mintegrity_exit);
 
+MODULE_AUTHOR("Jan Kasiak <j.kasiak@gmail.com>");
 MODULE_AUTHOR("Mikulas Patocka <mpatocka@redhat.com>");
 MODULE_AUTHOR("Mandeep Baines <msb@chromium.org>");
 MODULE_AUTHOR("Will Drewry <wad@chromium.org>");
-MODULE_DESCRIPTION(DM_NAME " target for transparent disk integrity checking");
+MODULE_DESCRIPTION(DM_NAME " target for transparent RW disk integrity checking");
 MODULE_LICENSE("GPL");
