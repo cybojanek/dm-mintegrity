@@ -1,4 +1,4 @@
-obj-m = dm-verity.o
+obj-m = dm-mintegrity.o
 KVERSION = $(shell uname -r)
 
 all:

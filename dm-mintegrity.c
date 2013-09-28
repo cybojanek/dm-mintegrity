@@ -17,6 +17,7 @@
 #include "dm-bufio.h"
 
 #include <linux/module.h>
+#include <linux/rwsem.h>
 #include <linux/device-mapper.h>
 #include <crypto/hash.h>
 
@@ -57,7 +58,10 @@ struct dm_mintegrity {
 
 	mempool_t *vec_mempool;	/* mempool of bio vector */
 
-	struct workqueue_struct *verify_wq;
+	struct workqueue_struct *wait_read_wq; /* workqueue for read lock */
+	struct workqueue_struct *read_wq; /* workqueue for processing reads */
+	struct workqueue_struct *write_wq; /* workqeue for processing writes */
+	struct rw_semaphore lock; /* read/write lock */
 
 	/* starting blocks for each tree level. 0 is the lowest level. */
 	sector_t hash_level_block[DM_MINTEGRITY_MAX_LEVELS];
@@ -74,6 +78,7 @@ struct dm_mintegrity_io {
 	unsigned n_blocks;
 
 	/* saved bio vector */
+	struct bio *bio;
 	struct bio_vec *io_vec;
 	unsigned io_vec_size;
 
@@ -140,6 +145,14 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 
 	aux->hash_verified = 0;
 }
+
+/*
+ * What do we want to do on a write callback ??
+ */
+ static void dm_bufio_write_callback(struct dm_buffer *buf)
+ {
+	// ???
+ }
 
 /*
  * Translate input sector number to the sector number on the target device.
@@ -406,24 +419,34 @@ static void mintegrity_finish_io(struct dm_mintegrity_io *io, int error)
 	bio_endio(bio, error);
 }
 
-static void mintegrity_work(struct work_struct *w)
+static void mintegrity_read_work(struct work_struct *w)
 {
 	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
 
 	mintegrity_finish_io(io, mintegrity_verify_io(io));
+	up_read(&(io->v->lock));
 }
 
-static void mintegrity_end_io(struct bio *bio, int error)
+static void mintegrity_end_read_io(struct bio *bio, int error)
 {
 	struct dm_mintegrity_io *io = bio->bi_private;
 
 	if (error) {
 		mintegrity_finish_io(io, error);
+		up_read(&(io->v->lock));
 		return;
 	}
 
-	INIT_WORK(&io->work, mintegrity_work);
-	queue_work(io->v->verify_wq, &io->work);
+	INIT_WORK(&io->work, mintegrity_read_work);
+	queue_work(io->v->read_wq, &io->work);
+}
+
+static void mintegrity_read_wait(struct work_struct *w)
+{
+	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
+	struct dm_mintegrity *v = io->v;
+	down_read(&(v->lock));
+	generic_make_request(io->bio);
 }
 
 /*
@@ -480,7 +503,7 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v, struct dm_minteg
 	pw->v = v;
 	pw->block = io->block;
 	pw->n_blocks = io->n_blocks;
-	queue_work(v->verify_wq, &pw->work);
+	queue_work(v->read_wq, &pw->work);
 }
 
 /*
@@ -507,29 +530,37 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		return -EIO;
 	}
 
-	if (bio_data_dir(bio) == WRITE)
+	if (bio_data_dir(bio) == WRITE) {
 		return -EIO;
+	}
 
-	io = dm_per_bio_data(bio, ti->per_bio_data_size);
-	io->v = v;
-	io->orig_bi_end_io = bio->bi_end_io;
-	io->orig_bi_private = bio->bi_private;
-	io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
-	io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
 
-	bio->bi_end_io = mintegrity_end_io;
-	bio->bi_private = io;
-	io->io_vec_size = bio_segments(bio);
-	if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
-		io->io_vec = io->io_vec_inline;
-	else
-		io->io_vec = mempool_alloc(v->vec_mempool, GFP_NOIO);
-	memcpy(io->io_vec, bio_iovec(bio),
-	       io->io_vec_size * sizeof(struct bio_vec));
+	if(bio_data_dir(bio) == READ) {
+		io = dm_per_bio_data(bio, ti->per_bio_data_size);
+		io->bio = bio;
+		io->v = v;
+		io->orig_bi_end_io = bio->bi_end_io;
+		io->orig_bi_private = bio->bi_private;
+		io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
+		io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
 
-	mintegrity_submit_prefetch(v, io);
+		bio->bi_end_io = mintegrity_end_read_io;
+		bio->bi_private = io;
+		io->io_vec_size = bio_segments(bio);
+		if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
+			io->io_vec = io->io_vec_inline;
+		else
+			io->io_vec = mempool_alloc(v->vec_mempool, GFP_NOIO);
+		memcpy(io->io_vec, bio_iovec(bio),
+		       io->io_vec_size * sizeof(struct bio_vec));
 
-	generic_make_request(bio);
+		// Disable prefetching for now
+		// mintegrity_submit_prefetch(v, io);
+		INIT_WORK(&(io->work), mintegrity_read_wait);
+		queue_work(io->v->wait_read_wq, &io->work);
+		// Make request after getting read lock in read_wait
+		// generic_make_request(bio);
+	}
 
 	return DM_MAPIO_SUBMITTED;
 }
@@ -625,8 +656,14 @@ static void mintegrity_dtr(struct dm_target *ti)
 {
 	struct dm_mintegrity *v = ti->private;
 
-	if (v->verify_wq)
-		destroy_workqueue(v->verify_wq);
+	if (v->write_wq)
+		destroy_workqueue(v->write_wq);
+
+	if (v->wait_read_wq)
+		destroy_workqueue(v->wait_read_wq);
+
+	if (v->read_wq)
+		destroy_workqueue(v->read_wq);
 
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
@@ -683,8 +720,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	ti->private = v;
 	v->ti = ti;
 
-	if ((dm_table_get_mode(ti->table) & ~FMODE_READ)) {
-		ti->error = "Device must be readonly";
+	if (!(dm_table_get_mode(ti->table) & FMODE_WRITE)) {
+		ti->error = "Device must be writeable!";
 		r = -EINVAL;
 		goto bad;
 	}
@@ -703,13 +740,13 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 	v->version = num;
 
-	r = dm_get_device(ti, argv[1], FMODE_READ, &v->data_dev);
+	r = dm_get_device(ti, argv[1], dm_table_get_mode(ti->table), &v->data_dev);
 	if (r) {
 		ti->error = "Data device lookup failed";
 		goto bad;
 	}
 
-	r = dm_get_device(ti, argv[2], FMODE_READ, &v->hash_dev);
+	r = dm_get_device(ti, argv[2], dm_table_get_mode(ti->table), &v->hash_dev);
 	if (r) {
 		ti->error = "Data device lookup failed";
 		goto bad;
@@ -844,7 +881,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	v->bufio = dm_bufio_client_create(v->hash_dev->bdev,
 		1 << v->hash_dev_block_bits, 1, sizeof(struct buffer_aux),
-		dm_bufio_alloc_callback, NULL);
+		dm_bufio_alloc_callback, dm_bufio_write_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
 		r = PTR_ERR(v->bufio);
@@ -868,10 +905,27 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
+	/* Initialize lock for IO operations */
+	init_rwsem(&(v->lock));
+
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
-	v->verify_wq = alloc_workqueue("kmintegrityd", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
-	if (!v->verify_wq) {
-		ti->error = "Cannot allocate workqueue";
+	v->read_wq = alloc_workqueue("kmintegrityd_read", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	if (!v->read_wq) {
+		ti->error = "Cannot allocate read workqueue";
+		r = -ENOMEM;
+		goto bad;
+	}
+
+	v->wait_read_wq = alloc_workqueue("kmintegrityd_wait", WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	if (!v->wait_read_wq) {
+		ti->error = "Cannot allocate wait workqueue";
+		r = -ENOMEM;
+		goto bad;
+	}
+
+	v->write_wq = alloc_workqueue("kmintegrityd_write", WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	if (!v->write_wq) {
+		ti->error = "Cannot allocate write workqueue";
 		r = -ENOMEM;
 		goto bad;
 	}
