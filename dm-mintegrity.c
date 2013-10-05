@@ -16,6 +16,7 @@
 
 #include "dm-bufio.h"
 
+#include <linux/printk.h>
 #include <linux/module.h>
 #include <linux/rwsem.h>
 #include <linux/device-mapper.h>
@@ -360,6 +361,7 @@ test_block_hash:
 			len = bv->bv_len - offset;
 			if (likely(len >= todo))
 				len = todo;
+			// NOTE: is this where the data is hashed?
 			r = crypto_shash_update(desc,
 					page + bv->bv_offset + offset, len);
 			kunmap_atomic(page);
@@ -416,7 +418,105 @@ static void mintegrity_finish_io(struct dm_mintegrity_io *io, int error)
 	if (io->io_vec != io->io_vec_inline)
 		mempool_free(io->io_vec, v->vec_mempool);
 
+	// Unlock before end of io
+	up_read(&(io->v->lock));
 	bio_endio(bio, error);
+}
+
+static void mintegrity_write_work(struct work_struct *w)
+{
+	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
+	struct dm_mintegrity *v = io->v;
+
+	struct shash_desc *desc;
+	int r;
+	u8 * result;
+	unsigned todo, vector = 0, offset = 0;
+
+	// Compute hash
+	desc = io_hash_desc(v, io);  // io hash description field for io request
+	desc->tfm = v->tfm;  // hash function
+	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+	// Init hash
+	r = crypto_shash_init(desc);
+	if (r < 0) {
+		DMERR("crypto_shash_init failed: %d", r);
+		bio_io_error(io->bio);
+		return;
+	}
+	// Update with salt
+	if (likely(v->version >= 1)) {
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			bio_io_error(io->bio);
+			return;
+		}
+	}
+	todo = 1 << v->data_dev_block_bits;
+	do {
+		struct bio_vec *bv;
+		u8 *page;
+		unsigned len;
+
+		BUG_ON(vector >= io->io_vec_size);
+		bv = &io->io_vec[vector];
+		page = kmap_atomic(bv->bv_page);
+		len = bv->bv_len - offset;
+		if (likely(len >= todo))
+			len = todo;
+		r = crypto_shash_update(desc,
+				page + bv->bv_offset + offset, len);
+		kunmap_atomic(page);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			bio_io_error(io->bio);
+			return;
+		}
+		offset += len;
+		if (likely(offset == bv->bv_len)) {
+			offset = 0;
+			vector++;
+		}
+		todo -= len;
+	} while (todo);
+
+	if (!v->version) {
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			bio_io_error(io->bio);
+			return;
+		}
+	}
+
+	result = io_real_digest(v, io);
+	r = crypto_shash_final(desc, result);
+	if (r < 0) {
+		DMERR("crypto_shash_final failed: %d", r);
+		bio_io_error(io->bio);
+		return;
+	}
+	print_hex_dump(KERN_DEBUG, "write hash: ", DUMP_PREFIX_ADDRESS, 16, 1, result, v->digest_size, 0);
+
+	// mintegrity_finish_io(io, -EIO);
+	// bio_endio(io->bio, -EIO);
+	// Lock writing
+	// printk("down_write before");
+	down_write(&(v->lock));
+	// printk("down_write after");
+	if(true){
+		// printk("up_write before");
+		up_write(&(v->lock));
+		// printk("up_write after");
+		// TODO: why does this have to be called last? what happens?
+		bio_io_error(io->bio);
+	}
+	// bio_io_error(io->bio);
+	
+	// mintegrity_finish_io(io, mintegrity_verify_io(io));
+	// down_write(&(io->v->lock));
+
 }
 
 static void mintegrity_read_work(struct work_struct *w)
@@ -424,7 +524,6 @@ static void mintegrity_read_work(struct work_struct *w)
 	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
 
 	mintegrity_finish_io(io, mintegrity_verify_io(io));
-	up_read(&(io->v->lock));
 }
 
 static void mintegrity_end_read_io(struct bio *bio, int error)
@@ -433,7 +532,6 @@ static void mintegrity_end_read_io(struct bio *bio, int error)
 
 	if (error) {
 		mintegrity_finish_io(io, error);
-		up_read(&(io->v->lock));
 		return;
 	}
 
@@ -531,11 +629,24 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 	}
 
 	if (bio_data_dir(bio) == WRITE) {
-		return -EIO;
+		io = dm_per_bio_data(bio, ti->per_bio_data_size);
+		io->bio = bio;
+		io->v = v;
+		// Copy bio buffers?
+		io->io_vec_size = bio_segments(bio);
+		if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
+			io->io_vec = io->io_vec_inline;
+		else
+			io->io_vec = mempool_alloc(v->vec_mempool, GFP_NOIO);
+		memcpy(io->io_vec, bio_iovec(bio),
+		       io->io_vec_size * sizeof(struct bio_vec));
+		/* Queue up write */
+		INIT_WORK(&(io->work), mintegrity_write_work);
+		queue_work(io->v->write_wq, &io->work);
 	}
 
-
 	if(bio_data_dir(bio) == READ) {
+		/* Prepare bio for work */
 		io = dm_per_bio_data(bio, ti->per_bio_data_size);
 		io->bio = bio;
 		io->v = v;
@@ -543,9 +654,8 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		io->orig_bi_private = bio->bi_private;
 		io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
 		io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
-
-		bio->bi_end_io = mintegrity_end_read_io;
 		bio->bi_private = io;
+		bio->bi_end_io = mintegrity_end_read_io;
 		io->io_vec_size = bio_segments(bio);
 		if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
 			io->io_vec = io->io_vec_inline;
@@ -556,9 +666,10 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 		// Disable prefetching for now
 		// mintegrity_submit_prefetch(v, io);
+		// Submit to queue to wait for lock
 		INIT_WORK(&(io->work), mintegrity_read_wait);
 		queue_work(io->v->wait_read_wq, &io->work);
-		// Make request after getting read lock in read_wait
+		// Make request after getting read lock in read_wait instead of here
 		// generic_make_request(bio);
 	}
 
@@ -825,6 +936,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		r = -ENOMEM;
 		goto bad;
 	}
+	// TODO - check hash on hash device when mounting
+	// not just wether its hex and of correct size
 	if (strlen(argv[8]) != v->digest_size * 2 ||
 	    hex2bin(v->root_digest, argv[8], v->digest_size)) {
 		ti->error = "Invalid root digest";
@@ -938,6 +1051,7 @@ bad:
 	return r;
 }
 
+// Struct for registering mintegrity
 static struct target_type mintegrity_target = {
 	.name		= "mintegrity",
 	.version	= {1, 2, 0},
@@ -952,10 +1066,12 @@ static struct target_type mintegrity_target = {
 	.io_hints	= mintegrity_io_hints,
 };
 
+// Called on module loading
 static int __init dm_mintegrity_init(void)
 {
 	int r;
 
+	// Register mintegrity module
 	r = dm_register_target(&mintegrity_target);
 	if (r < 0)
 		DMERR("register failed %d", r);
