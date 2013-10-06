@@ -58,6 +58,7 @@ struct dm_mintegrity {
 	int hash_failed;	/* set to 1 if hash of any block failed */
 
 	mempool_t *vec_mempool;	/* mempool of bio vector */
+	mempool_t *hb_mempool; /* mempool for hash block writebacks */
 
 	struct workqueue_struct *wait_read_wq; /* workqueue for read lock */
 	struct workqueue_struct *read_wq; /* workqueue for processing reads */
@@ -81,6 +82,7 @@ struct dm_mintegrity_io {
 	/* saved bio vector */
 	struct bio *bio;
 	struct bio_vec *io_vec;
+	u8 *hb_vec;
 	unsigned io_vec_size;
 
 	struct work_struct work;
@@ -205,7 +207,7 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, in
  * against current value of io_want_digest(v, io).
  */
 static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
-			       int level, bool skip_unverified)
+			       int level, bool skip_unverified, bool get_data, char *level_data)
 {
 	struct dm_mintegrity *v = io->v;
 	struct dm_buffer *buf;
@@ -275,13 +277,20 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			v->hash_failed = 1;
 			r = -EIO;
 			goto release_ret_r;
-		} else
-			aux->hash_verified = 1;
+		} else {
+			// ignore this for now and keep it at 0
+			aux->hash_verified = 0;
+		}
+	}
+	// Return back the whole block we read and verified
+	if(get_data){
+		memcpy(level_data, data, 1 << v->hash_dev_block_bits);
 	}
 
 	data += offset;
 
 	memcpy(io_want_digest(v, io), data, v->digest_size);
+
 
 	dm_bufio_release(buf);
 	return 0;
@@ -316,7 +325,8 @@ static int mintegrity_verify_io(struct dm_mintegrity_io *io)
 			 * function returns 0 and we fall back to whole
 			 * chain verification.
 			 */
-			int r = mintegrity_verify_level(io, io->block + b, 0, true);
+			int r = mintegrity_verify_level(io, io->block + b, 0, true,
+				false, NULL);
 			if (likely(!r))
 				goto test_block_hash;
 			if (r < 0)
@@ -326,7 +336,8 @@ static int mintegrity_verify_io(struct dm_mintegrity_io *io)
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
 
 		for (i = v->levels - 1; i >= 0; i--) {
-			int r = mintegrity_verify_level(io, io->block + b, i, false);
+			int r = mintegrity_verify_level(io, io->block + b, i, false,
+				false, NULL);
 			if (unlikely(r))
 				return r;
 		}
@@ -407,7 +418,28 @@ test_block_hash:
 /*
  * End one "io" structure with a given error.
  */
-static void mintegrity_finish_io(struct dm_mintegrity_io *io, int error)
+static void mintegrity_finish_write_io(struct dm_mintegrity_io *io, int error)
+{
+	struct dm_mintegrity *v = io->v;
+	// struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
+
+	// bio->bi_end_io = io->orig_bi_end_io;
+	// bio->bi_private = io->orig_bi_private;
+
+	if (io->io_vec != io->io_vec_inline)
+		mempool_free(io->io_vec, v->vec_mempool);
+
+	mempool_free(io->hb_vec, v->hb_mempool);
+
+	// Unlock before end of io
+	up_write(&(io->v->lock));
+	bio_endio(io->bio, error);
+}
+
+/*
+ * End one "io" structure with a given error.
+ */
+static void mintegrity_finish_read_io(struct dm_mintegrity_io *io, int error)
 {
 	struct dm_mintegrity *v = io->v;
 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
@@ -427,103 +459,109 @@ static void mintegrity_write_work(struct work_struct *w)
 {
 	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
 	struct dm_mintegrity *v = io->v;
+	unsigned b;
+	int i;
+	unsigned vector = 0, offset = 0;
 
-	struct shash_desc *desc;
-	int r;
-	u8 * result;
-	unsigned todo, vector = 0, offset = 0;
-
-	// Compute hash
-	desc = io_hash_desc(v, io);  // io hash description field for io request
-	desc->tfm = v->tfm;  // hash function
-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
-	// Init hash
-	r = crypto_shash_init(desc);
-	if (r < 0) {
-		DMERR("crypto_shash_init failed: %d", r);
-		bio_io_error(io->bio);
-		return;
-	}
-	// Update with salt
-	if (likely(v->version >= 1)) {
-		r = crypto_shash_update(desc, v->salt, v->salt_size);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			bio_io_error(io->bio);
-			return;
-		}
-	}
-	todo = 1 << v->data_dev_block_bits;
-	do {
-		struct bio_vec *bv;
-		u8 *page;
-		unsigned len;
-
-		BUG_ON(vector >= io->io_vec_size);
-		bv = &io->io_vec[vector];
-		page = kmap_atomic(bv->bv_page);
-		len = bv->bv_len - offset;
-		if (likely(len >= todo))
-			len = todo;
-		r = crypto_shash_update(desc,
-				page + bv->bv_offset + offset, len);
-		kunmap_atomic(page);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			bio_io_error(io->bio);
-			return;
-		}
-		offset += len;
-		if (likely(offset == bv->bv_len)) {
-			offset = 0;
-			vector++;
-		}
-		todo -= len;
-	} while (todo);
-
-	if (!v->version) {
-		r = crypto_shash_update(desc, v->salt, v->salt_size);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			bio_io_error(io->bio);
-			return;
-		}
-	}
-
-	result = io_real_digest(v, io);
-	r = crypto_shash_final(desc, result);
-	if (r < 0) {
-		DMERR("crypto_shash_final failed: %d", r);
-		bio_io_error(io->bio);
-		return;
-	}
-	print_hex_dump(KERN_DEBUG, "write hash: ", DUMP_PREFIX_ADDRESS, 16, 1, result, v->digest_size, 0);
-
-	// mintegrity_finish_io(io, -EIO);
-	// bio_endio(io->bio, -EIO);
-	// Lock writing
-	// printk("down_write before");
+	// Lock down!
 	down_write(&(v->lock));
-	// printk("down_write after");
-	if(true){
-		// printk("up_write before");
-		up_write(&(v->lock));
-		// printk("up_write after");
-		// TODO: why does this have to be called last? what happens?
-		bio_io_error(io->bio);
-	}
-	// bio_io_error(io->bio);
-	
-	// mintegrity_finish_io(io, mintegrity_verify_io(io));
-	// down_write(&(io->v->lock));
 
+	for(b = 0; b < io->n_blocks; b++){
+		struct shash_desc *desc;
+		int r;
+		u8 * result;
+		unsigned todo;
+		// u8 level_data[v->levels][1 << v->hash_dev_block_bits];
+
+		// The io digest we want is the root
+		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
+
+		// Read levels, TOP DOWN and compare to io want, which is set after
+		// every successive read
+		for (i = v->levels - 1; i >= 0; i--) {
+			int r = mintegrity_verify_level(io, io->block + b, i, false, true,
+				io->hb_vec + (1 << v->hash_dev_block_bits) * i);
+			if (unlikely(r)){
+				mintegrity_finish_write_io(io, -EIO);
+				return;
+			}
+		}
+
+		// Compute hash
+		desc = io_hash_desc(v, io);  // io hash description field for io request
+		desc->tfm = v->tfm;  // hash function
+		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+		// Init hash
+		r = crypto_shash_init(desc);
+		if (r < 0) {
+			DMERR("crypto_shash_init failed: %d", r);
+			mintegrity_finish_write_io(io, -EIO);
+			return;
+		}
+		// Update with salt
+		if (likely(v->version >= 1)) {
+			r = crypto_shash_update(desc, v->salt, v->salt_size);
+			if (r < 0) {
+				DMERR("crypto_shash_update failed: %d", r);
+				mintegrity_finish_write_io(io, -EIO);
+				return;
+			}
+		}
+		todo = 1 << v->data_dev_block_bits;
+		do {
+			struct bio_vec *bv;
+			u8 *page;
+			unsigned len;
+
+			BUG_ON(vector >= io->io_vec_size);
+			bv = &io->io_vec[vector];
+			page = kmap_atomic(bv->bv_page);
+			len = bv->bv_len - offset;
+			if (likely(len >= todo))
+				len = todo;
+			r = crypto_shash_update(desc,
+					page + bv->bv_offset + offset, len);
+			kunmap_atomic(page);
+			if (r < 0) {
+				DMERR("crypto_shash_update failed: %d", r);
+				mintegrity_finish_write_io(io, -EIO);
+				return;
+			}
+			offset += len;
+			if (likely(offset == bv->bv_len)) {
+				offset = 0;
+				vector++;
+			}
+			todo -= len;
+		} while (todo);
+
+		if (!v->version) {
+			r = crypto_shash_update(desc, v->salt, v->salt_size);
+			if (r < 0) {
+				DMERR("crypto_shash_update failed: %d", r);
+				mintegrity_finish_write_io(io, -EIO);
+				return;
+			}
+		}
+
+		result = io_real_digest(v, io);
+		r = crypto_shash_final(desc, result);
+		if (r < 0) {
+			DMERR("crypto_shash_final failed: %d", r);
+			mintegrity_finish_write_io(io, -EIO);
+			return;
+		}
+		print_hex_dump(KERN_DEBUG, "write hash: ", DUMP_PREFIX_ADDRESS, 16, 1, result, v->digest_size, 0);
+		// Got write hash...now verify and get blocks along the way
+	}
+
+	mintegrity_finish_write_io(io, -EIO);
 }
 
 static void mintegrity_read_work(struct work_struct *w)
 {
 	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
-
-	mintegrity_finish_io(io, mintegrity_verify_io(io));
+	mintegrity_finish_read_io(io, mintegrity_verify_io(io));
 }
 
 static void mintegrity_end_read_io(struct bio *bio, int error)
@@ -531,7 +569,7 @@ static void mintegrity_end_read_io(struct bio *bio, int error)
 	struct dm_mintegrity_io *io = bio->bi_private;
 
 	if (error) {
-		mintegrity_finish_io(io, error);
+		mintegrity_finish_read_io(io, error);
 		return;
 	}
 
@@ -632,6 +670,8 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		io = dm_per_bio_data(bio, ti->per_bio_data_size);
 		io->bio = bio;
 		io->v = v;
+		io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
+		io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
 		// Copy bio buffers?
 		io->io_vec_size = bio_segments(bio);
 		if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
@@ -640,6 +680,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			io->io_vec = mempool_alloc(v->vec_mempool, GFP_NOIO);
 		memcpy(io->io_vec, bio_iovec(bio),
 		       io->io_vec_size * sizeof(struct bio_vec));
+		io->hb_vec = mempool_alloc(v->hb_mempool, GFP_NOIO);
 		/* Queue up write */
 		INIT_WORK(&(io->work), mintegrity_write_work);
 		queue_work(io->v->write_wq, &io->work);
@@ -775,6 +816,9 @@ static void mintegrity_dtr(struct dm_target *ti)
 
 	if (v->read_wq)
 		destroy_workqueue(v->read_wq);
+
+	if (v->hb_mempool)
+		mempool_destroy(v->hb_mempool);
 
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
@@ -1014,6 +1058,14 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 					BIO_MAX_PAGES * sizeof(struct bio_vec));
 	if (!v->vec_mempool) {
 		ti->error = "Cannot allocate vector mempool";
+		r = -ENOMEM;
+		goto bad;
+	}
+
+	v->hb_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
+					v->levels * (1 << v->hash_dev_block_bits));
+	if (!v->hb_mempool){
+		ti->error = "Cannot allocate hash block mempool";
 		r = -ENOMEM;
 		goto bad;
 	}
