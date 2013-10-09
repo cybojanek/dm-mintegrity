@@ -196,6 +196,46 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, in
 }
 
 /*
+ * Calculate hash of buffer and put it in io_real_digest
+ */
+int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data, unsigned int len)
+{
+	struct dm_mintegrity *v = io->v;
+	struct shash_desc *desc;
+	int r;
+	desc = io_hash_desc(v, io);
+	desc->tfm = v->tfm;
+	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+	r = crypto_shash_init(desc);
+	if(r < 0){
+		DMERR("crypto_shash_init failed: %d", r);
+		return r;
+	}
+
+	if (likely(v->version >= 1)) {
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			return r;
+		}
+	}
+
+	r = crypto_shash_update(desc, data, len);
+	if (r < 0) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_final(desc, io_real_digest(v, io));
+	if (r < 0) {
+		DMERR("crypto_shash_final failed: %d", r);
+		return r;
+	}
+	return 0;
+}
+
+
+/*
  * Verify hash of a metadata block pertaining to the specified data block
  * ("block" argument) at a specified level ("level" argument).
  *
@@ -423,8 +463,8 @@ static void mintegrity_finish_write_io(struct dm_mintegrity_io *io, int error)
 	struct dm_mintegrity *v = io->v;
 	// struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
 
-	// bio->bi_end_io = io->orig_bi_end_io;
-	// bio->bi_private = io->orig_bi_private;
+	io->bio->bi_end_io = io->orig_bi_end_io;
+	io->bio->bi_private = io->orig_bi_private;
 
 	if (io->io_vec != io->io_vec_inline)
 		mempool_free(io->io_vec, v->vec_mempool);
@@ -466,12 +506,12 @@ static void mintegrity_write_work(struct work_struct *w)
 	// Lock down!
 	down_write(&(v->lock));
 
+
 	for(b = 0; b < io->n_blocks; b++){
 		struct shash_desc *desc;
 		int r;
 		u8 * result;
 		unsigned todo;
-		// u8 level_data[v->levels][1 << v->hash_dev_block_bits];
 
 		// The io digest we want is the root
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
@@ -551,17 +591,99 @@ static void mintegrity_write_work(struct work_struct *w)
 			mintegrity_finish_write_io(io, -EIO);
 			return;
 		}
-		print_hex_dump(KERN_DEBUG, "write hash: ", DUMP_PREFIX_ADDRESS, 16, 1, result, v->digest_size, 0);
+
+		// Copy data hash into first level
+		unsigned offset;
+		sector_t hash_block;
+		mintegrity_hash_at_level(v, io->block + b, 0, &hash_block, &offset);
+		memcpy(io->hb_vec + offset, result, v->digest_size);
+		struct dm_buffer *buf;
+		u8 *data = dm_bufio_read(v->bufio, hash_block, &buf);
+		memcpy(data, io->hb_vec, (1 << v->hash_dev_block_bits));
+		dm_bufio_mark_buffer_dirty(buf);
+		dm_bufio_release(buf);
+
+		// data = dm_bufio_write(v->bufio, hash_block, io->hb_vec + (1 << v->hash_dev_block_bits) * 0);
+		// if (unlikely(IS_ERR(data)))
+			// return PTR_ERR(data);
+
+		// Write things back bottom up
+		for (i = 1; i < v->levels; i++){
+			// Get offset for level
+			mintegrity_hash_at_level(v, io->block + b, i, &hash_block, &offset);
+			// Calculate hash for level below
+			r = mintegrity_buffer_hash(io, io->hb_vec + (1 << v->hash_dev_block_bits) * (i-1), (1 << v->hash_dev_block_bits));
+			if(r < 0) {
+				DMERR("failed to calcualte write buffer hash for level");
+				mintegrity_finish_write_io(io, -EIO);
+			}
+			result = io_real_digest(v, io);
+			// Copy hash into current level
+			memcpy(io->hb_vec + ((1 << v->hash_dev_block_bits) * i) + offset, result, v->digest_size);
+			data = dm_bufio_read(v->bufio, hash_block, &buf);
+			memcpy(data, io->hb_vec + ((1 << v->hash_dev_block_bits) * i), (1 << v->hash_dev_block_bits));
+			dm_bufio_mark_buffer_dirty(buf);
+			dm_bufio_release(buf);
+			// dm_bufio_mark_buffer_dirty(buf);
+			// Write to buffer
+
+			// data = dm_bufio_write(v->bufio, hash_block, io->hb_vec + (1 << v->hash_dev_block_bits) * i);
+			// if (unlikely(IS_ERR(data)))
+				// return PTR_ERR(data);
+		}
+		// Compute hash of last level and set it as v->root_digest
+		// mintegrity_hash_at_level(v, io->block + b, v->, &hash_block, &offset);
+		desc = io_hash_desc(v, io);
+		desc->tfm = v->tfm;
+		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+		r = crypto_shash_init(desc);
+		if (r < 0) {
+			DMERR("crypto_shash_init failed: %d", r);
+			return;
+		}
+
+		if (likely(v->version >= 1)) {
+			r = crypto_shash_update(desc, v->salt, v->salt_size);
+			if (r < 0) {
+				DMERR("crypto_shash_update failed: %d", r);
+				return;
+			}
+		}
+		r = crypto_shash_update(desc, io->hb_vec + (1 << v->hash_dev_block_bits) * (v->levels - 1), (1 << v->hash_dev_block_bits));
+		result = io_real_digest(v, io);
+		r = crypto_shash_final(desc, result);
+		if (r < 0) {
+			DMERR("crypto_shash_final failed: %d", r);
+			mintegrity_finish_write_io(io, -EIO);
+			return;
+		}
+		DMERR("UPDATING ROOT HASH");
+		memcpy(v->root_digest, result, v->digest_size);
+		// print_hex_dump(KERN_DEBUG, "write hash: ", DUMP_PREFIX_ADDRESS, 16, 1, result, v->digest_size, 0);
 		// Got write hash...now verify and get blocks along the way
 	}
+	generic_make_request(io->bio);
 
-	mintegrity_finish_write_io(io, -EIO);
+	// mintegrity_finish_write_io(io, -EIO);
 }
 
 static void mintegrity_read_work(struct work_struct *w)
 {
 	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
 	mintegrity_finish_read_io(io, mintegrity_verify_io(io));
+}
+
+static void mintegrity_end_write_io(struct bio *bio, int error)
+{
+	struct dm_mintegrity_io *io = bio->bi_private;
+
+	// if (error) {
+		mintegrity_finish_write_io(io, error);
+		// return;
+	// }
+
+	// INIT_WORK(&io->work, mintegrity_read_work);
+	// queue_work(io->v->read_wq, &io->work);
 }
 
 static void mintegrity_end_read_io(struct bio *bio, int error)
@@ -651,6 +773,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 	struct dm_mintegrity *v = ti->private;
 	struct dm_mintegrity_io *io;
 
+
 	bio->bi_bdev = v->data_dev->bdev;
 	bio->bi_sector = mintegrity_map_sector(v, bio->bi_sector);
 
@@ -670,8 +793,13 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		io = dm_per_bio_data(bio, ti->per_bio_data_size);
 		io->bio = bio;
 		io->v = v;
+		io->orig_bi_end_io = bio->bi_end_io;
+		io->orig_bi_private = bio->bi_private;
+		bio->bi_private = io;
+		bio->bi_end_io = mintegrity_end_write_io;
 		io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
 		io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
+	DMERR("WRITE, %d", io->n_blocks);
 		// Copy bio buffers?
 		io->io_vec_size = bio_segments(bio);
 		if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
@@ -695,6 +823,8 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		io->orig_bi_private = bio->bi_private;
 		io->block = bio->bi_sector >> (v->data_dev_block_bits - SECTOR_SHIFT);
 		io->n_blocks = bio->bi_size >> v->data_dev_block_bits;
+	DMERR("READ, %d", io->n_blocks);
+
 		bio->bi_private = io;
 		bio->bi_end_io = mintegrity_end_read_io;
 		io->io_vec_size = bio_segments(bio);
@@ -808,6 +938,7 @@ static void mintegrity_dtr(struct dm_target *ti)
 {
 	struct dm_mintegrity *v = ti->private;
 
+
 	if (v->write_wq)
 		destroy_workqueue(v->write_wq);
 
@@ -823,8 +954,10 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
 
-	if (v->bufio)
+	if (v->bufio) {
+			dm_bufio_write_dirty_buffers(v->bufio);
 		dm_bufio_client_destroy(v->bufio);
+	}
 
 	kfree(v->salt);
 	kfree(v->root_digest);
@@ -1037,7 +1170,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	v->hash_blocks = hash_position;
 
 	v->bufio = dm_bufio_client_create(v->hash_dev->bdev,
-		1 << v->hash_dev_block_bits, 1, sizeof(struct buffer_aux),
+		1 << v->hash_dev_block_bits, 32, sizeof(struct buffer_aux), // TODO: reserved count: levels + num online cpus * ?
 		dm_bufio_alloc_callback, dm_bufio_write_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
@@ -1094,6 +1227,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		r = -ENOMEM;
 		goto bad;
 	}
+
+	printk("bufio size is: %d", dm_bufio_get_block_size(v->bufio));
 
 	return 0;
 
