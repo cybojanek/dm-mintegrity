@@ -5,11 +5,10 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
-
 #include <sys/stat.h>
-
 #include <uuid/uuid.h>
 
 #include "mkmint.h"
@@ -66,6 +65,7 @@ void print_superblock(struct mint_superblock *sb){
 	uint32_t hash_bytes = EVP_MD_size(md);
 	md = EVP_get_digestbyname(sb->hmac_algorithm);
 	uint32_t hmac_bytes = EVP_MD_size(md);
+	printf("[ dm-mintegrity superblock ]\n");
 	printf("Name: %s\n", sb->name);
 	printf("Version: %u\n", sb->version);
 	bytes_to_hex(sb->uuid, 16, buf);
@@ -279,7 +279,7 @@ int main(int argc, char const *argv[]) {
 		&hash_blocks, &jbd_blocks, &pad_blocks, &levels, blocks_per_level);
 	
 	// Result info
-	info("Blocks --> Data: %llu, Hash: %u, JBD: %u, Pad: %u, Levels: %u",
+	info("Blocks -- Data: %llu, Hash: %u, JBD: %u, Pad: %u, Levels: %u",
 			data_blocks, hash_blocks, jbd_blocks, pad_blocks, levels);
 
 	// Sanity check
@@ -289,10 +289,6 @@ int main(int argc, char const *argv[]) {
 		exit_error_f("Sanity check failed!: %llu != %llu",
 			data_blocks + hash_blocks + jbd_blocks + pad_blocks + 1, blocks);
 	}
-
-	info("Total blocks: %llu", blocks);
-	info("Fanout: %u", fanout);
-
 
 	// Calculate each hash block level
 	uint8_t **hash_levels = (uint8_t**)malloc(sizeof(uint8_t*) * levels);
@@ -308,51 +304,53 @@ int main(int argc, char const *argv[]) {
 	// Now loop through each level
 	for(uint32_t i = 0; i < levels; i++){
 		hash_levels[i] = (uint8_t*)malloc(BLOCK_SIZE);
+		// Fill block with hashes - padding is zeros
 		bzero(hash_levels[i], BLOCK_SIZE);
 		for(uint32_t f = 0; f < fanout; f++){
 			memcpy(hash_levels[i] + (f * hash_length), hash_output, hash_length);
 		}
+		// Compute hash of this level for next iteration/root
 		hash(md_hash, mdctx_hash, hash_levels[i], BLOCK_SIZE, (uint8_t*)salt, strlen(salt),
 			hash_output, &hash_length);
 	}
 
 	// Write out hash superblock
-	struct mint_superblock sb;
+	struct mint_superblock *msb = malloc(sizeof(struct mint_superblock));
 	// Zero out everything
-	bzero(&sb, sizeof(struct mint_superblock));
+	bzero(msb, sizeof(struct mint_superblock));
 	// Name
-	stpcpy(sb.name, "mint");
+	stpcpy(msb->name, "mint");
 	// Version
-	sb.version = 1;
+	msb->version = 1;
 	// Make a new uuid!
 	uuid_t uuid;
 	uuid_generate(uuid);
 	// TODO: is there a better way of doing this?
-	memcpy(&sb.uuid, &uuid, 16);
+	memcpy(&msb->uuid, &uuid, 16);
 	// Copy hash algorithm name
-	stpcpy(sb.hash_algorithm, hash_type);
+	stpcpy(msb->hash_algorithm, hash_type);
 	// Copy hmac algorithm name
-	stpcpy(sb.hmac_algorithm, hmac_type);
+	stpcpy(msb->hmac_algorithm, hmac_type);
 	// Block size!
-	sb.block_size = BLOCK_SIZE;
+	msb->block_size = BLOCK_SIZE;
 	// Set block numbers
-	sb.data_blocks = data_blocks;
-	sb.hash_blocks = hash_blocks;
-	sb.jbd_blocks = jbd_blocks;
+	msb->data_blocks = data_blocks;
+	msb->hash_blocks = hash_blocks;
+	msb->jbd_blocks = jbd_blocks;
 	// Set salt size
-	sb.salt_size = strlen(salt);
+	msb->salt_size = strlen(salt);
 	// Copy salt
-	stpcpy(sb.salt, salt);
+	stpcpy(msb->salt, salt);
 	// Set root hash
-	memcpy(sb.root, hash_output, hash_length);
+	memcpy(msb->root, hash_output, hash_length);
 	// Set hmac
-	hash(md_hmac, mdctx_hmac, (uint8_t*)sb.root, hash_length, (uint8_t*)secret,
-		strlen(secret), (uint8_t*)sb.hmac, &hash_length);
+	hash(md_hmac, mdctx_hmac, (uint8_t*)msb->root, hash_length, (uint8_t*)secret,
+		strlen(secret), (uint8_t*)msb->hmac, &hash_length);
 	// Write it out!
-	write(file, &sb, sizeof(struct mint_superblock));
+	write(file, msb, sizeof(struct mint_superblock));
 
 	// Write out hash block levels
-	info("Writing hash blocks");
+	info("Writing hash blocks...");
 	uint32_t h_written = 0;
 	for(int i = levels - 1; i >= 0; i--){
 		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
@@ -363,17 +361,45 @@ int main(int argc, char const *argv[]) {
 	fprintf(stderr, "\n");
 
 	// Initialize journal
+	struct journal_superblock_s *jsb = malloc(sizeof(struct journal_superblock_s));
+	bzero(jsb, sizeof(struct journal_superblock_s));
+	// Header initilization - numbers are all big endian
+	// Magic number
+	jsb->s_header.h_magic = htonl(0xC03B3998);
+	jsb->s_header.h_blocktype = htonl(4);
+	// Block device size
+	jsb->s_blocksize = htonl(BLOCK_SIZE);
+	// Total jbd blocks - 1 for header
+	jsb->s_maxlen = htonl(jbd_blocks - 1);
+	// First after this one ??
+	jsb->s_first = htonl(1);
+	// Sequence 1
+	jsb->s_sequence = htonl(1);
+	// Copy over mint uuid - kind of like ext4 does
+	memcpy(jsb->s_uuid, msb->uuid, 16);
+	// Number of users is 1
+	jsb->s_nr_users = htonl(1);
+	// Everything else is already zeroed
+	info("Writing journal...");
+	// Write jbd superblock...as many times as we have blocks. ext4 does this...
+	for(uint32_t i = 0 ; i < jbd_blocks; i++){
+		progress(i + 1, jbd_blocks, 100, 79);
+		write(file, jsb, sizeof(struct journal_superblock_s));
+	}
+	fprintf(stderr, "\n");
 
 	// Zero out data
-	info("Writing data blocks");
+	info("Writing data blocks...");
 	for(uint64_t i = 0; i < data_blocks; i++){
 		progress(i + 1, data_blocks, 100, 79);
 		write(file, zero_block, BLOCK_SIZE);
 	}
 	fprintf(stderr, "\n");
 
-	print_superblock(&sb);
+	print_superblock(msb);
 
+	free(jsb);
+	free(msb);
 	free(blocks_per_level);
 	free(zero_block);
 	for(int i = 0; i < levels; i++){

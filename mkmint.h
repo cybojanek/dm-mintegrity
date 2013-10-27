@@ -18,9 +18,46 @@ struct mint_superblock {
 	char salt[128];           /**< Salt */
 	char root[128];           /**< Root hash */     
 	char hmac[128];           /**< Signed hmac of root */
-	char pad[14];             /** Padding */
-	char pad_block[BLOCK_SIZE - 512];
+	char pad[14];             /**< Padding */
+	char pad_block[BLOCK_SIZE - 512];  /**< Padding to block size */
 }__attribute__((packed));
+
+struct journal_header_s {
+	uint32_t h_magic;      /**< Magic number 0xC03B3998 */
+	uint32_t h_blocktype;  /**< 1 Descriptor
+								2 Block commit record
+								3 Journal superblock v1
+								4 Journal superblock v2
+								5 Block revocation records */
+	uint32_t h_sequence;   /**< Transaction ID that goes with this block */
+}__attribute__((packed));
+
+struct journal_superblock_s {
+	struct journal_header_s s_header;  /**< Header superblock */
+	/* Static information */
+	uint32_t s_blocksize;  /**< Journal device block size */
+	uint32_t s_maxlen;     /**< Total number of blocks in this journal */
+	uint32_t s_first;      /**< First block of log information */
+	/* Dynamic information */
+	uint32_t s_sequence;   /**< First commid ID expected in log */
+	uint32_t s_start;      /**< Block number of the start of log */
+	uint32_t s_errno;      /**< Error value set by jbd2_journal_abort() */
+	/* Only valid in version 2 superblock */
+	uint32_t s_feature_compat;   /**< 0x1 Journal maintains checksums on data blocks */
+	uint32_t s_feature_incompat; /**< 0x1 Journal has block revocation records
+									  0x2 Journal can deal with 64 bit block numbers
+									  0x4 Jornal commits asynchronously */
+	uint32_t s_feature_ro_compat; /**< Read only compatibility set. None */
+	uint8_t s_uuid[16];  /**< 128 bit uuid for journal. Compared against ext4 superblock (and now ours?) */
+	uint32_t s_nr_users;  /**< Number of filesystems sharing this journal */
+	uint32_t s_dynsuper;  /** Location of dynamic super block copy. Not used? */
+	uint32_t s_max_transaction;  /** Limit of journal blocks per transaction. Not used? */
+	uint32_t s_max_trans_data;  /** Limit of data blocks per transaction. Not used? */
+	uint32_t s_padding[44];
+	uint8_t s_users[16 * 48];  /**< Ids of all filesystems sharing the log. Not used? */
+	uint8_t pad_block[BLOCK_SIZE - 1024];  /**< Padding to block size */
+}__attribute__((packed));
+
 
 ///////////////////////////////////////////////////////////////////////////////
 ////////////////////////////////// Printing ///////////////////////////////////
