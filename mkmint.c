@@ -1,25 +1,89 @@
 #include <fcntl.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
 #include <unistd.h>
-#include <sys/stat.h>
-#include <uuid/uuid.h>
-// #include <sys/types.h>
-#include <openssl/sha.h>
-#include <openssl/evp.h>
 
+#include <openssl/evp.h>
+#include <openssl/sha.h>
+
+#include <sys/stat.h>
+
+#include <uuid/uuid.h>
 
 #include "mkmint.h"
 
 const char *dev, *hash_type, *hmac_type, *salt, *secret;
 
-int n_hash_types = 3;
-const char *hash_types[] = {"sha1", "sha256", "sha512"};
-const uint32_t hash_types_bits[] = {160, 256, 512};
+/** @brief Print progress bar
+ *
+ * @param i Current index
+ * @param n Total number of things
+ * @param r How many times to update
+ * @param w Total width of progress bar
+ */
+static inline void progress(uint64_t i, uint64_t n, uint8_t r, uint8_t w){
+	if(i % (n/r) != 0 && i != n){ return; }
+	char line[w + 1];
+	sprintf(line, " %3llu%% [", i != n ? i * 100 / n : 100);
+	uint8_t points = i != n ? 7 + (w - 9) * i / n : 7 + w - 9;
+	for(uint8_t i = 7; i < points; i++){
+		line[i] = '=';
+	}
+	for(uint8_t i = points; i < w - 2; i++){
+		line[i] = ' ';
+	}
+	line[w - 2] = ']';
+	line[w - 1] = '\r';
+	line[w] = 0;
+	fprintf(stderr, "%s", line);
+}
 
-#define divide_up(x, y) (x == 0 ? x : (1 + ((x - 1) / y)))
+/** @brief Convert an array of bytes to a hex strings
+ *
+ * Caller's responsibility to check that out is long enough
+ *
+ * @param bytes Bytes to convert
+ * @param len Number of bytes
+ * @param out[out] Null terminated hex string of bytes
+ */
+void bytes_to_hex(char *bytes, size_t len, char *out){
+	for(size_t i = 0; i < len; i++){
+		out += sprintf(out, "%02x", (uint8_t)bytes[i]);
+	}
+	*(out + 1) = 0;
+}
+
+/** @brief Print out the superblock struct to stdout
+ *
+ * @param sb Superblock
+ */
+void print_superblock(struct mint_superblock *sb){
+	char *buf = (char*)(malloc(4096));
+	const EVP_MD *md;
+	md = EVP_get_digestbyname(sb->hash_algorithm);
+	uint32_t hash_bytes = EVP_MD_size(md);
+	md = EVP_get_digestbyname(sb->hmac_algorithm);
+	uint32_t hmac_bytes = EVP_MD_size(md);
+	printf("Name: %s\n", sb->name);
+	printf("Version: %u\n", sb->version);
+	bytes_to_hex(sb->uuid, 16, buf);
+	printf("UUID: %s\n", buf);
+	printf("Hash_Type: %s\n", sb->hash_algorithm);
+	printf("Hmac_Type: %s\n", sb->hmac_algorithm);
+	printf("Block_Size: %u\n", sb->block_size);
+	printf("Data_Blocks: %llu\n", sb->data_blocks);
+	printf("Hash_Blocks: %u\n", sb->hash_blocks);
+	printf("JBD_Blocks: %u\n", sb->jbd_blocks);
+	printf("Salt_Size: %u\n", sb->salt_size);
+	printf("Salt: %s\n", sb->salt);
+	bytes_to_hex(sb->root, hash_bytes, buf);
+	printf("Root_Hash: %s\n", buf);
+	bytes_to_hex(sb->hmac, hmac_bytes, buf);
+	printf("Hmac_Hash: %s\n", buf);
+	free(buf);
+}
 
 /** @brief Compute the number of hash blocks needed
  *
@@ -112,6 +176,7 @@ int compute_block_numbers(uint64_t blocks, uint32_t fanout,
 			break;
 		}
 	}
+	free(bpl);
 	// Failed at first try
 	if(*pad_blocks == blocks){
 		return -1;
@@ -120,8 +185,18 @@ int compute_block_numbers(uint64_t blocks, uint32_t fanout,
 	}
 }
 
-/**
+/** @brief Compute the hash of some input with a salt
  *
+ * Salt length can be 0. Updates are: update(salt), update(input), update(salt)
+ *
+ * @param md Message digest algorithm
+ * @param mdctx Message digest context
+ * @param input Input bytes
+ * @param i Number of input bytes
+ * @param salt Salt bytes
+ * @param s Number of salt bytes
+ * @param out[out] Binary digest output
+ * @param hash_length[out] Size of digest in bytes
  */
 void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const uint8_t *input, size_t i,
 	const uint8_t *salt, size_t s, uint8_t *out, uint32_t *hash_length){
@@ -143,30 +218,29 @@ int main(int argc, char const *argv[]) {
 	hmac_type = argv[4];
 	secret = argv[5];
 
-	EVP_MD_CTX *mdctx = EVP_MD_CTX_create();
-	const EVP_MD *md;
 	OpenSSL_add_all_digests();
-	md = EVP_get_digestbyname(hash_type);
-	if(!md){
+
+	// Block hash algorithm
+	EVP_MD_CTX *mdctx_hash = EVP_MD_CTX_create();
+	const EVP_MD *md_hash;
+	md_hash = EVP_get_digestbyname(hash_type);
+	if(!md_hash){
 		exit_error_f("Unsupported hash type: %s", hash_type);
 	}
+	uint32_t hash_bytes = EVP_MD_size(md_hash);
 
-	uint32_t hash_bytes = EVP_MD_size(md);
-
-	// Check hmac type
-	uint32_t hmac_bits = 0;
-	for(int i = 0; i < n_hash_types; i++){
-		if(strcmp(hash_type, hash_types[i]) == 0){
-			hmac_bits = hash_types_bits[i];
-		}
+	// Hmac algorithm
+	EVP_MD_CTX *mdctx_hmac = EVP_MD_CTX_create();
+	const EVP_MD *md_hmac;
+	md_hmac = EVP_get_digestbyname(hmac_type);
+	if(!md_hmac){
+		exit_error_f("Unsupported hmac type: %s", hmac_type);
 	}
-	if(hmac_bits == 0){
-		exit_error_f("Unsupported hmac type: %s", hash_type);
-	}
+	// uint32_t hmac_bytes = EVP_MD_size(md_hmac);
 
 	// Check salt
-	if(strlen(salt) > 256){
-		exit_error_f("Salt has to be of length: [0, 256]");
+	if(strlen(salt) > 128){
+		exit_error_f("Salt has to be of length: [0, 128]");
 	}
 
 	// Open destination device
@@ -200,7 +274,7 @@ int main(int argc, char const *argv[]) {
 	// Fanout
 	uint32_t fanout = BLOCK_SIZE / hash_bytes;
 
-	// compute_hash_blocks(11, 2, &levels, &hash_blocks);
+	// Use up entire block device
 	compute_block_numbers(blocks, fanout, &data_blocks,
 		&hash_blocks, &jbd_blocks, &pad_blocks, &levels, blocks_per_level);
 	
@@ -221,16 +295,14 @@ int main(int argc, char const *argv[]) {
 
 
 	// Calculate each hash block level
-	// uint8_t **levels = malloc(sizeof(uint8_t*) * )
 	uint8_t **hash_levels = (uint8_t**)malloc(sizeof(uint8_t*) * levels);
 	uint8_t hash_output[EVP_MAX_MD_SIZE];
-	uint8_t root_hash[EVP_MAX_MD_SIZE];
 	uint32_t hash_length;
 	uint8_t *zero_block = (uint8_t*)malloc(BLOCK_SIZE);
 	bzero(zero_block, BLOCK_SIZE);
 
 	// Data hash
-	hash(md, mdctx, zero_block, BLOCK_SIZE, (uint8_t*)salt,
+	hash(md_hash, mdctx_hash, zero_block, BLOCK_SIZE, (uint8_t*)salt,
 		strlen(salt), hash_output, &hash_length);
 
 	// Now loop through each level
@@ -240,12 +312,9 @@ int main(int argc, char const *argv[]) {
 		for(uint32_t f = 0; f < fanout; f++){
 			memcpy(hash_levels[i] + (f * hash_length), hash_output, hash_length);
 		}
-		hash(md, mdctx, hash_levels[i], BLOCK_SIZE, (uint8_t*)salt, strlen(salt),
+		hash(md_hash, mdctx_hash, hash_levels[i], BLOCK_SIZE, (uint8_t*)salt, strlen(salt),
 			hash_output, &hash_length);
 	}
-	// Save root
-	memcpy(root_hash, hash_output, hash_length);
-
 
 	// Write out hash superblock
 	struct mint_superblock sb;
@@ -271,30 +340,47 @@ int main(int argc, char const *argv[]) {
 	sb.hash_blocks = hash_blocks;
 	sb.jbd_blocks = jbd_blocks;
 	// Set salt size
-	sb.salt_size = strlen(sb.salt);
+	sb.salt_size = strlen(salt);
 	// Copy salt
 	stpcpy(sb.salt, salt);
-	// TODO: set sb.hmac
+	// Set root hash
+	memcpy(sb.root, hash_output, hash_length);
+	// Set hmac
+	hash(md_hmac, mdctx_hmac, (uint8_t*)sb.root, hash_length, (uint8_t*)secret,
+		strlen(secret), (uint8_t*)sb.hmac, &hash_length);
 	// Write it out!
 	write(file, &sb, sizeof(struct mint_superblock));
 
 	// Write out hash block levels
+	info("Writing hash blocks");
+	uint32_t h_written = 0;
 	for(int i = levels - 1; i >= 0; i--){
-		info("Writing hash level: %d, blocks: %u", i, blocks_per_level[i]);
 		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
+			progress(++h_written, hash_blocks, 100, 79);
 			write(file, hash_levels[i], BLOCK_SIZE);
 		}
 	}
+	fprintf(stderr, "\n");
 
 	// Initialize journal
 
 	// Zero out data
+	info("Writing data blocks");
 	for(uint64_t i = 0; i < data_blocks; i++){
+		progress(i + 1, data_blocks, 100, 79);
 		write(file, zero_block, BLOCK_SIZE);
 	}
+	fprintf(stderr, "\n");
 
-	/* code */
+	print_superblock(&sb);
+
+	free(blocks_per_level);
+	free(zero_block);
+	for(int i = 0; i < levels; i++){
+		free(hash_levels[i]);
+	}
+	free(hash_levels);
 	close(file);
-	EVP_MD_CTX_destroy(mdctx);
+	EVP_MD_CTX_destroy(mdctx_hash);
 	return 0;
 }

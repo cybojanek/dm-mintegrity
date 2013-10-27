@@ -2,6 +2,8 @@
 #define BLOCK_SIZE 4096
 #define JBD_LEVEL_FACTOR 100
 
+#define divide_up(x, y) (x == 0 ? x : (1 + ((x - 1) / y)))
+
 struct mint_superblock {
 	char name[8];             /**< Mint */
 	uint32_t version;         /**< dm-mintegrity superblock version */
@@ -13,7 +15,8 @@ struct mint_superblock {
 	uint32_t hash_blocks;     /**< Number of hash blocks */
 	uint32_t jbd_blocks;      /**< Number of JBD blocks */
 	uint16_t salt_size;       /**< Size of salt */
-	char salt[256];           /**< Salt */         
+	char salt[128];           /**< Salt */
+	char root[128];           /**< Root hash */     
 	char hmac[128];           /**< Signed hmac of root */
 	char pad[14];             /** Padding */
 	char pad_block[BLOCK_SIZE - 512];
@@ -58,7 +61,7 @@ struct mint_superblock {
  * @param fmt format string
  * @param ... args for format string
  */
-#define info(fmt, ...) fprintf(stderr, "\033[32m[INFO]\033[0m \033[35m%s:%d:\033[0m " fmt"\n", __FILE__, __LINE__, ##__VA_ARGS__)
+#define info(fmt, ...) fprintf(stderr, "\033[32m[INFO]\033[0m " fmt"\n", ##__VA_ARGS__)
 
 /*! @brief Print a log message to stderr
  *
