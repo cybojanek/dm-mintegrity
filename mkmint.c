@@ -15,6 +15,7 @@
 
 const char *dev, *hash_type, *hmac_type, *salt, *secret;
 
+#define NUM_TRANSACTIONS 100
 /** @brief Print progress bar
  *
  * @param i Current index
@@ -23,7 +24,7 @@ const char *dev, *hash_type, *hmac_type, *salt, *secret;
  * @param w Total width of progress bar
  */
 static inline void progress(uint64_t i, uint64_t n, uint8_t r, uint8_t w){
-	if(i % (n/r) != 0 && i != n){ return; }
+	if((n/r) != 0 && i % (n/r) != 0 && i != n){ return; }
 	char line[w + 1];
 	sprintf(line, " %3llu%% [", i != n ? i * 100 / n : 100);
 	uint8_t points = i != n ? 7 + (w - 9) * i / n : 7 + w - 9;
@@ -66,7 +67,7 @@ void print_superblock(struct mint_superblock *sb){
 	md = EVP_get_digestbyname(sb->hmac_algorithm);
 	uint32_t hmac_bytes = EVP_MD_size(md);
 	printf("[ dm-mintegrity superblock ]\n");
-	printf("Name: %s\n", sb->name);
+	printf("Magic: %#0x\n", sb->magic);
 	printf("Version: %u\n", sb->version);
 	bytes_to_hex(sb->uuid, 16, buf);
 	printf("UUID: %s\n", buf);
@@ -75,7 +76,7 @@ void print_superblock(struct mint_superblock *sb){
 	printf("Block_Size: %u\n", sb->block_size);
 	printf("Data_Blocks: %llu\n", sb->data_blocks);
 	printf("Hash_Blocks: %u\n", sb->hash_blocks);
-	printf("JBD_Blocks: %u\n", sb->jbd_blocks);
+	printf("JB_Blocks: %u\n", sb->jb_blocks);
 	printf("Salt_Size: %u\n", sb->salt_size);
 	printf("Salt: %s\n", sb->salt);
 	bytes_to_hex(sb->root, hash_bytes, buf);
@@ -124,15 +125,16 @@ int compute_hash_blocks(uint64_t data_blocks, uint32_t fanout,
  * @param fanout Number of hashes that fit in a hash block
  * @param data_blocks[out] Number of data blocks writeable
  * @param hash_blocks[out] Number of blocks needed for hashes
- * @param jbd_blocks[out] Number of blocks needed for journal
- * @param pad_blocks[out] Number of blocks wasted (could be repurposed for JBD)
+ * @param jb_blocks[out] Number of blocks needed for journal
+ * @param pad_blocks[out] Number of blocks wasted
  * @param levels[out] Number of hash block levels (not including data level)
  *
  * @return 0 if ok else error
  */
 int compute_block_numbers(uint64_t blocks, uint32_t fanout,
-	uint64_t *data_blocks, uint32_t *hash_blocks, uint32_t *jbd_blocks,
-	uint32_t *pad_blocks, uint32_t *levels, uint32_t *blocks_per_level){
+	uint64_t *data_blocks, uint32_t *hash_blocks, uint32_t *jb_blocks,
+	uint32_t *pad_blocks, uint32_t *levels, uint32_t *blocks_per_level,
+	uint32_t hash_bytes){
 
 	// Remove one for superblocks
 	blocks = blocks - 1;
@@ -151,8 +153,11 @@ int compute_block_numbers(uint64_t blocks, uint32_t fanout,
 			break; // Barf
 		}
 
-		// Number of jbd blocks needed
-		jb = JBD_LEVEL_FACTOR * lev;
+		// Number of jb blocks needed
+		uint32_t hash_transactions_per_block = (BLOCK_SIZE / (hash_bytes * lev + sizeof(uint32_t)));
+		// Suerpblock, data blocks, hash transactions
+		jb = 1 + NUM_TRANSACTIONS + divide_up(NUM_TRANSACTIONS, hash_transactions_per_block);
+
 		used = db + jb + hb;
 		pb = blocks - used;
 
@@ -160,7 +165,7 @@ int compute_block_numbers(uint64_t blocks, uint32_t fanout,
 		if(used <= blocks && pb < *pad_blocks){
 			*data_blocks = db;
 			*hash_blocks = hb;
-			*jbd_blocks = jb;
+			*jb_blocks = jb;
 			*pad_blocks = pb;
 			*levels = lev;
 			for(int i = 0; i < *levels; i++){
@@ -260,7 +265,9 @@ int main(int argc, char const *argv[]) {
 	// Calculate data size, hash block size, journal size
 	// TODO: uh...this is 64 bits...
 	uint64_t data_blocks = 0;
-	uint32_t hash_blocks = 0, jbd_blocks = 0, pad_blocks = 0;
+	uint32_t hash_blocks = 0;
+	uint32_t jb_blocks = 0;
+	uint32_t pad_blocks = 0;
 	uint32_t *blocks_per_level = malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 	uint32_t levels = 0;
 	uint64_t blocks = file_stats.st_size / BLOCK_SIZE;
@@ -275,19 +282,19 @@ int main(int argc, char const *argv[]) {
 	uint32_t fanout = BLOCK_SIZE / hash_bytes;
 
 	// Use up entire block device
-	compute_block_numbers(blocks, fanout, &data_blocks,
-		&hash_blocks, &jbd_blocks, &pad_blocks, &levels, blocks_per_level);
+	compute_block_numbers(blocks, fanout, &data_blocks, &hash_blocks,
+		&jb_blocks, &pad_blocks, &levels, blocks_per_level, hash_bytes);
 	
 	// Result info
-	info("Blocks -- Data: %llu, Hash: %u, JBD: %u, Pad: %u, Levels: %u",
-			data_blocks, hash_blocks, jbd_blocks, pad_blocks, levels);
+	info("Blocks -- Data: %llu, Hash: %u, JB: %u, Pad: %u, Levels: %u",
+			data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
 
 	// Sanity check
-	if(data_blocks + hash_blocks + jbd_blocks + pad_blocks + 1!= blocks){
-		warn("Data: %llu, Hash: %u, JBD: %u, Pad: %u, Levels: %u",
-			data_blocks, hash_blocks, jbd_blocks, pad_blocks, levels);
+	if(data_blocks + hash_blocks + jb_blocks + pad_blocks + 1!= blocks){
+		warn("Data: %llu, Hash: %u, JB: %u, Pad: %u, Levels: %u",
+			data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
 		exit_error_f("Sanity check failed!: %llu != %llu",
-			data_blocks + hash_blocks + jbd_blocks + pad_blocks + 1, blocks);
+			data_blocks + hash_blocks + jb_blocks + pad_blocks + 1, blocks);
 	}
 
 	// Calculate each hash block level
@@ -318,8 +325,8 @@ int main(int argc, char const *argv[]) {
 	struct mint_superblock *msb = malloc(sizeof(struct mint_superblock));
 	// Zero out everything
 	bzero(msb, sizeof(struct mint_superblock));
-	// Name
-	stpcpy(msb->name, "mint");
+	// Magic
+	msb->magic = 0x796c694c;
 	// Version
 	msb->version = 1;
 	// Make a new uuid!
@@ -336,7 +343,7 @@ int main(int argc, char const *argv[]) {
 	// Set block numbers
 	msb->data_blocks = data_blocks;
 	msb->hash_blocks = hash_blocks;
-	msb->jbd_blocks = jbd_blocks;
+	msb->jb_blocks = jb_blocks;
 	// Set salt size
 	msb->salt_size = strlen(salt);
 	// Copy salt
@@ -351,40 +358,51 @@ int main(int argc, char const *argv[]) {
 
 	// Write out hash block levels
 	info("Writing hash blocks...");
-	uint32_t h_written = 0;
+	uint32_t h_written = 1;
 	for(int i = levels - 1; i >= 0; i--){
 		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
-			progress(++h_written, hash_blocks, 100, 79);
+			// debug("level: %u, block: %u", i, j);
+			progress(h_written++, hash_blocks, 100, 79);
 			write(file, hash_levels[i], BLOCK_SIZE);
 		}
 	}
 	fprintf(stderr, "\n");
 
 	// Initialize journal
-	struct journal_superblock_s *jsb = malloc(sizeof(struct journal_superblock_s));
-	bzero(jsb, sizeof(struct journal_superblock_s));
-	// Header initilization - numbers are all big endian
-	// Magic number
-	jsb->s_header.h_magic = htonl(0xC03B3998);
-	jsb->s_header.h_blocktype = htonl(4);
-	// Block device size
-	jsb->s_blocksize = htonl(BLOCK_SIZE);
-	// Total jbd blocks - 1 for header
-	jsb->s_maxlen = htonl(jbd_blocks - 1);
-	// First after this one ??
-	jsb->s_first = htonl(1);
-	// Sequence 1
-	jsb->s_sequence = htonl(1);
-	// Copy over mint uuid - kind of like ext4 does
-	memcpy(jsb->s_uuid, msb->uuid, 16);
-	// Number of users is 1
-	jsb->s_nr_users = htonl(1);
-	// Everything else is already zeroed
+	struct mint_journal_superblock *mjsb = (struct mint_journal_superblock*)malloc(sizeof(struct mint_journal_superblock));
+	bzero(mjsb, sizeof(struct mint_journal_superblock));
+	// // Magic
+	mjsb->magic[0] = 0x6c; mjsb->magic[1] = 0x69; mjsb->magic[2] = 0x6c; mjsb->magic[3] = 0x79;
+	mjsb->magic[4] = 0x6d; mjsb->magic[5] = 0x75; mjsb->magic[6] = 0x66; mjsb->magic[7] = 0x66;
+	mjsb->magic[8] = 0x69; mjsb->magic[9] = 0x6e; mjsb->magic[10] = 0x00; mjsb->magic[11] = 0x00;
+	mjsb->magic[12] = 0x00; mjsb->magic[13] = 0x00; mjsb->magic[14] = 0x00; mjsb->magic[15] = 0x00;
+	// Maximum number of supported transactions
+	mjsb->transaction_capacity = NUM_TRANSACTIONS;
+	// Current amount of transactions - 0
+	mjsb->transaction_fill = 0;
+	// Block size
+	mjsb->block_size = BLOCK_SIZE;
+	// Number of blocks - including journal
+	mjsb->num_blocks = jb_blocks;
+	// Number of hash levels
+	mjsb->hash_levels = levels;
+	// Number of bytes in a hash
+	mjsb->hash_bytes = hash_bytes;
+	// Clean
+	mjsb->state = 0;
+	// Zeroed
+	// mjsb->hmac = 
+	// Zeroed
+	// mjsb->pad
+	// Zeroed
+	// mjsb->pad_block
+
 	info("Writing journal...");
-	// Write jbd superblock...as many times as we have blocks. ext4 does this...
-	for(uint32_t i = 0 ; i < jbd_blocks; i++){
-		progress(i + 1, jbd_blocks, 100, 79);
-		write(file, jsb, sizeof(struct journal_superblock_s));
+	// Doesn't matter that the rest are the same - just duplicate the block
+	// everywhere - I think even mkfs.ext3/ext4 does it the same way
+	for(uint32_t i = 0 ; i < jb_blocks; i++){
+		progress(i + 1, jb_blocks, 100, 79);
+		write(file, mjsb, sizeof(struct mint_journal_superblock));
 	}
 	fprintf(stderr, "\n");
 
@@ -398,7 +416,7 @@ int main(int argc, char const *argv[]) {
 
 	print_superblock(msb);
 
-	free(jsb);
+	free(mjsb);
 	free(msb);
 	free(blocks_per_level);
 	free(zero_block);
