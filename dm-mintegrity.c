@@ -16,11 +16,11 @@
 
 #include "dm-bufio.h"
 
-#include <linux/printk.h>
-#include <linux/module.h>
-#include <linux/rwsem.h>
-#include <linux/device-mapper.h>
 #include <crypto/hash.h>
+#include <linux/device-mapper.h>
+#include <linux/module.h>
+#include <linux/printk.h>
+#include <linux/rwsem.h>
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -44,10 +44,15 @@ struct dm_mintegrity {
 	u8 *root_digest;	/* digest of the root block */
 	u8 *salt;		/* salt: its size is salt_size */
 	unsigned salt_size;
-	sector_t data_start;	/* data offset in 512-byte sectors */
+
 	sector_t hash_start;	/* hash start in blocks */
-	sector_t data_blocks;	/* the number of data blocks */
+	sector_t journal_start;	/* journal start in blocks */
+	sector_t data_start;	/* data offset in 512-byte sectors */
+
 	sector_t hash_blocks;	/* the number of hash blocks */
+	sector_t journal_blocks;/* the number of journal blocks */
+	sector_t data_blocks;	/* the number of data blocks */
+
 	unsigned char data_dev_block_bits;	/* log2(data blocksize) */
 	unsigned char hash_dev_block_bits;	/* log2(hash blocksize) */
 	unsigned char hash_per_block_bits;	/* log2(hashes in hash block) */
@@ -162,6 +167,7 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
  */
 static sector_t mintegrity_map_sector(struct dm_mintegrity *v, sector_t bi_sector)
 {
+	// printk("%lu -> %lu | ", bi_sector, v->data_start + dm_target_offset(v->ti, bi_sector));
 	return v->data_start + dm_target_offset(v->ti, bi_sector);
 }
 
@@ -198,7 +204,7 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, in
 /*
  * Calculate hash of buffer and put it in io_real_digest
  */
-int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data, unsigned int len)
+static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data, unsigned int len)
 {
 	struct dm_mintegrity *v = io->v;
 	struct shash_desc *desc;
@@ -262,6 +268,8 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 	mintegrity_hash_at_level(v, block, level, &hash_block, &offset);
 
 	data = dm_bufio_read(v->bufio, hash_block, &buf);
+	// printk("block: %u, level: %d, bufio hash_block: %u, offset: %u", block, level, hash_block, offset);
+	// print_hex_dump(KERN_CRIT, "hash data: ", DUMP_PREFIX_NONE, 16, 1, data, v->digest_size * 2, false);
 	if (unlikely(IS_ERR(data)))
 		return PTR_ERR(data);
 
@@ -293,6 +301,9 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			}
 		}
 
+		// print_hex_dump(KERN_CRIT, "hash data: ", DUMP_PREFIX_NONE, 16, 1, data, 1 << v->hash_dev_block_bits, false);
+
+
 		r = crypto_shash_update(desc, data, 1 << v->hash_dev_block_bits);
 		if (r < 0) {
 			DMERR("crypto_shash_update failed: %d", r);
@@ -300,6 +311,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		}
 
 		if (!v->version) {
+			printk("SALT 2");
 			r = crypto_shash_update(desc, v->salt, v->salt_size);
 			if (r < 0) {
 				DMERR("crypto_shash_update failed: %d", r);
@@ -313,6 +325,11 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			DMERR("crypto_shash_final failed: %d", r);
 			goto release_ret_r;
 		}
+
+		// print_hex_dump(KERN_CRIT, "hash: ", DUMP_PREFIX_NONE, 16, 1, result, v->digest_size, false);
+		// print_hex_dump(KERN_CRIT, "want: ", DUMP_PREFIX_NONE, 16, 1, io_want_digest(v, io), v->digest_size, false);
+
+
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("metadata block %llu is corrupted",
 				(unsigned long long)hash_block);
@@ -376,6 +393,7 @@ static int mintegrity_verify_io(struct dm_mintegrity_io *io)
 		}
 
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
+		// print_hex_dump(KERN_CRIT, "root: ", DUMP_PREFIX_NONE, 16, 1, v->root_digest, v->digest_size, false);
 
 		for (i = v->levels - 1; i >= 0; i--) {
 			int r = mintegrity_verify_level(io, io->block + b, i, false,
@@ -415,6 +433,8 @@ test_block_hash:
 			if (likely(len >= todo))
 				len = todo;
 			// NOTE: is this where the data is hashed?
+			// print_hex_dump(KERN_CRIT, "data: ", DUMP_PREFIX_NONE, 16, 1, page + bv->bv_offset + offset, len, false);
+			// print_hex_dump_bytes("data", DUMP_PREFIX_NONE, page + bv->bv_offset + offset, len);
 			r = crypto_shash_update(desc,
 					page + bv->bv_offset + offset, len);
 			kunmap_atomic(page);
@@ -444,6 +464,11 @@ test_block_hash:
 			DMERR("crypto_shash_final failed: %d", r);
 			return r;
 		}
+
+		// print_hex_dump_bytes("hash", DUMP_PREFIX_NONE, result, 32);
+		// printk("HERE");
+
+
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("data block %llu is corrupted",
 				(unsigned long long)(io->block + b));
@@ -513,6 +538,10 @@ static void mintegrity_write_work(struct work_struct *w)
 		int r;
 		u8 * result;
 		unsigned todo;
+
+		sector_t hash_block;
+		struct dm_buffer *buf;
+		u8 *data;
 
 		// The io digest we want is the root
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
@@ -594,17 +623,13 @@ static void mintegrity_write_work(struct work_struct *w)
 		}
 
 		// Copy data hash into first level
-		unsigned offset;
-		sector_t hash_block;
-		struct dm_buffer *buf;
-
 		// Hash offset
 		mintegrity_hash_at_level(v, io->block + b, 0, &hash_block, &offset);
 		// Set hash for first level
 		memcpy(io->hb_vec + offset, result, v->digest_size);
 		// Write block to disk
 		// TODO: remove bufio
-		u8 *data = dm_bufio_read(v->bufio, hash_block, &buf);
+		data = dm_bufio_read(v->bufio, hash_block, &buf);
 		memcpy(data, io->hb_vec, (1 << v->hash_dev_block_bits));
 		dm_bufio_mark_buffer_dirty(buf);
 		dm_bufio_release(buf);
@@ -752,7 +777,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 	}
 
 	if (bio_end_sector(bio) >>
-	    (v->data_dev_block_bits - SECTOR_SHIFT) > v->data_blocks) {
+	    (v->data_dev_block_bits - SECTOR_SHIFT) > v->data_blocks + (v->data_start * 8)) {
 		DMERR_LIMIT("io out of range");
 		return -EIO;
 	}
@@ -980,8 +1005,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	if (argc != 10) {
-		ti->error = "Invalid argument count: exactly 10 arguments required";
+	if (argc != 11) {
+		ti->error = "Invalid argument count: exactly 11 arguments required";
 		r = -EINVAL;
 		goto bad;
 	}
@@ -992,7 +1017,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		r = -EINVAL;
 		goto bad;
 	}
-	v->version = num;
+	v->version = 1;
 
 	r = dm_get_device(ti, argv[1], dm_table_get_mode(ti->table), &v->data_dev);
 	if (r) {
@@ -1000,13 +1025,15 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	r = dm_get_device(ti, argv[2], dm_table_get_mode(ti->table), &v->hash_dev);
+	// SAME DEVICE: what happens now?
+	r = dm_get_device(ti, argv[1], dm_table_get_mode(ti->table), &v->hash_dev);
 	if (r) {
 		ti->error = "Data device lookup failed";
 		goto bad;
 	}
+	printk("Block device logical size: %lu |", bdev_logical_block_size(v->data_dev->bdev));
 
-	if (sscanf(argv[3], "%u%c", &num, &dummy) != 1 ||
+	if (sscanf(argv[2], "%u%c", &num, &dummy) != 1 ||
 	    !num || (num & (num - 1)) ||
 	    num < bdev_logical_block_size(v->data_dev->bdev) ||
 	    num > PAGE_SIZE) {
@@ -1015,16 +1042,25 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 	v->data_dev_block_bits = __ffs(num);
+	v->hash_dev_block_bits = __ffs(num);
 
-	if (sscanf(argv[4], "%u%c", &num, &dummy) != 1 ||
-	    !num || (num & (num - 1)) ||
-	    num < bdev_logical_block_size(v->hash_dev->bdev) ||
-	    num > INT_MAX) {
-		ti->error = "Invalid hash device block size";
+	// 3 hash blocks
+	if (sscanf(argv[3], "%llu%c", &num_ll, &dummy) != 1){
+		ti->error = "Invalid number of hash blocks";
 		r = -EINVAL;
 		goto bad;
 	}
-	v->hash_dev_block_bits = __ffs(num);
+	v->hash_blocks = num_ll;
+	v->hash_start = 1;
+
+	// 4 jb blocks
+	if (sscanf(argv[4], "%llu%c", &num_ll, &dummy) != 1){
+		ti->error = "Invalid number of journal blocks";
+		r = -EINVAL;
+		goto bad;
+	}
+	v->journal_blocks = num_ll;
+	v->journal_start = v->hash_start + v->hash_blocks;
 
 	if (sscanf(argv[5], "%llu%c", &num_ll, &dummy) != 1 ||
 	    (sector_t)(num_ll << (v->data_dev_block_bits - SECTOR_SHIFT))
@@ -1034,23 +1070,19 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 	v->data_blocks = num_ll;
+	// TODO: struct says this is in 512 byte sectors...
+	v->data_start = (v->journal_start + v->journal_blocks) * 8;
+	// v->data_start = 0;
+	printk("v->data_start: %llu", v->data_start);
 
+	// TODO: adjust for jb and hash blocks
 	if (ti->len > (v->data_blocks << (v->data_dev_block_bits - SECTOR_SHIFT))) {
 		ti->error = "Data device is too small";
 		r = -EINVAL;
 		goto bad;
 	}
 
-	if (sscanf(argv[6], "%llu%c", &num_ll, &dummy) != 1 ||
-	    (sector_t)(num_ll << (v->hash_dev_block_bits - SECTOR_SHIFT))
-	    >> (v->hash_dev_block_bits - SECTOR_SHIFT) != num_ll) {
-		ti->error = "Invalid hash start";
-		r = -EINVAL;
-		goto bad;
-	}
-	v->hash_start = num_ll;
-
-	v->alg_name = kstrdup(argv[7], GFP_KERNEL);
+	v->alg_name = kstrdup(argv[6], GFP_KERNEL);
 	if (!v->alg_name) {
 		ti->error = "Cannot allocate algorithm name";
 		r = -ENOMEM;
@@ -1081,28 +1113,31 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 	// TODO - check hash on hash device when mounting
 	// not just wether its hex and of correct size
-	if (strlen(argv[8]) != v->digest_size * 2 ||
-	    hex2bin(v->root_digest, argv[8], v->digest_size)) {
+	if (strlen(argv[7]) != v->digest_size * 2 ||
+	    hex2bin(v->root_digest, argv[7], v->digest_size)) {
 		ti->error = "Invalid root digest";
 		r = -EINVAL;
 		goto bad;
 	}
 
-	if (strcmp(argv[9], "-")) {
-		v->salt_size = strlen(argv[9]) / 2;
+	if (strcmp(argv[8], "-")) {
+		v->salt_size = strlen(argv[8]) / 2;
 		v->salt = kmalloc(v->salt_size, GFP_KERNEL);
 		if (!v->salt) {
 			ti->error = "Cannot allocate salt";
 			r = -ENOMEM;
 			goto bad;
 		}
-		if (strlen(argv[9]) != v->salt_size * 2 ||
-		    hex2bin(v->salt, argv[9], v->salt_size)) {
+		if (strlen(argv[8]) != v->salt_size * 2 ||
+		    hex2bin(v->salt, argv[8], v->salt_size)) {
 			ti->error = "Invalid salt";
 			r = -EINVAL;
 			goto bad;
 		}
 	}
+
+	print_hex_dump(KERN_CRIT, "salt: ", DUMP_PREFIX_NONE, 16, 1, v->salt, v->salt_size, false);
+
 
 	v->hash_per_block_bits =
 		__fls((1 << v->hash_dev_block_bits) / v->digest_size);
@@ -1134,9 +1169,13 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		hash_position += s;
 	}
 	v->hash_blocks = hash_position;
+	for(i = 0; i < v->levels; i++){
+		printk("Level: %i, %llu", i, v->hash_level_block[i]);
+	}
 
+	printk("BUFIO Block size: %u", 1 << v->hash_dev_block_bits);
 	v->bufio = dm_bufio_client_create(v->hash_dev->bdev,
-		1 << v->hash_dev_block_bits, 32, sizeof(struct buffer_aux), // TODO: reserved count: levels + num online cpus * ?
+		1 << v->hash_dev_block_bits, 1, sizeof(struct buffer_aux), // TODO: reserved count: levels + num online cpus * ?
 		dm_bufio_alloc_callback, dm_bufio_write_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
@@ -1145,11 +1184,35 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
+	printk("bufio size: %lu", dm_bufio_get_device_size(v->bufio));
+
 	if (dm_bufio_get_device_size(v->bufio) < v->hash_blocks) {
 		ti->error = "Hash device is too small";
 		r = -E2BIG;
 		goto bad;
 	}
+
+	/** Journal setup **/
+	// Move it to earlier, before checking hash block
+	// journal device, fs device, start, length, block size
+	// TODO: actual offsets
+	// what about: jbd2_journal_load
+	// v->journal = jbd2_journal_init_dev(v->hash_dev->bdev, v->hash_dev->bdev,
+		// v->hash_blocks + 10, 100, (1 << v->hash_dev_block_bits));
+
+	// if(!v->journal) {
+		// ti->error = "Could not initialize journal";
+		// r = -EINVAL;
+		// goto bad;
+	// }
+
+	// TODO: recover journal
+	// TODO: don't clear journal every time...
+	// jbd2_journal_reset(v->journal);
+	// jbd2_journal_wipe(v->journal, 1);
+	// calls: jbd2_journal_recover
+	// jbd2_journal_load(v->journal);
+
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) + v->shash_descsize + v->digest_size * 2, __alignof__(struct dm_mintegrity_io));
 
@@ -1195,6 +1258,14 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	printk("bufio size is: %d", dm_bufio_get_block_size(v->bufio));
+
+	// struct dm_buffer *buf;
+	// struct buffer_aux *aux;
+	// u8 *data;
+	// data = dm_bufio_read(v->bufio, 1, &buf);
+	// print_hex_dump(KERN_CRIT, "hash data: ", DUMP_PREFIX_NONE, 16, 1, data, 4096, false);
+	// dm_bufio_release(buf);
+
 
 	return 0;
 

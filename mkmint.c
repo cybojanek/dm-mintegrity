@@ -13,9 +13,8 @@
 
 #include "mkmint.h"
 
-const char *dev, *hash_type, *hmac_type, *salt, *secret;
+#define NUM_TRANSACTIONS 0
 
-#define NUM_TRANSACTIONS 100
 /** @brief Print progress bar
  *
  * @param i Current index
@@ -48,11 +47,30 @@ static inline void progress(uint64_t i, uint64_t n, uint8_t r, uint8_t w){
  * @param len Number of bytes
  * @param out[out] Null terminated hex string of bytes
  */
-void bytes_to_hex(char *bytes, size_t len, char *out){
+void bytes_to_hex(const char *bytes, size_t len, char *out){
 	for(size_t i = 0; i < len; i++){
 		out += sprintf(out, "%02x", (uint8_t)bytes[i]);
 	}
 	*(out + 1) = 0;
+}
+
+/*! @brief Convert an ascii string of hex bytes to bytes
+ *
+ * Out should be of length len/2
+ *
+ * @param hex Hex string to convert
+ * @param len Length of hex string
+ * @param out[out] Output bytes
+ *
+ * @return 0 no error, -1 error in parsing
+ */
+int hex_to_bytes(const char *hex, size_t len, char *out){
+	for(size_t i = 0; i < len / 2; i++){
+		if(sscanf(hex + 2 * i, "%02x", &out[i]) != 1){
+			return -1;
+		}
+	}
+	return 0;
 }
 
 /** @brief Print out the superblock struct to stdout
@@ -78,7 +96,8 @@ void print_superblock(struct mint_superblock *sb){
 	printf("Hash_Blocks: %u\n", sb->hash_blocks);
 	printf("JB_Blocks: %u\n", sb->jb_blocks);
 	printf("Salt_Size: %u\n", sb->salt_size);
-	printf("Salt: %s\n", sb->salt);
+	bytes_to_hex(sb->salt, sb->salt_size, buf);
+	printf("Salt: %s\n", buf);
 	bytes_to_hex(sb->root, hash_bytes, buf);
 	printf("Root_Hash: %s\n", buf);
 	bytes_to_hex(sb->hmac, hmac_bytes, buf);
@@ -131,33 +150,44 @@ int compute_hash_blocks(uint64_t data_blocks, uint32_t fanout,
  *
  * @return 0 if ok else error
  */
-int compute_block_numbers(uint64_t blocks, uint32_t fanout,
-	uint64_t *data_blocks, uint32_t *hash_blocks, uint32_t *jb_blocks,
-	uint32_t *pad_blocks, uint32_t *levels, uint32_t *blocks_per_level,
-	uint32_t hash_bytes){
+int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
+	uint32_t jb_transactions, uint64_t *data_blocks, uint32_t *hash_blocks,
+	uint32_t *jb_blocks, uint32_t *pad_blocks, uint32_t *levels,
+	uint32_t *blocks_per_level, uint32_t hash_bytes){
 
+	if(blocks < 6){
+		exit_error_f("Not enough space! Need at least 6 blocks!");
+		return -1;
+	}
 	// Remove one for superblocks
 	blocks = blocks - 1;
 	*pad_blocks = blocks;
 
-	uint64_t low = 0, high = blocks;
+	uint64_t low = 0;
+	uint64_t high = blocks;
 	uint32_t *bpl = (uint32_t*)malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 
+	debug("Blocks: %llu, Low: %llu, high: %llu", blocks, low, high);
+
+
 	while(high >= low && high != 0){
-		uint64_t mid = low + ((high - low) / 2);  // Non overflow method
+		uint64_t mid = low + divide_up((high - low), 2);  // Non overflow method
 		uint64_t db = mid, used = 0;
 		uint32_t hb = 0, jb = 0, pb = 0;
 		uint32_t lev;
 		// Number of hash blocks, levels needed for this many data blocks
+		debug("Low: %llu, high: %llu", low, high);
 		if(compute_hash_blocks(db, fanout, &lev, &hb, bpl) != 0){
 			break; // Barf
 		}
+		debug("Computed");
 
 		// Number of jb blocks needed
-		uint32_t hash_transactions_per_block = (BLOCK_SIZE / (hash_bytes * lev + sizeof(uint32_t)));
+		uint32_t hash_transactions_per_block = (block_size / (hash_bytes * lev + sizeof(uint32_t)));
 		// Suerpblock, data blocks, hash transactions
-		jb = 1 + NUM_TRANSACTIONS + divide_up(NUM_TRANSACTIONS, hash_transactions_per_block);
-
+		// TODL jb format
+		jb = 1 + jb_transactions + divide_up(jb_transactions, hash_transactions_per_block);
+		debug("JB: %u", jb);
 		used = db + jb + hb;
 		pb = blocks - used;
 
@@ -203,25 +233,62 @@ int compute_block_numbers(uint64_t blocks, uint32_t fanout,
  * @param out[out] Binary digest output
  * @param hash_length[out] Size of digest in bytes
  */
-void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const uint8_t *input, size_t i,
-	const uint8_t *salt, size_t s, uint8_t *out, uint32_t *hash_length){
+void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const char *input, size_t i,
+	const char *salt, size_t s, char *out, uint32_t *hash_length){
 	EVP_DigestInit_ex(mdctx, md, NULL);
 	EVP_DigestUpdate(mdctx, salt, s);
 	EVP_DigestUpdate(mdctx, input, i);
-	EVP_DigestUpdate(mdctx, salt, s);
-	EVP_DigestFinal_ex(mdctx, out, hash_length);
+	EVP_DigestFinal_ex(mdctx, (unsigned char*)out, hash_length);
 }
 
 int main(int argc, char const *argv[]) {
 	// Check for arguments
-	if(argc != 6){
-		exit_error_f("Usage: %s DEV HASH_TYPE SALT HMAC_TYPE SECRET", argv[0]);
+	if(argc != 8){
+		exit_error_f("Usage: %s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT HMAC_TYPE SECRET", argv[0]);
 	}
+	const char *dev, *hash_type, *hmac_type, *salt_str, *secret;
+	uint32_t block_size, jb_transactions;
+
 	dev = argv[1];
-	hash_type = argv[2];
-	salt = argv[3];
-	hmac_type = argv[4];
-	secret = argv[5];
+	hash_type = argv[4];
+	salt_str = argv[5];
+	hmac_type = argv[6];
+	secret = argv[7];
+
+	// Open destination device
+	int file;
+	if((file = open(dev, O_RDWR)) == -1){
+		exit_error_f("Could not open: '%s' for writing", dev);
+	}
+
+	// Get size
+	// TODO: size of file in 512 chunks?
+	struct stat file_stats;
+	if(fstat(file, &file_stats) == -1){
+		exit_error_f("Could not get file stats for: '%s'", dev);
+	}
+
+	// Get block size
+	if(sscanf(argv[2], "%u", &block_size) != 1){
+		exit_error_f("Invalid block size: '%s'", argv[2]);
+	}
+	if(block_size < 512){
+		exit_error_f("Invalid block size: '%u' < 512", block_size);
+	}
+
+	// Remainder check
+	if(file_stats.st_size % block_size != 0){
+		warn("File is not a multiple of block_size: %d. %llu bytes left over",
+			block_size, file_stats.st_size % block_size);
+	}
+
+	// Number of journal transactions
+	if(sscanf(argv[3], "%u", &jb_transactions) != 1){
+		exit_error_f("Invalid journal transaction number: '%s'", argv[3]);
+	}
+	if(jb_transactions == 0){
+		exit_error_f("Journal transaction number has to be at least 1");
+	}
 
 	OpenSSL_add_all_digests();
 
@@ -241,26 +308,19 @@ int main(int argc, char const *argv[]) {
 	if(!md_hmac){
 		exit_error_f("Unsupported hmac type: %s", hmac_type);
 	}
-	// uint32_t hmac_bytes = EVP_MD_size(md_hmac);
+	uint32_t hmac_bytes = EVP_MD_size(md_hmac);
 
-	// Check salt
-	if(strlen(salt) > 128){
-		exit_error_f("Salt has to be of length: [0, 128]");
+	// Parse and check salt
+	char salt[128];
+	if(strlen(salt_str) % 2 != 0){
+		exit_error_f("Invalid hex salt: length not a multiple of 2");
 	}
-
-	// Open destination device
-	int file;
-	if((file = open(dev, O_RDWR)) == -1){
-		exit(1);
+	if(strlen(salt_str) > 256){
+		exit_error_f("Salt is too long. %lu > %d", strlen(salt_str), 256);
 	}
-
-	// Get size
-	struct stat file_stats;
-	if(fstat(file, &file_stats) == -1){
-		exit(1);
+	if(hex_to_bytes(salt_str, strlen(salt_str), (char*)salt) != 0){
+		exit_error_f("Invalid hex salt: '%s'", salt_str);
 	}
-
-	debug("Size of: %s is %lld bytes", dev, file_stats.st_size);
 
 	// Calculate data size, hash block size, journal size
 	// TODO: uh...this is 64 bits...
@@ -270,24 +330,19 @@ int main(int argc, char const *argv[]) {
 	uint32_t pad_blocks = 0;
 	uint32_t *blocks_per_level = malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 	uint32_t levels = 0;
-	uint64_t blocks = file_stats.st_size / BLOCK_SIZE;
-
-	// Remainder check
-	if(file_stats.st_size % BLOCK_SIZE != 0){
-		warn("File is not a multiple of BLOCK_SIZE: %d. %llu bytes left over",
-			BLOCK_SIZE, file_stats.st_size % BLOCK_SIZE);
-	}
+	uint64_t blocks = file_stats.st_size / block_size;
+	debug("Blocks: %llu", blocks);
 
 	// Fanout
-	uint32_t fanout = BLOCK_SIZE / hash_bytes;
+	uint32_t fanout = block_size / hash_bytes;
 
 	// Use up entire block device
-	compute_block_numbers(blocks, fanout, &data_blocks, &hash_blocks,
-		&jb_blocks, &pad_blocks, &levels, blocks_per_level, hash_bytes);
+	compute_block_numbers(blocks, block_size, fanout, jb_transactions, &data_blocks,
+		&hash_blocks, &jb_blocks, &pad_blocks, &levels, blocks_per_level, hash_bytes);
 	
 	// Result info
-	info("Blocks -- Data: %llu, Hash: %u, JB: %u, Pad: %u, Levels: %u",
-			data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
+	info("Blocks: %llu = Superblock: 1, Data: %llu, Hash: %u, JB: %u, Pad: %u, Levels: %u",
+			blocks, data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
 
 	// Sanity check
 	if(data_blocks + hash_blocks + jb_blocks + pad_blocks + 1!= blocks){
@@ -298,26 +353,30 @@ int main(int argc, char const *argv[]) {
 	}
 
 	// Calculate each hash block level
-	uint8_t **hash_levels = (uint8_t**)malloc(sizeof(uint8_t*) * levels);
-	uint8_t hash_output[EVP_MAX_MD_SIZE];
+	char **hash_levels = (char**)malloc(sizeof(char*) * levels);
+	char hash_output[EVP_MAX_MD_SIZE];
 	uint32_t hash_length;
-	uint8_t *zero_block = (uint8_t*)malloc(BLOCK_SIZE);
+	char *zero_block = (char*)malloc(BLOCK_SIZE);
 	bzero(zero_block, BLOCK_SIZE);
 
+	char buf[128];
 	// Data hash
-	hash(md_hash, mdctx_hash, zero_block, BLOCK_SIZE, (uint8_t*)salt,
-		strlen(salt), hash_output, &hash_length);
+	hash(md_hash, mdctx_hash, zero_block, BLOCK_SIZE, salt,
+		strlen(salt) / 2, hash_output, &hash_length);
 
 	// Now loop through each level
 	for(uint32_t i = 0; i < levels; i++){
-		hash_levels[i] = (uint8_t*)malloc(BLOCK_SIZE);
+		hash_levels[i] = (char*)malloc(BLOCK_SIZE);
 		// Fill block with hashes - padding is zeros
 		bzero(hash_levels[i], BLOCK_SIZE);
 		for(uint32_t f = 0; f < fanout; f++){
-			memcpy(hash_levels[i] + (f * hash_length), hash_output, hash_length);
+			for(int b = 0; b < hash_bytes; b++){
+				hash_levels[i][f * hash_length + b] = hash_output[b];
+			}
+			// memcpy(&hash_levels[i][f * hash_length], hash_output, hash_length);
 		}
 		// Compute hash of this level for next iteration/root
-		hash(md_hash, mdctx_hash, hash_levels[i], BLOCK_SIZE, (uint8_t*)salt, strlen(salt),
+		hash(md_hash, mdctx_hash, hash_levels[i], BLOCK_SIZE, salt, strlen(salt) / 2,
 			hash_output, &hash_length);
 	}
 
@@ -345,14 +404,14 @@ int main(int argc, char const *argv[]) {
 	msb->hash_blocks = hash_blocks;
 	msb->jb_blocks = jb_blocks;
 	// Set salt size
-	msb->salt_size = strlen(salt);
+	msb->salt_size = strlen(salt_str) / 2;
 	// Copy salt
-	stpcpy(msb->salt, salt);
+	memcpy(msb->salt, salt, msb->salt_size);
 	// Set root hash
 	memcpy(msb->root, hash_output, hash_length);
 	// Set hmac
-	hash(md_hmac, mdctx_hmac, (uint8_t*)msb->root, hash_length, (uint8_t*)secret,
-		strlen(secret), (uint8_t*)msb->hmac, &hash_length);
+	// TODO: calculate hmac
+	memcpy(msb->hmac, hash_output, hash_length);
 	// Write it out!
 	write(file, msb, sizeof(struct mint_superblock));
 
@@ -360,6 +419,7 @@ int main(int argc, char const *argv[]) {
 	info("Writing hash blocks...");
 	uint32_t h_written = 1;
 	for(int i = levels - 1; i >= 0; i--){
+		debug("Level: %d, blocks: %d", i, blocks_per_level[i]);
 		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
 			// debug("level: %u, block: %u", i, j);
 			progress(h_written++, hash_blocks, 100, 79);
@@ -415,6 +475,22 @@ int main(int argc, char const *argv[]) {
 	fprintf(stderr, "\n");
 
 	print_superblock(msb);
+	bytes_to_hex(msb->root, hash_bytes, buf);
+	printf("dmsetup create meow --table \"%u %llu mintegrity %s %u %u %u %llu %s %s %s %s %s\"\n",
+		0,
+		data_blocks * (BLOCK_SIZE / 512),   // Size of device given to device mapper
+		// Mintegrity options
+		"/dev/loop0",  // String of block device
+		BLOCK_SIZE,    // Block size
+		hash_blocks,   // Number of hash blocks
+		jb_blocks,     // Number of journaling blocks
+		data_blocks,   // Number of data blocks
+		hash_type,     // Hash type
+		buf,           // Root digest to verity
+		salt_str,      // Salt
+		hmac_type,     // Hash type for hmac
+		secret         // Secret for hmac
+		);
 
 	free(mjsb);
 	free(msb);
