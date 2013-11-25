@@ -213,9 +213,42 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, in
 }
 
 static void mintegrity_flush_journal(struct dm_mintegrity *v){
-	// flush_worqueue
-	// dm_bufio_write_dirty_buffers(v->bufio);
-	v->journal_superblock.transaction_fill = 0;
+	struct dm_buffer *jbu;
+	u8 *jdata;
+	struct mintegrity_journal_superblock *js = &v->journal_superblock;
+	// Sync all journal entries
+	dm_bufio_write_dirty_buffers(v->bufio);
+	// Commit journal superbolock
+	// TODO: does this have to be done atomically ?
+	// What if only part of superblock is written back ???
+	js->state = 1;
+	jdata = dm_bufio_new(v->bufio, v->journal_start, &jbu);
+	memcpy(jdata, js, sizeof(struct mintegrity_journal_superblock));
+	dm_bufio_mark_buffer_dirty(jbu);
+	dm_bufio_release(jbu);
+	dm_bufio_write_dirty_buffers(v->bufio);
+	// Read through journal and update on disk blocks
+	// TODO:
+	for(uint32_t i = 0; i < js->transaction_fill){
+		struct dm_buffer *hbuf;
+		u8 *hdata;
+		uint32_t start, end, i;
+		start = (v->levels * v->digest_size + 4) * js->transaction_fill;
+		end = start + (v->levels * v->digest_size + 4);
+		i = start;
+	}
+
+
+	// Commit journal superblock
+	// TODO: does this have to be done atomically ?
+	// What if only part of superblock is written back ???
+	js->transaction_fill = 0;
+	js->state = 0;
+	jdata = dm_bufio_new(v->bufio, v->journal_start, &jbuf);
+	memcpy(jdata, js, sizeof(struct mintegrity_journal_superblock));
+	dm_bufio_mark_buffer_dirty(jbuf);
+	dm_bufio_release(jbuf);
+	dm_bufio_write_dirty_buffers(v->bufio);
 	return;
 }
 
@@ -224,16 +257,16 @@ static void mintegrity_write_to_journal(struct dm_mintegrity *v, sector_t block,
 	struct dm_buffer *buf;
 	u8 *data;
 	uint32_t start, end, i;
+	struct mintegrity_journal_superblock *js = &v->journal_superblock;
 
 	// Flush journal if its full
-	if(v->journal_superblock.transaction_capacity
-		== v->journal_superblock.transaction_fill){
+	if(js->transaction_fill == js->transaction_capacity){
 		mintegrity_flush_journal(v);
 	}
 
 	// Offset into journal (in bytes)
-	start = v->levels * v->digest_size * v->journal_superblock.transaction_fill;
-	end = start + v->levels * v->digest_size;
+	start = (v->levels * v->digest_size + 4) * js->transaction_fill;
+	end = start + (v->levels * v->digest_size + 4);
 	i = start;
 
 	// Write out buffer
@@ -256,7 +289,7 @@ static void mintegrity_write_to_journal(struct dm_mintegrity *v, sector_t block,
 		dm_bufio_release(buf);
 		i += length;
 	}
-	v->journal_superblock.transaction_fill += 1;
+	js->transaction_fill += 1;
 }
 
 /*
@@ -558,9 +591,14 @@ static void mintegrity_write_work(struct work_struct *w)
 		u8 * result;
 		unsigned todo;
 
+		sector_t sec;
 		sector_t hash_block;
 		struct dm_buffer *buf;
 		u8 *data;
+
+		// TODO: sizeof
+		sec = io->n_blocks + b;
+		memcpy(io->hb_vec, &sec, 4);
 
 		// The io digest we want is the root
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
@@ -569,7 +607,7 @@ static void mintegrity_write_work(struct work_struct *w)
 		// every successive read
 		for (i = v->levels - 1; i >= 0; i--) {
 			int r = mintegrity_verify_level(io, io->block + b, i, false, true,
-				io->hb_vec + (1 << v->dev_block_bits) * i);
+				io->hb_vec + 4 + (1 << v->dev_block_bits) * i);
 			if (unlikely(r)){
 				mintegrity_finish_write_io(io, -EIO);
 				return;
@@ -637,11 +675,11 @@ static void mintegrity_write_work(struct work_struct *w)
 		// Hash offset
 		mintegrity_hash_at_level(v, io->block + b, 0, &hash_block, &offset);
 		// Set hash for first level
-		memcpy(io->hb_vec + offset, result, v->digest_size);
+		memcpy(io->hb_vec + 4 + offset, result, v->digest_size);
 		// Write block to disk
 		// TODO: remove bufio
 		data = dm_bufio_read(v->bufio, hash_block, &buf);
-		memcpy(data, io->hb_vec, (1 << v->dev_block_bits));
+		memcpy(data, io->hb_vec + 4, (1 << v->dev_block_bits));
 		dm_bufio_mark_buffer_dirty(buf);
 		dm_bufio_release(buf);
 
@@ -650,23 +688,23 @@ static void mintegrity_write_work(struct work_struct *w)
 			// Get offset for level
 			mintegrity_hash_at_level(v, io->block + b, i, &hash_block, &offset);
 			// Calculate hash for level below
-			r = mintegrity_buffer_hash(io, io->hb_vec + (1 << v->dev_block_bits) * (i-1), (1 << v->dev_block_bits));
+			r = mintegrity_buffer_hash(io, io->hb_vec + 4 + (1 << v->dev_block_bits) * (i-1), (1 << v->dev_block_bits));
 			if(r < 0) {
 				DMERR("failed to calcualte write buffer hash for level");
 				mintegrity_finish_write_io(io, -EIO);
 			}
 			result = io_real_digest(v, io);
 			// Copy hash into current level
-			memcpy(io->hb_vec + ((1 << v->dev_block_bits) * i) + offset, result, v->digest_size);
+			memcpy(io->hb_vec + 4 + ((1 << v->dev_block_bits) * i) + offset, result, v->digest_size);
 			// Write block to disk
 			// TODO: remove bufio
 			data = dm_bufio_read(v->bufio, hash_block, &buf);
-			memcpy(data, io->hb_vec + ((1 << v->dev_block_bits) * i), (1 << v->dev_block_bits));
+			memcpy(data, io->hb_vec + 4 + ((1 << v->dev_block_bits) * i), (1 << v->dev_block_bits));
 			dm_bufio_mark_buffer_dirty(buf);
 			dm_bufio_release(buf);
 		}
 		// Update root merkle tree hash
-		r = mintegrity_buffer_hash(io, io->hb_vec + (1 << v->dev_block_bits) * (v->levels - 1), (1 << v->dev_block_bits));
+		r = mintegrity_buffer_hash(io, io->hb_vec + 4 + (1 << v->dev_block_bits) * (v->levels - 1), (1 << v->dev_block_bits));
 		if (r < 0) {
 			DMERR("failed to calcualte write buffer hash for level");
 			mintegrity_finish_write_io(io, -EIO);
@@ -1189,7 +1227,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	// Open device mapper buffered IO client
 	v->bufio = dm_bufio_client_create(v->hash_dev->bdev,
-		1 << v->dev_block_bits, 1, sizeof(struct buffer_aux), // TODO: reserved count: levels + num online cpus * ?
+		1 << v->dev_block_bits, 2, sizeof(struct buffer_aux), // TODO: reserved count: levels + num online cpus * ?
 		dm_bufio_alloc_callback, dm_bufio_write_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
@@ -1219,7 +1257,6 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		printk("NEED TO CLEAN UP JOURNAL AND RECOVER HMAC");
 	}
 
-
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) + v->shash_descsize + v->digest_size * 2, __alignof__(struct dm_mintegrity_io));
 
 	v->vec_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
@@ -1232,7 +1269,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	// TODO: should this really be here? mempool for write hashes
 	v->hb_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
-					v->levels * (1 << v->dev_block_bits));
+					v->levels * (1 << v->dev_block_bits) + 4);
 	if (!v->hb_mempool){
 		ti->error = "Cannot allocate hash block mempool";
 		r = -ENOMEM;

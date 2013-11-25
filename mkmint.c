@@ -13,8 +13,6 @@
 
 #include "mkmint.h"
 
-#define NUM_TRANSACTIONS 0
-
 /** @brief Print progress bar
  *
  * @param i Current index
@@ -182,7 +180,7 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 		uint32_t hash_transactions_per_block = (block_size / (hash_bytes * lev + sizeof(uint32_t)));
 		// Suerpblock, data blocks, hash transactions
 		// TODL jb format
-		jb = 1 + divide_up(jb_transactions, hash_transactions_per_block) * (*levels);
+		jb = 1 + divide_up(jb_transactions, hash_transactions_per_block);
 		used = db + jb + hb;
 		pb = blocks - used;
 
@@ -422,7 +420,6 @@ int main(int argc, char const *argv[]) {
 		}
 	}
 	fprintf(stderr, "\n");
-	debug("Wrote: %u hash blocks", blocks_written);
 
 	// Initialize journal
 	struct mint_journal_superblock *mjsb = (struct mint_journal_superblock*)malloc(sizeof(struct mint_journal_superblock));
@@ -433,7 +430,7 @@ int main(int argc, char const *argv[]) {
 	mjsb->magic[8] = 0x69; mjsb->magic[9] = 0x6e; mjsb->magic[10] = 0x00; mjsb->magic[11] = 0x00;
 	mjsb->magic[12] = 0x00; mjsb->magic[13] = 0x00; mjsb->magic[14] = 0x00; mjsb->magic[15] = 0x00;
 	// Maximum number of supported transactions
-	mjsb->transaction_capacity = NUM_TRANSACTIONS;
+	mjsb->transaction_capacity = jb_transactions;
 	// Current amount of transactions - 0
 	mjsb->transaction_fill = 0;
 	// Block size
