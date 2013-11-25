@@ -212,6 +212,53 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, in
 	*offset = idx << (v->dev_block_bits - v->hash_per_block_bits);
 }
 
+static void mintegrity_flush_journal(struct dm_mintegrity *v){
+	// flush_worqueue
+	// dm_bufio_write_dirty_buffers(v->bufio);
+	v->journal_superblock.transaction_fill = 0;
+	return;
+}
+
+static void mintegrity_write_to_journal(struct dm_mintegrity *v, sector_t block,
+	u8 *hashes){
+	struct dm_buffer *buf;
+	u8 *data;
+	uint32_t start, end, i;
+
+	// Flush journal if its full
+	if(v->journal_superblock.transaction_capacity
+		== v->journal_superblock.transaction_fill){
+		mintegrity_flush_journal(v);
+	}
+
+	// Offset into journal (in bytes)
+	start = v->levels * v->digest_size * v->journal_superblock.transaction_fill;
+	end = start + v->levels * v->digest_size;
+	i = start;
+
+	// Write out buffer
+	while(i < end){
+		// Sector
+		sector_t journal_block = v->journal_start + 1 + i / (1 << v->dev_block_bits);
+		// Offset into sector
+		uint32_t offset = i % (1 << v->dev_block_bits);
+		// How many bytes to write
+		uint32_t length = min((1 << v->dev_block_bits) - offset, end - i);
+		// Read from disk
+		if(offset == 0){ // We're going to overwrite anyways
+			data = dm_bufio_new(v->bufio, journal_block, &buf);
+		} else { // We're only going to modify
+			data = dm_bufio_read(v->bufio, journal_block, &buf);
+		}
+		// Copy into buffer
+		memcpy(&data[offset], &hashes[i - start], length);
+		dm_bufio_mark_buffer_dirty(buf);
+		dm_bufio_release(buf);
+		i += length;
+	}
+	v->journal_superblock.transaction_fill += 1;
+}
+
 /*
  * Calculate hash of buffer and put it in io_real_digest
  */
@@ -584,6 +631,8 @@ static void mintegrity_write_work(struct work_struct *w)
 			return;
 		}
 
+
+
 		// Copy data hash into first level
 		// Hash offset
 		mintegrity_hash_at_level(v, io->block + b, 0, &hash_block, &offset);
@@ -624,6 +673,10 @@ static void mintegrity_write_work(struct work_struct *w)
 		}
 		result = io_real_digest(v, io);
 		memcpy(v->root_digest, result, v->digest_size);
+
+		// Add to journal
+		mintegrity_write_to_journal(v, io->block + b, io->hb_vec);
+		dm_bufio_write_dirty_buffers(v->bufio);
 	}
 	// Run BIO request writing data to data device
 	generic_make_request(io->bio);
