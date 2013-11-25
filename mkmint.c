@@ -167,8 +167,6 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 	uint64_t high = blocks;
 	uint32_t *bpl = (uint32_t*)malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 
-	debug("Blocks: %llu, Low: %llu, high: %llu", blocks, low, high);
-
 
 	while(high >= low && high != 0){
 		uint64_t mid = low + divide_up((high - low), 2);  // Non overflow method
@@ -176,18 +174,15 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 		uint32_t hb = 0, jb = 0, pb = 0;
 		uint32_t lev;
 		// Number of hash blocks, levels needed for this many data blocks
-		debug("Low: %llu, high: %llu", low, high);
 		if(compute_hash_blocks(db, fanout, &lev, &hb, bpl) != 0){
 			break; // Barf
 		}
-		debug("Computed");
 
 		// Number of jb blocks needed
 		uint32_t hash_transactions_per_block = (block_size / (hash_bytes * lev + sizeof(uint32_t)));
 		// Suerpblock, data blocks, hash transactions
 		// TODL jb format
-		jb = 1 + jb_transactions + divide_up(jb_transactions, hash_transactions_per_block);
-		debug("JB: %u", jb);
+		jb = 1 + divide_up(jb_transactions, hash_transactions_per_block) * (*levels);
 		used = db + jb + hb;
 		pb = blocks - used;
 
@@ -331,7 +326,7 @@ int main(int argc, char const *argv[]) {
 	uint32_t *blocks_per_level = malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 	uint32_t levels = 0;
 	uint64_t blocks = file_stats.st_size / block_size;
-	debug("Blocks: %llu", blocks);
+	// debug("Blocks: %llu", blocks);
 
 	// Fanout
 	uint32_t fanout = block_size / hash_bytes;
@@ -362,7 +357,7 @@ int main(int argc, char const *argv[]) {
 	char buf[128];
 	// Data hash
 	hash(md_hash, mdctx_hash, zero_block, BLOCK_SIZE, salt,
-		strlen(salt) / 2, hash_output, &hash_length);
+		strlen(salt_str) / 2, hash_output, &hash_length);
 
 	// Now loop through each level
 	for(uint32_t i = 0; i < levels; i++){
@@ -373,10 +368,9 @@ int main(int argc, char const *argv[]) {
 			for(int b = 0; b < hash_bytes; b++){
 				hash_levels[i][f * hash_length + b] = hash_output[b];
 			}
-			// memcpy(&hash_levels[i][f * hash_length], hash_output, hash_length);
 		}
 		// Compute hash of this level for next iteration/root
-		hash(md_hash, mdctx_hash, hash_levels[i], BLOCK_SIZE, salt, strlen(salt) / 2,
+		hash(md_hash, mdctx_hash, hash_levels[i], BLOCK_SIZE, salt, strlen(salt_str) / 2,
 			hash_output, &hash_length);
 	}
 
@@ -416,17 +410,19 @@ int main(int argc, char const *argv[]) {
 	write(file, msb, sizeof(struct mint_superblock));
 
 	// Write out hash block levels
+	uint32_t blocks_written = 0;
 	info("Writing hash blocks...");
 	uint32_t h_written = 1;
 	for(int i = levels - 1; i >= 0; i--){
-		debug("Level: %d, blocks: %d", i, blocks_per_level[i]);
 		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
 			// debug("level: %u, block: %u", i, j);
 			progress(h_written++, hash_blocks, 100, 79);
 			write(file, hash_levels[i], BLOCK_SIZE);
+			blocks_written++;
 		}
 	}
 	fprintf(stderr, "\n");
+	debug("Wrote: %u hash blocks", blocks_written);
 
 	// Initialize journal
 	struct mint_journal_superblock *mjsb = (struct mint_journal_superblock*)malloc(sizeof(struct mint_journal_superblock));
