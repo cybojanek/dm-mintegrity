@@ -74,7 +74,6 @@ struct dm_mintegrity {
 	unsigned char hash_per_block_bits;	/* log2(hashes in hash block) */
 
 	unsigned char levels;	/* the number of tree levels */
-	unsigned char version;  /* mintegrity version */
 
 	mempool_t *vec_mempool;	/* mempool of bio vector */
 	mempool_t *hb_mempool;  /* mempool for hash block writebacks */
@@ -210,10 +209,7 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block, in
 		return;
 
 	idx = position & ((1 << v->hash_per_block_bits) - 1);
-	if (!v->version)
-		*offset = idx * v->digest_size;
-	else
-		*offset = idx << (v->dev_block_bits - v->hash_per_block_bits);
+	*offset = idx << (v->dev_block_bits - v->hash_per_block_bits);
 }
 
 /*
@@ -234,12 +230,10 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data, u
 		return r;
 	}
 
-	if (likely(v->version >= 1)) {
-		r = crypto_shash_update(desc, v->salt, v->salt_size);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			return r;
-		}
+	r = crypto_shash_update(desc, v->salt, v->salt_size);
+	if (r < 0) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
 	}
 
 	r = crypto_shash_update(desc, data, len);
@@ -306,27 +300,16 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			goto release_ret_r;
 		}
 
-		if (likely(v->version >= 1)) {
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				goto release_ret_r;
-			}
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			goto release_ret_r;
 		}
 
 		r = crypto_shash_update(desc, data, 1 << v->dev_block_bits);
 		if (r < 0) {
 			DMERR("crypto_shash_update failed: %d", r);
 			goto release_ret_r;
-		}
-
-		if (!v->version) {
-			printk("SALT 2");
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				goto release_ret_r;
-			}
 		}
 
 		result = io_real_digest(v, io);
@@ -417,12 +400,10 @@ test_block_hash:
 			return r;
 		}
 
-		if (likely(v->version >= 1)) {
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				return r;
-			}
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			return r;
 		}
 
 		todo = 1 << v->dev_block_bits;
@@ -452,14 +433,6 @@ test_block_hash:
 			}
 			todo -= len;
 		} while (todo);
-
-		if (!v->version) {
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				return r;
-			}
-		}
 
 		result = io_real_digest(v, io);
 		r = crypto_shash_final(desc, result);
@@ -568,14 +541,13 @@ static void mintegrity_write_work(struct work_struct *w)
 			return;
 		}
 		// Update with salt
-		if (likely(v->version >= 1)) {
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				mintegrity_finish_write_io(io, -EIO);
-				return;
-			}
+		r = crypto_shash_update(desc, v->salt, v->salt_size);
+		if (r < 0) {
+			DMERR("crypto_shash_update failed: %d", r);
+			mintegrity_finish_write_io(io, -EIO);
+			return;
 		}
+
 		todo = 1 << v->dev_block_bits;
 		do {
 			struct bio_vec *bv;
@@ -603,15 +575,6 @@ static void mintegrity_write_work(struct work_struct *w)
 			}
 			todo -= len;
 		} while (todo);
-
-		if (!v->version) {
-			r = crypto_shash_update(desc, v->salt, v->salt_size);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				mintegrity_finish_write_io(io, -EIO);
-				return;
-			}
-		}
 
 		result = io_real_digest(v, io);
 		r = crypto_shash_final(desc, result);
@@ -852,8 +815,7 @@ static void mintegrity_status(struct dm_target *ti, status_type_t type,
 		DMEMIT("%c", v->hash_failed ? 'C' : 'V');
 		break;
 	case STATUSTYPE_TABLE:
-		DMEMIT("%u %s %s %u %u %llu %llu %s ",
-			v->version,
+		DMEMIT("%s %s %u %u %llu %llu %s ",
 			v->data_dev->name,
 			v->hash_dev->name,
 			1 << v->dev_block_bits,
@@ -967,8 +929,6 @@ static void mintegrity_dtr(struct dm_target *ti)
 
 /*
  * Target parameters:
- *	<version>	The current format is version 1.
- *			Vsn 0 is compatible with original Chromium OS releases.
  *	<data device>
  *	<block size>
  *  <number of hash blocks>
@@ -1018,9 +978,6 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		r = -EINVAL;
 		goto bad;
 	}
-
-	// TODO: remove rest of version code from module
-	v->version = 1;
 
 	// argv[0] <data device>
 	r = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &v->data_dev);
