@@ -177,10 +177,12 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 		}
 
 		// Number of jb blocks needed
-		uint32_t hash_transactions_per_block = (block_size / (hash_bytes * lev + sizeof(uint32_t)));
+		// How many levels will fit in a block, plus one more if not enough
+		// for trasanction number
+		uint32_t blocks_per_transaction = 1 + divide_up(lev, fanout) + 
+			((lev % fanout * hash_bytes > block_size - sizeof(uint32_t)) ? 1 : 0);
 		// Suerpblock, data blocks, hash transactions
-		// TODL jb format
-		jb = 1 + divide_up(jb_transactions, hash_transactions_per_block);
+		jb = 1 + jb_transactions * blocks_per_transaction;
 		used = db + jb + hb;
 		pb = blocks - used;
 
@@ -424,7 +426,7 @@ int main(int argc, char const *argv[]) {
 	// Initialize journal
 	struct mint_journal_superblock *mjsb = (struct mint_journal_superblock*)malloc(sizeof(struct mint_journal_superblock));
 	bzero(mjsb, sizeof(struct mint_journal_superblock));
-	// // Magic
+	// Magic
 	mjsb->magic[0] = 0x6c; mjsb->magic[1] = 0x69; mjsb->magic[2] = 0x6c; mjsb->magic[3] = 0x79;
 	mjsb->magic[4] = 0x6d; mjsb->magic[5] = 0x75; mjsb->magic[6] = 0x66; mjsb->magic[7] = 0x66;
 	mjsb->magic[8] = 0x69; mjsb->magic[9] = 0x6e; mjsb->magic[10] = 0x00; mjsb->magic[11] = 0x00;
