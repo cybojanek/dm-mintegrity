@@ -46,6 +46,27 @@ struct mintegrity_journal_superblock {
 	char hmac[128];                 /**< hmac for flush update */
 };
 
+/*
+ * Auxiliary structure appended to each dm-bufio buffer. If the value
+ * hash_verified is nonzero, hash of the block has been verified.
+ *
+ * The variable hash_verified is set to 0 when allocating the buffer, then
+ * it can be changed to 1 and it is never reset to 0 again.
+ *
+ * There is no lock around this value, a race condition can at worst cause
+ * that multiple processes verify the hash of the same buffer simultaneously
+ * and write 1 to hash_verified simultaneously.
+ * This condition is harmless, so we don't need locking.
+ */
+struct buffer_aux {
+	unsigned hash_verified; /* Buffer has been verified */
+	unsigned journal; /* Buffer is already in journal list */
+	unsigned journal_position; /* First position buffer is part of */
+	struct dm_buffer *self_buffer; /* Pointer to own dm_buffer */
+	struct buffer_aux *next_aux; /* Next aux buffer for journal */
+	struct rw_semaphore lock; /* RW semaphore lock for async write back */
+};
+
 struct dm_mintegrity {
 	struct dm_dev *dev;
 	struct dm_target *ti;
@@ -60,6 +81,7 @@ struct dm_mintegrity {
 	unsigned digest_size;	/* digest size for the current hash algorithm */
 	unsigned shash_descsize;/* the size of temporary space for crypto */
 	int hash_failed;	/* set to 1 if hash of any block failed */
+	int created;
 
 	sector_t hash_start;	/* hash start in blocks */
 	sector_t journal_start;	/* journal start in blocks */
@@ -84,6 +106,8 @@ struct dm_mintegrity {
 	struct rw_semaphore lock;              /* read/write lock */
 
 	struct mintegrity_journal_superblock journal_superblock;
+	struct buffer_aux *journal_buffer_head;
+	struct buffer_aux *journal_buffer_tail;
 
 	/* starting blocks for each tree level. 0 is the lowest level. */
 	sector_t hash_level_block[DM_MINTEGRITY_MAX_LEVELS];
@@ -147,22 +171,6 @@ static u8 *io_want_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 }
 
 /*
- * Auxiliary structure appended to each dm-bufio buffer. If the value
- * hash_verified is nonzero, hash of the block has been verified.
- *
- * The variable hash_verified is set to 0 when allocating the buffer, then
- * it can be changed to 1 and it is never reset to 0 again.
- *
- * There is no lock around this value, a race condition can at worst cause
- * that multiple processes verify the hash of the same buffer simultaneously
- * and write 1 to hash_verified simultaneously.
- * This condition is harmless, so we don't need locking.
- */
-struct buffer_aux {
-	int hash_verified;
-};
-
-/*
  * Initialize struct buffer_aux for a freshly created buffer.
  */
 static void dm_bufio_alloc_callback(struct dm_buffer *buf)
@@ -170,6 +178,9 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 	struct buffer_aux *aux = dm_bufio_get_aux_data(buf);
 
 	aux->hash_verified = 0;
+	aux->journal = 0;
+	aux->journal_position = 0;
+	init_rwsem(&(aux->lock));
 }
 
 /*
@@ -216,6 +227,53 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block,
 	*offset = idx << (v->dev_block_bits - v->hash_per_block_bits);
 }
 
+static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
+	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash,
+	struct dm_mintegrity_block *buffer)
+{
+	struct buffer_aux *aux = dm_bufio_get_aux_data(buffer->buf);
+	if(aux->journal){ // Already in journal
+		dm_bufio_release(buffer->buf);
+		return;
+	}
+	aux->journal = 1;
+	aux->journal_position = hash->offset;
+	aux->self_buffer = buffer->buf;
+	aux->next_aux = NULL;
+
+	if(v->journal_buffer_head == NULL){
+		v->journal_buffer_head = aux;
+		v->journal_buffer_tail = v->journal_buffer_head;
+	} else {
+		v->journal_buffer_tail->next_aux = aux;
+		v->journal_buffer_tail = aux;
+	}
+}
+
+static void mintegrity_flush_journal(struct dm_mintegrity *v)
+{
+	struct buffer_aux *aux;
+	struct mintegrity_journal_superblock *js = &v->journal_superblock;
+	// Flush journal
+	dm_bufio_write_dirty_buffers(v->bufio);
+	// Mark all buffers passed to journal as dirty
+	aux = v->journal_buffer_head;
+	while(aux != NULL){
+		struct buffer_aux *next = aux->next_aux;
+		aux->journal = 0;
+		aux->journal_position = 0;
+		dm_bufio_mark_buffer_dirty(aux->self_buffer);
+		dm_bufio_release(aux->self_buffer);
+		aux = next;
+	}
+	// Flush buffers
+	dm_bufio_write_dirty_buffers(v->bufio);
+	v->journal_buffer_head = NULL;
+	v->journal_buffer_tail = NULL;
+
+	js->transaction_fill = 0;
+}
+
 static void mintegrity_rollback_journal_slot(struct dm_mintegrity *v,
 	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
 {
@@ -231,8 +289,7 @@ static int mintegrity_get_journal_slot(struct dm_mintegrity *v,
 	struct mintegrity_journal_superblock *js = &v->journal_superblock;
 	// Check for space
 	if(js->transaction_fill == js->transaction_capacity){
-		// TODO: sync and clean up
-		js->transaction_fill = 0;
+		mintegrity_flush_journal(v);
 	}
 	// Get next journal spot
 	sector = v->journal_start + 1 + (js->transaction_fill *
@@ -374,8 +431,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			r = -EIO;
 			goto release_ret_r;
 		} else {
-			// ignore this for now and keep it at 0
-			aux->hash_verified = 0;
+			aux->hash_verified = 1;
 		}
 	}
 	// Return back the whole block we read and verified
@@ -675,8 +731,13 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			goto bad;
 		}
 		memcpy(d_data_block.data, j_data_block.data, v->dev_block_bytes);
-		dm_bufio_mark_buffer_dirty(d_data_block.buf);
-		dm_bufio_release(d_data_block.buf);
+		mintegrity_add_buffer_to_journal(v, &j_data_block, &j_hash_block,
+			&d_data_block);
+
+		for (i = v->levels - 1; i >= 0; i--) {
+			mintegrity_add_buffer_to_journal(v, &j_data_block, &j_hash_block,
+				&io->hb_vec[i]);
+		}
 
 		// Write to journal
 		dm_bufio_mark_buffer_dirty(j_data_block.buf);
@@ -684,10 +745,6 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		dm_bufio_release(j_data_block.buf);
 		dm_bufio_release(j_hash_block.buf);
 
-		for (i = v->levels - 1; i >= 0; i--) {
-			dm_bufio_mark_buffer_dirty(io->hb_vec[i].buf);
-			dm_bufio_release(io->hb_vec[i].buf);
-		}
 		continue;
 
 		bad:
@@ -703,8 +760,6 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 	}
 	BUG_ON(vector != io->io_vec_size);
 	BUG_ON(offset);
-	// Sync
-	dm_bufio_write_dirty_buffers_async(v->bufio);
 	// Finished!
 	return 0;
 }
@@ -909,11 +964,21 @@ static void mintegrity_status(struct dm_target *ti, status_type_t type,
 	}
 }
 
+static void mintegrity_sync(struct dm_mintegrity *v)
+{
+	flush_workqueue(v->write_wq);
+	mintegrity_flush_journal(v);
+}
+
 static int mintegrity_ioctl(struct dm_target *ti, unsigned cmd,
 			unsigned long arg)
 {
 	struct dm_mintegrity *v = ti->private;
 	int r = 0;
+
+	// TODO: Not supported yet - because journal not locked
+	// if (cmd == BLKFLSBUF)
+	// 	mintegrity_sync(v);
 
 	if (v->data_start ||
 	    ti->len != i_size_read(v->dev->bdev->bd_inode) >> SECTOR_SHIFT)
@@ -963,6 +1028,10 @@ static void mintegrity_dtr(struct dm_target *ti)
 {
 	struct dm_mintegrity *v = ti->private;
 
+	// Sync everything
+	if (v->created)
+		mintegrity_sync(v);
+
 	if (v->write_wq)
 		destroy_workqueue(v->write_wq);
 
@@ -975,10 +1044,8 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
 
-	if (v->bufio) {
-			dm_bufio_write_dirty_buffers(v->bufio);
+	if (v->bufio)
 		dm_bufio_client_destroy(v->bufio);
-	}
 
 	kfree(v->salt);
 	kfree(v->root_digest);
@@ -1212,6 +1279,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	// Journal setup
+	v->journal_buffer_head = NULL;
+	v->journal_buffer_tail = NULL;
 	data = dm_bufio_read(v->bufio, v->journal_start, &buf);
 	if (unlikely(IS_ERR(data))) {
 		ti->error = "Failed to read journal superblock";
@@ -1270,11 +1339,11 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
+	v->created = 1;
 	return 0;
 
 bad:
 	mintegrity_dtr(ti);
-
 	return r;
 }
 
