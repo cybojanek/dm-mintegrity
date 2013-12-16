@@ -1,4 +1,5 @@
 #include <fcntl.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -9,7 +10,10 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <uuid/uuid.h>
+#include <linux/fs.h>
+
 
 #include "mkmint.h"
 
@@ -252,15 +256,19 @@ int main(int argc, char const *argv[]) {
 
 	// Open destination device
 	int file;
-	if((file = open(dev, O_RDWR)) == -1){
-		exit_error_f("Could not open: '%s' for writing", dev);
+	if((file = open(dev, O_RDWR)) < 0){
+		exit_error_f("Could not open: '%s' for writing, %s", dev, strerror(errno));
 	}
 
 	// Get size
 	// TODO: size of file in 512 chunks?
 	struct stat file_stats;
-	if(fstat(file, &file_stats) == -1){
-		exit_error_f("Could not get file stats for: '%s'", dev);
+	if(fstat(file, &file_stats) != 0){
+		exit_error_f("Could not get file stats for: '%s', %s", dev, strerror(errno));
+	}
+
+	if(!(S_ISREG(file_stats.st_mode) || S_ISBLK(file_stats.st_mode))){
+		exit_error_f("File is neither a regular file nor block device");
 	}
 
 	// Get block size
@@ -272,17 +280,18 @@ int main(int argc, char const *argv[]) {
 	}
 
 	// Remainder check
-	if(file_stats.st_size % block_size != 0){
+	if(S_ISREG(file_stats.st_mode) && file_stats.st_size % block_size != 0){
 		warn("File is not a multiple of block_size: %d. %llu bytes left over",
 			block_size, file_stats.st_size % block_size);
-	}
+	} else if(S_ISBLK(file_stats.st_mode))
 
 	// Number of journal transactions
+	info("ARGV[3]: %s", argv[3]);
 	if(sscanf(argv[3], "%u", &jb_transactions) != 1){
 		exit_error_f("Invalid journal transaction number: '%s'", argv[3]);
 	}
 	if(jb_transactions == 0){
-		exit_error_f("Journal transaction number has to be at least 1");
+		exit_error_f("Journal transaction number has to be at least 1: %s", argv[3]);
 	}
 
 	OpenSSL_add_all_digests();
@@ -325,8 +334,15 @@ int main(int argc, char const *argv[]) {
 	uint32_t pad_blocks = 0;
 	uint32_t *blocks_per_level = malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 	uint32_t levels = 0;
-	uint64_t blocks = file_stats.st_size / block_size;
-	// debug("Blocks: %llu", blocks);
+	uint64_t blocks;
+	if(S_ISREG(file_stats.st_mode)){
+		blocks = file_stats.st_size / block_size;
+	} else if(S_ISBLK(file_stats.st_mode)){
+		if(ioctl(file, BLKGETSIZE64, &blocks) != 0){
+			exit_error_f("ioctl for block size failed: %s", strerror(errno));
+		}
+		blocks = blocks / block_size;
+	}
 
 	// Fanout
 	uint32_t fanout = block_size / hash_bytes;
@@ -407,7 +423,9 @@ int main(int argc, char const *argv[]) {
 	// TODO: calculate hmac
 	memcpy(msb->hmac, hash_output, hash_length);
 	// Write it out!
-	write(file, msb, sizeof(struct mint_superblock));
+	if(write(file, msb, sizeof(struct mint_superblock)) < 0){
+		exit_error_f("Failed to write MSB: %s", strerror(errno));
+	}
 
 	// Write out hash block levels
 	uint32_t blocks_written = 0;
@@ -417,7 +435,10 @@ int main(int argc, char const *argv[]) {
 		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
 			// debug("level: %u, block: %u", i, j);
 			progress(h_written++, hash_blocks, 100, 79);
-			write(file, hash_levels[i], BLOCK_SIZE);
+			if(write(file, hash_levels[i], BLOCK_SIZE) < 0){
+				exit_error_f("Failed to write hash block: %u, %s",
+					h_written - 1, strerror(errno));
+			}
 			blocks_written++;
 		}
 	}
@@ -457,7 +478,10 @@ int main(int argc, char const *argv[]) {
 	// everywhere - I think even mkfs.ext3/ext4 does it the same way
 	for(uint32_t i = 0 ; i < jb_blocks; i++){
 		progress(i + 1, jb_blocks, 100, 79);
-		write(file, mjsb, sizeof(struct mint_journal_superblock));
+		if(write(file, mjsb, sizeof(struct mint_journal_superblock)) < 0){
+			exit_error_f("Failed to write journal block: %u, %s", i,
+				strerror(errno));
+		}
 	}
 	fprintf(stderr, "\n");
 
@@ -465,7 +489,10 @@ int main(int argc, char const *argv[]) {
 	info("Writing data blocks...");
 	for(uint64_t i = 0; i < data_blocks; i++){
 		progress(i + 1, data_blocks, 100, 79);
-		write(file, zero_block, BLOCK_SIZE);
+		if(write(file, zero_block, BLOCK_SIZE) < 0){
+			exit_error_f("Failed to write data block: %u, %s", i,
+				strerror(errno));
+		}
 	}
 	fprintf(stderr, "\n");
 
@@ -475,7 +502,7 @@ int main(int argc, char const *argv[]) {
 		0,
 		data_blocks * (BLOCK_SIZE / 512),   // Size of device given to device mapper
 		// Mintegrity options
-		"/dev/loop0",  // String of block device
+		dev,           // String of block device
 		BLOCK_SIZE,    // Block size
 		hash_blocks,   // Number of hash blocks
 		jb_blocks,     // Number of journaling blocks
