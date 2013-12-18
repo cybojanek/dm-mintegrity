@@ -390,7 +390,6 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 	aux = dm_bufio_get_aux_data(buf);
 
 	if (!aux->hash_verified) {
-		struct shash_desc *desc;
 		u8 *result;
 
 		if (skip_unverified) {
@@ -398,33 +397,13 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			goto release_ret_r;
 		}
 
-		desc = io_hash_desc(v, io);
-		desc->tfm = v->tfm;
-		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
-		r = crypto_shash_init(desc);
-		if (r < 0) {
-			DMERR("crypto_shash_init failed: %d", r);
-			goto release_ret_r;
-		}
-
-		r = crypto_shash_update(desc, v->salt, v->salt_size);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			goto release_ret_r;
-		}
-
-		r = crypto_shash_update(desc, data, v->dev_block_bytes);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
+		r = mintegrity_buffer_hash(io, data, v->dev_block_bytes);
+		if (r != 0) {
 			goto release_ret_r;
 		}
 
 		result = io_real_digest(v, io);
-		r = crypto_shash_final(desc, result);
-		if (r < 0) {
-			DMERR("crypto_shash_final failed: %d", r);
-			goto release_ret_r;
-		}
+
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("metadata block %llu is corrupted",
 				(unsigned long long)hash_block);
@@ -466,7 +445,6 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 	unsigned vector = 0, offset = 0;
 
 	for (b = 0; b < io->n_blocks; b++) {
-		struct shash_desc *desc;
 		u8 *result;
 		int r;
 		unsigned todo;
@@ -508,38 +486,13 @@ test_block_hash:
 			return -EIO;
 		}
 
-		desc = io_hash_desc(v, io);
-		desc->tfm = v->tfm;
-		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
-		r = crypto_shash_init(desc);
-		if (r < 0) {
-			DMERR("crypto_shash_init failed: %d", r);
+		r = mintegrity_buffer_hash(io, d_data_block.data, v->dev_block_bytes);
+		if (r != 0) {
 			dm_bufio_release(d_data_block.buf);
-			return r;
-		}
-
-		r = crypto_shash_update(desc, v->salt, v->salt_size);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			dm_bufio_release(d_data_block.buf);
-			return r;
-		}
-
-		// Update hash with data bytes
-		r = crypto_shash_update(desc, d_data_block.data, v->dev_block_bytes);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			dm_bufio_release(d_data_block.buf);
-			return r;
+			return -EIO;
 		}
 
 		result = io_real_digest(v, io);
-		r = crypto_shash_final(desc, result);
-		if (r < 0) {
-			DMERR("crypto_shash_final failed: %d", r);
-			dm_bufio_release(d_data_block.buf);
-			return r;
-		}
 
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("data block %llu is corrupted",
@@ -746,7 +699,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 
 		continue;
 
-		bad:
+bad:
 		mintegrity_rollback_journal_slot(v, &j_data_block, &j_hash_block);
 		dm_bufio_release(j_data_block.buf);
 		dm_bufio_release(j_hash_block.buf);
@@ -816,6 +769,8 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 	struct dm_mintegrity *v = pw->v;
 	int i;
 
+	dm_bufio_prefetch(v->bufio, pw->block, pw->n_blocks);
+
 	for (i = v->levels - 2; i >= 0; i--) {
 		sector_t hash_block_start;
 		sector_t hash_block_end;
@@ -874,7 +829,6 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 	// Block device
 	bio->bi_bdev = v->dev->bdev;
-	// Offset by v->data_start
 	bio->bi_sector = mintegrity_map_sector(v, bio->bi_sector);
 
 	if (((unsigned)bio->bi_sector | bio_sectors(bio)) &
@@ -1084,6 +1038,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	int r;
 	int i;
 	sector_t hash_position;
+	sector_t reserved;
+	sector_t b;
 	char dummy;
 	struct dm_buffer *buf;
 	u8 *data;
@@ -1257,10 +1213,24 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		hash_position += s;
 	}
 
+	// Number of necessary reserved buffers
+	reserved = 0;
+	b = v->data_blocks;
+	// Min of number of hash blocks in level and numbe of transactions
+	for (i = 0; i < v->levels; i++) {
+		b = (b == 0 ? b : (1 + ((b - 1) / (v->dev_block_bytes / v->digest_size))));
+		reserved += min(b, (v->journal_blocks - 1) / 2);
+	}
+	// One data block per transaction
+	reserved += (v->journal_blocks - 1) / 2;
+	// Journal blocks
+	reserved += v->journal_blocks;
+	// One for each read operation
+	reserved += num_online_cpus();
+
 	// Open device mapper buffered IO client
-	// TODO: reserved count: levels + num online cpus * ?
 	v->bufio = dm_bufio_client_create(v->dev->bdev,
-		1 << v->dev_block_bits, 2, sizeof(struct buffer_aux),
+		1 << v->dev_block_bits, reserved, sizeof(struct buffer_aux),
 		dm_bufio_alloc_callback, dm_bufio_write_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
