@@ -14,7 +14,6 @@
 #include <uuid/uuid.h>
 #include <linux/fs.h>
 
-
 #include "mkmint.h"
 
 /** @brief Print progress bar
@@ -286,7 +285,6 @@ int main(int argc, char const *argv[]) {
 	} else if(S_ISBLK(file_stats.st_mode))
 
 	// Number of journal transactions
-	info("ARGV[3]: %s", argv[3]);
 	if(sscanf(argv[3], "%u", &jb_transactions) != 1){
 		exit_error_f("Invalid journal transaction number: '%s'", argv[3]);
 	}

@@ -85,7 +85,8 @@ struct dm_mintegrity {
 
 	sector_t hash_start;	/* hash start in blocks */
 	sector_t journal_start;	/* journal start in blocks */
-	sector_t data_start;	/* data offset in 512-byte sectors */
+	sector_t data_start;	/* data start in blocks */
+	sector_t data_start_shift;	/* data offset in 512-byte sectors */
 
 	sector_t hash_blocks;	/* the number of hash blocks */
 	sector_t journal_blocks;/* the number of journal blocks */
@@ -197,7 +198,7 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 static sector_t mintegrity_map_sector(struct dm_mintegrity *v,
 	sector_t bi_sector)
 {
-	return v->data_start + dm_target_offset(v->ti, bi_sector);
+	return v->data_start_shift + dm_target_offset(v->ti, bi_sector);
 }
 
 /*
@@ -412,7 +413,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			goto release_ret_r;
 		}
 
-		r = crypto_shash_update(desc, data, 1 << v->dev_block_bits);
+		r = crypto_shash_update(desc, data, v->dev_block_bytes);
 		if (r < 0) {
 			DMERR("crypto_shash_update failed: %d", r);
 			goto release_ret_r;
@@ -434,20 +435,18 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			aux->hash_verified = 1;
 		}
 	}
+
+	memcpy(io_want_digest(v, io), data + offset, v->digest_size);
+
 	// Return back the whole block we read and verified
-	if(dmb != NULL){
+	if (dmb != NULL) {
 		dmb->buf = buf;
 		dmb->data = data;
 		dmb->offset = offset;
-	}
-
-	data += offset;
-
-	memcpy(io_want_digest(v, io), data, v->digest_size);
-
-	if(dmb == NULL){
+	} else {
 		dm_bufio_release(buf);
 	}
+
 	return 0;
 
 release_ret_r:
@@ -494,7 +493,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
 
 		for (i = v->levels - 1; i >= 0; i--) {
-			int r = mintegrity_verify_level(io, io->block + b, i, false, NULL);
+			int r = mintegrity_verify_level(io, data_sector, i, false, NULL);
 			if (unlikely(r))
 				return r;
 		}
@@ -502,7 +501,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 
 test_block_hash:
 		// Read data block
-		d_data_block.data = dm_bufio_read(v->bufio, data_sector,
+		d_data_block.data = dm_bufio_read(v->bufio, data_sector + v->data_start,
 			&d_data_block.buf);
 		if(unlikely(IS_ERR(d_data_block.data))){
 			DMERR("data block read failed");
@@ -721,11 +720,11 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		memcpy(j_hash_block.data + (v->levels - 1) * v->digest_size, result,
 			v->digest_size);
 		// Copy data sector: TODO: size/endianess
-		memcpy(j_hash_block.data + v->levels * v->digest_size, &data_sector,
-			sizeof(sector_t));
+		// memcpy(j_hash_block.data + v->levels * v->digest_size, &data_sector,
+			// sizeof(sector_t));
 
 		// Get ready to write to disk
-		d_data_block.data = dm_bufio_new(v->bufio, data_sector,
+		d_data_block.data = dm_bufio_new(v->bufio, data_sector + v->data_start,
 			&d_data_block.buf);
 		if (unlikely(IS_ERR(d_data_block.data))){
 			goto bad;
@@ -885,12 +884,12 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 	}
 
 	if (bio_end_sector(bio) >>
-	    (v->dev_block_bits - SECTOR_SHIFT) > v->data_blocks + (v->data_start * 8)) {
+	    (v->dev_block_bits - SECTOR_SHIFT) > v->data_blocks) {
 		DMERR_LIMIT("io out of range");
 		return -EIO;
 	}
 
-	if(bio_data_dir(bio) == WRITE || bio_data_dir(bio) == READ){
+	if (bio_data_dir(bio) == WRITE || bio_data_dir(bio) == READ) {
 		// Common setup
 		io = dm_per_bio_data(bio, ti->per_bio_data_size);
 		io->bio = bio;
@@ -980,7 +979,7 @@ static int mintegrity_ioctl(struct dm_target *ti, unsigned cmd,
 	// if (cmd == BLKFLSBUF)
 	// 	mintegrity_sync(v);
 
-	if (v->data_start ||
+	if (v->data_start_shift ||
 	    ti->len != i_size_read(v->dev->bdev->bd_inode) >> SECTOR_SHIFT)
 		r = scsi_verify_blk_ioctl(NULL, cmd);
 
@@ -1008,7 +1007,7 @@ static int mintegrity_iterate_devices(struct dm_target *ti,
 {
 	struct dm_mintegrity *v = ti->private;
 
-	return fn(ti, v->dev, v->data_start, ti->len, data);
+	return fn(ti, v->dev, v->data_start_shift, ti->len, data);
 }
 
 static void mintegrity_io_hints(struct dm_target *ti, struct queue_limits *limits)
@@ -1160,8 +1159,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 	v->data_blocks = num_ll;
-	// Struct says this is in 512 byte sectors...
-	v->data_start = (v->journal_start + v->journal_blocks) << (v->dev_block_bits - 9);
+	v->data_start = v->journal_start + v->journal_blocks;
 
 	// Check that device is long enough
 	if (ti->len > (v->data_blocks << (v->dev_block_bits - SECTOR_SHIFT))) {
