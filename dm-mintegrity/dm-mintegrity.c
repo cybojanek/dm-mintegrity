@@ -67,6 +67,12 @@ struct buffer_aux {
 	struct rw_semaphore lock; /* RW semaphore lock for async write back */
 };
 
+struct dm_mintegrity_block {
+	struct dm_buffer *buf;
+	u8 *data;
+	unsigned offset;
+};
+
 struct dm_mintegrity {
 	struct dm_dev *dev;
 	struct dm_target *ti;
@@ -115,17 +121,12 @@ struct dm_mintegrity {
 	struct rw_semaphore lock;              /* read/write lock */
 
 	struct mintegrity_journal_superblock journal_superblock;
+	struct dm_mintegrity_block journal_block;
 	struct buffer_aux *journal_buffer_head;
 	struct buffer_aux *journal_buffer_tail;
 
 	/* starting blocks for each tree level. 0 is the lowest level. */
 	sector_t hash_level_block[DM_MINTEGRITY_MAX_LEVELS];
-};
-
-struct dm_mintegrity_block {
-	struct dm_buffer *buf;
-	u8 *data;
-	unsigned offset;
 };
 
 struct dm_mintegrity_io {
@@ -247,92 +248,6 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block,
 	*offset = idx << (v->dev_block_bits - v->hash_per_block_bits);
 }
 
-static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
-	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash,
-	struct dm_mintegrity_block *buffer)
-{
-	struct buffer_aux *aux = dm_bufio_get_aux_data(buffer->buf);
-	if(aux->journal){ // Already in journal
-		dm_bufio_release(buffer->buf);
-		return;
-	}
-	aux->journal = 1;
-	aux->journal_position = hash->offset;
-	aux->self_buffer = buffer->buf;
-	aux->next_aux = NULL;
-
-	if(v->journal_buffer_head == NULL){
-		v->journal_buffer_head = aux;
-		v->journal_buffer_tail = v->journal_buffer_head;
-	} else {
-		v->journal_buffer_tail->next_aux = aux;
-		v->journal_buffer_tail = aux;
-	}
-}
-
-static void mintegrity_flush_journal(struct dm_mintegrity *v)
-{
-	struct buffer_aux *aux;
-	struct mintegrity_journal_superblock *js = &v->journal_superblock;
-	// Flush journal
-	dm_bufio_write_dirty_buffers(v->bufio);
-	// Mark all buffers passed to journal as dirty
-	aux = v->journal_buffer_head;
-	while(aux != NULL){
-		struct buffer_aux *next = aux->next_aux;
-		aux->journal = 0;
-		aux->journal_position = 0;
-		dm_bufio_mark_buffer_dirty(aux->self_buffer);
-		dm_bufio_release(aux->self_buffer);
-		aux = next;
-	}
-	// Flush buffers
-	dm_bufio_write_dirty_buffers(v->bufio);
-	v->journal_buffer_head = NULL;
-	v->journal_buffer_tail = NULL;
-
-	js->transaction_fill = 0;
-}
-
-static void mintegrity_rollback_journal_slot(struct dm_mintegrity *v,
-	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
-{
-	// TODO: fix this for circular buffer
-	struct mintegrity_journal_superblock *js = &v->journal_superblock;
-	js->transaction_fill--;
-}
-
-static int mintegrity_get_journal_slot(struct dm_mintegrity *v,
-	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
-{
-	sector_t sector;
-	struct mintegrity_journal_superblock *js = &v->journal_superblock;
-	// Check for space
-	if(js->transaction_fill == js->transaction_capacity){
-		mintegrity_flush_journal(v);
-	}
-	// Get next journal spot
-	sector = v->journal_start + 1 + (js->transaction_fill *
-		((js->num_blocks - 1) / js->transaction_capacity));
-
-	// Get the journal data block
-	data->data = dm_bufio_new(v->bufio, sector, &(data->buf));
-	if (unlikely(IS_ERR(data->data)))
-		return PTR_ERR(data->data);
-	data->offset = js->transaction_fill;
-
-	// Get the journal hash block
-	hash->data = dm_bufio_new(v->bufio, sector + 1, &(hash->buf));
-	if (unlikely(IS_ERR(hash->data))){
-		dm_bufio_release(data->buf);
-		return PTR_ERR(hash->data);
-	}
-	hash->offset = js->transaction_fill;
-
-	// Increment fill
-	js->transaction_fill++;
-	return 0;
-}
 
 /*
  * Calculate hash of buffer and put it in io_real_digest
@@ -450,6 +365,233 @@ static int mintegrity_hmac_hash(struct dm_mintegrity_io *io)
 	}
 
 	return 0;
+}
+
+static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
+	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash,
+	struct dm_mintegrity_block *buffer)
+{
+	struct buffer_aux *aux = dm_bufio_get_aux_data(buffer->buf);
+	if(aux->journal){ // Already in journal
+		dm_bufio_release(buffer->buf);
+		return;
+	}
+	aux->journal = 1;
+	aux->journal_position = hash->offset;
+	aux->self_buffer = buffer->buf;
+	aux->next_aux = NULL;
+
+	if(v->journal_buffer_head == NULL){
+		v->journal_buffer_head = aux;
+		v->journal_buffer_tail = v->journal_buffer_head;
+	} else {
+		v->journal_buffer_tail->next_aux = aux;
+		v->journal_buffer_tail = aux;
+	}
+}
+
+static void mintegrity_flush_journal(struct dm_mintegrity *v)
+{
+	struct buffer_aux *aux;
+	struct mintegrity_journal_superblock *js = &v->journal_superblock;
+
+	// Write out journal and journal superblock
+	js->state = 1;
+	memcpy(v->journal_block.data, js, sizeof(struct mintegrity_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->journal_block.buf);
+	dm_bufio_write_dirty_buffers(v->bufio);
+
+	// Mark all buffers passed to journal as dirty
+	aux = v->journal_buffer_head;
+	while(aux != NULL){
+		struct buffer_aux *next = aux->next_aux;
+		aux->journal = 0;
+		aux->journal_position = 0;
+		dm_bufio_mark_buffer_dirty(aux->self_buffer);
+		dm_bufio_release(aux->self_buffer);
+		aux = next;
+	}
+
+	// Flush buffers
+	dm_bufio_write_dirty_buffers(v->bufio);
+	v->journal_buffer_head = NULL;
+	v->journal_buffer_tail = NULL;
+
+	// Write out journal superblock - clean
+	js->transaction_fill = 0;
+	js->state = 0;
+	memcpy(v->journal_block.data, js, sizeof(struct mintegrity_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->journal_block.buf);
+	dm_bufio_write_dirty_buffers(v->bufio);
+}
+
+static void mintegrity_rollback_journal_slot(struct dm_mintegrity *v,
+	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
+{
+	// TODO: fix this for circular buffer
+	struct mintegrity_journal_superblock *js = &v->journal_superblock;
+	js->transaction_fill--;
+}
+
+static int mintegrity_get_journal_slot(struct dm_mintegrity *v,
+	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
+{
+	sector_t sector;
+	struct mintegrity_journal_superblock *js = &v->journal_superblock;
+	// Check for space
+	if(js->transaction_fill == js->transaction_capacity){
+		mintegrity_flush_journal(v);
+	}
+	// Get next journal spot
+	sector = v->journal_start + 1 + (js->transaction_fill *
+		((js->num_blocks - 1) / js->transaction_capacity));
+
+	// Get the journal data block
+	data->data = dm_bufio_new(v->bufio, sector, &(data->buf));
+	if (unlikely(IS_ERR(data->data)))
+		return PTR_ERR(data->data);
+	data->offset = js->transaction_fill;
+
+	// Get the journal hash block
+	hash->data = dm_bufio_new(v->bufio, sector + 1, &(hash->buf));
+	if (unlikely(IS_ERR(hash->data))){
+		dm_bufio_release(data->buf);
+		return PTR_ERR(hash->data);
+	}
+	hash->offset = js->transaction_fill;
+
+	// Increment fill
+	js->transaction_fill++;
+	return 0;
+}
+
+
+static int mintegrity_recover_journal(struct dm_mintegrity *v)
+{
+	struct dm_mintegrity_block j_data_block;
+	struct dm_mintegrity_block j_hash_block;
+	struct dm_mintegrity_block block;
+	sector_t data_sector, hash_sector;
+	unsigned offset;
+	u8 *result;
+	int i;
+	int j;
+	int r;
+	struct mintegrity_journal_superblock *mjsb = &v->journal_superblock;
+	struct dm_mintegrity_io *io = (struct dm_mintegrity_io*)kzalloc(v->ti->per_bio_data_size, GFP_KERNEL);
+	if (!io)
+		return -ENOMEM;
+
+	for (i = 0; i < mjsb->transaction_fill; i++) {
+		j_data_block.data = NULL;
+		j_hash_block.data = NULL;
+		block.data = NULL;
+
+		// Read hash block
+		j_hash_block.data = dm_bufio_read(v->bufio, v->journal_start + (i + 1) * 2,
+			&j_hash_block.buf);
+		if (IS_ERR(j_hash_block.data)) {
+			DMERR("Failed to read journal hash block: %d", i);
+			goto bad;
+		}
+		// Set up root
+		memcpy(v->root_digest, j_hash_block.data + v->levels * v->digest_size +
+			sizeof(sector_t), v->digest_size);
+
+		// Compute hmac
+		r = mintegrity_hmac_hash(io);
+		if (r < 0) {
+			DMERR("Failed to calculate hmac for journal block: %d", i);
+			goto bad;
+		}
+
+		// Verify match
+		result = io_hmac_digest(v, io);
+		if(memcmp(j_hash_block.data + v->levels * v->digest_size + sizeof(sector_t)
+			+ v->digest_size, result, v->hmac_digest_size)) {
+			DMERR("Journal hmac does not verify for block: %d", i);
+			goto bad;
+		}
+
+		// Get logical data sector
+		memcpy(&data_sector, j_hash_block.data + v->levels * v->digest_size,
+			sizeof(sector_t));
+		if (data_sector > v->data_blocks) {
+			DMERR("Journdal data block IO out of range: %llu > %llu",
+				(unsigned long long)data_sector,
+				(unsigned long long)v->data_blocks);
+			goto bad;
+		}
+
+		// Write out hashes
+		for (j = 0; i < v->levels; j++) {
+			// Get hash positions
+			mintegrity_hash_at_level(v, data_sector, j, &hash_sector, &offset);
+			// Read current hash block from disk
+			block.data = dm_bufio_read(v->bufio, hash_sector, &block.buf);
+			if (IS_ERR(block.data)) {
+				DMERR("Failed to get hash");
+				goto bad;
+			}
+			// Copy in changes
+			memcpy(block.data + offset, j_hash_block.data + j * v->digest_size,
+				v->digest_size);
+			// Write back to disk
+			dm_bufio_mark_buffer_dirty(block.buf);
+			dm_bufio_release(block.buf);
+			block.data = NULL;
+		}
+		dm_bufio_release(j_hash_block.buf);
+		j_hash_block.data = NULL;
+
+		// Read data block
+		j_data_block.data = dm_bufio_read(v->bufio, v->journal_start + 1 + i * 2,
+			&j_data_block.buf);
+		if (IS_ERR(j_data_block.data)) {
+			DMERR("Failed to read journal data block: %d", i);
+			goto bad;
+		}
+
+		// Get new data block
+		block.data = dm_bufio_new(v->bufio, v->data_start + data_sector, &block.buf);
+		if (IS_ERR(block.data)) {
+			DMERR("Failed to get new data block for recovery");
+			goto bad;
+		}
+
+		// Write it out
+		memcpy(block.data, j_data_block.data, v->dev_block_bytes);
+		dm_bufio_mark_buffer_dirty(block.buf);
+		dm_bufio_release(block.buf);
+		dm_bufio_release(j_data_block.buf);
+	}
+
+	// Sync everything
+	dm_bufio_write_dirty_buffers(v->bufio);
+
+	// Write out journal superblock - clean
+	mjsb->transaction_fill = 0;
+	mjsb->state = 0;
+	memcpy(v->journal_block.data, mjsb,
+		sizeof(struct mintegrity_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->journal_block.buf);
+	dm_bufio_write_dirty_buffers(v->bufio);
+
+	kfree(io);
+	return 0;
+
+bad:
+	if (j_data_block.data)
+		dm_bufio_release(j_data_block.buf);
+
+	if (j_hash_block.data)
+		dm_bufio_release(j_hash_block.buf);
+
+	if (block.data)
+		dm_bufio_release(block.buf);
+
+	kfree(io);
+	return -EIO;
 }
 
 /*
@@ -740,7 +882,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		memcpy(j_hash_block.data, result, v->digest_size);
 
 		// Write things back bottom up
-		for (i = 1; i < v->levels; i++){
+		for (i = 1; i < v->levels; i++) {
 			// Calculate hash for level below
 			r = mintegrity_buffer_hash(io, io->hb_vec[i - 1].data,
 				v->dev_block_bytes);
@@ -1105,6 +1247,9 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
 
+	if (v->journal_block.data)
+		dm_bufio_release(v->journal_block.buf);
+
 	if (v->bufio)
 		dm_bufio_client_destroy(v->bufio);
 
@@ -1156,8 +1301,6 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	sector_t reserved;
 	sector_t b;
 	char dummy;
-	struct dm_buffer *buf;
-	u8 *data;
 
 	// Allocate struct dm_mintegrity for this device mapper instance
 	v = kzalloc(sizeof(struct dm_mintegrity), GFP_KERNEL);
@@ -1389,6 +1532,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	reserved += v->journal_blocks;
 	// One for each read operation
 	reserved += num_online_cpus();
+	// One for journal superblock
+	reserved += 1;
 
 	// Open device mapper buffered IO client
 	v->bufio = dm_bufio_client_create(v->dev->bdev,
@@ -1406,24 +1551,6 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		ti->error = "Device is too small";
 		r = -E2BIG;
 		goto bad;
-	}
-
-	// Journal setup
-	v->journal_buffer_head = NULL;
-	v->journal_buffer_tail = NULL;
-	data = dm_bufio_read(v->bufio, v->journal_start, &buf);
-	if (unlikely(IS_ERR(data))) {
-		ti->error = "Failed to read journal superblock";
-		r = -EINVAL;
-		goto bad;
-	}
-
-	// TODO: endianness
-	memcpy(&v->journal_superblock, data, sizeof(struct mintegrity_journal_superblock));
-	dm_bufio_release(buf);
-
-	if(v->journal_superblock.state != 0){
-		printk("NEED TO CLEAN UP JOURNAL AND RECOVER HMAC");
 	}
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
@@ -1467,6 +1594,30 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		ti->error = "Cannot allocate write workqueue";
 		r = -ENOMEM;
 		goto bad;
+	}
+
+	// Journal setup
+	v->journal_buffer_head = NULL;
+	v->journal_buffer_tail = NULL;
+	v->journal_block.data = dm_bufio_read(v->bufio, v->journal_start,
+		&v->journal_block.buf);
+	if (IS_ERR(v->journal_block.data)) {
+		ti->error = "Failed to read journal superblock";
+		r = -EINVAL;
+		goto bad;
+	}
+
+	// TODO: endianness
+	memcpy(&v->journal_superblock, v->journal_block.data,
+		sizeof(struct mintegrity_journal_superblock));
+
+	if(v->journal_superblock.state != 0){
+		r = mintegrity_recover_journal(v);
+		if (r < 0) {
+			ti->error = "Could not recover journal";
+			r = -EIO;
+			goto bad;
+		}
 	}
 
 	v->created = 1;
