@@ -1,6 +1,4 @@
 #define DM_MINTEGRITY_MAX_LEVELS 63
-#define BLOCK_SIZE 4096
-#define JBD_LEVEL_FACTOR 100
 
 #define divide_up(x, y) (x == 0 ? x : (1 + ((x - 1) / y)))
 
@@ -19,7 +17,6 @@ struct mint_superblock {
 	char root[128];           /**< Root hash */     
 	char hmac[128];           /**< Signed hmac of root */
 	char pad[18];             /**< Padding */
-	char pad_block[BLOCK_SIZE - 512];  /**< Padding to block size */
 }__attribute__((packed));
 
 struct mint_journal_superblock {
@@ -31,9 +28,7 @@ struct mint_journal_superblock {
 	uint16_t hash_levels;           /**< Number of hash levels */
 	uint16_t hash_bytes;            /**< Number of bytes in a hash */
 	char state;                     /**< Clean, Dirty, Committing */
-	char hmac[128];                 /**< hmac for flush update */
-	char pad[347];                  /**< 512 byte padding */
-	char pad_block[BLOCK_SIZE - 512];/**< Block size padding */
+	char pad[475];                  /**< 512 byte padding */
 }__attribute__((packed));
 
 /**

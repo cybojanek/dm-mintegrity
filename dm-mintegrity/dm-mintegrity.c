@@ -77,9 +77,17 @@ struct dm_mintegrity {
 	u8 *root_digest;	/* digest of the root block */
 	u8 *salt;		/* salt: its size is salt_size */
 	unsigned salt_size;
+	char *hmac_alg_name;
+	struct crypto_shash *hmac_tfm;
+	u8 *inner_pad;
+	u8 *outer_pad;
 
 	unsigned digest_size;	/* digest size for the current hash algorithm */
 	unsigned shash_descsize;/* the size of temporary space for crypto */
+
+	unsigned hmac_digest_size;	/* digest size for the current hash algorithm */
+	unsigned hmac_shash_descsize;/* the size of temporary space for crypto */
+
 	int hash_failed;	/* set to 1 if hash of any block failed */
 	int created;
 
@@ -169,6 +177,17 @@ static u8 *io_real_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 static u8 *io_want_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 {
 	return (u8 *)(io + 1) + v->shash_descsize + v->digest_size;
+}
+
+static struct shash_desc *io_hmac_desc(struct dm_mintegrity *v,
+	struct dm_mintegrity_io *io)
+{
+	return (struct shash_desc*)((u8 *)(io + 1) + v->shash_descsize + v->digest_size * 2);
+}
+
+static u8 *io_hmac_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
+{
+	return (u8 *)(io + 1) + v->shash_descsize + v->digest_size * 2 + v->hmac_shash_descsize;
 }
 
 /*
@@ -355,6 +374,83 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
 	return 0;
 }
 
+/*
+ * Calculate hmac of root buffer. Clobbers io_want_digest
+ *
+ * hash((outer_pad ^ root_digest) || hash((inner_pad ^ root_digest) || message))
+ * || - concatenation
+ */
+static int mintegrity_hmac_hash(struct dm_mintegrity_io *io)
+{
+	struct dm_mintegrity *v = io->v;
+	struct shash_desc *desc;
+	int r;
+	int i;
+	u8 *temp = io_want_digest(v, io);
+	u8 *result = io_hmac_digest(v, io);
+	desc = io_hmac_desc(v, io);
+	desc->tfm = v->hmac_tfm;
+	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+
+	for (i = 0; i < v->digest_size; i++) {
+		temp[i] = v->inner_pad[i] ^ v->root_digest[i];
+	}
+
+	r = crypto_shash_init(desc);
+	if(r < 0){
+		DMERR("crypto_shash_init failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_update(desc, temp, v->digest_size);
+	if (r < 0) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_update(desc, v->root_digest, v->digest_size);
+	if (r < 0) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_final(desc, result);
+	if (r < 0) {
+		DMERR("crypto_shash_final failed: %d", r);
+		return r;
+	}
+
+	// XOR outer_pad with root_digest
+	for (i = 0; i < v->digest_size; i++) {
+		temp[i] = v->outer_pad[i] ^ v->root_digest[i];
+	}
+
+	r = crypto_shash_init(desc);
+	if(r < 0){
+		DMERR("crypto_shash_init failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_update(desc, temp, v->digest_size);
+	if (r < 0) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_update(desc, result, v->hmac_digest_size);
+	if (r < 0) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_final(desc, result);
+	if (r < 0) {
+		DMERR("crypto_shash_final failed: %d", r);
+		return r;
+	}
+
+	return 0;
+}
 
 /*
  * Verify hash of a metadata block pertaining to the specified data block
@@ -649,7 +745,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			r = mintegrity_buffer_hash(io, io->hb_vec[i - 1].data,
 				v->dev_block_bytes);
 			if(r < 0) {
-				DMERR("failed to calcualte write buffer hash for level");
+				DMERR("failed to calculate write buffer hash for level");
 				goto bad;
 			}
 			result = io_real_digest(v, io);
@@ -664,7 +760,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		r = mintegrity_buffer_hash(io, io->hb_vec[v->levels - 1].data,
 			v->dev_block_bytes);
 		if (r < 0) {
-			DMERR("failed to calcualte write buffer hash for level");
+			DMERR("failed to calculate write buffer hash for level");
 			goto bad;
 		}
 		result = io_real_digest(v, io);
@@ -672,9 +768,21 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		// Copy into journal buffer
 		memcpy(j_hash_block.data + (v->levels - 1) * v->digest_size, result,
 			v->digest_size);
-		// Copy data sector: TODO: size/endianess
-		// memcpy(j_hash_block.data + v->levels * v->digest_size, &data_sector,
-			// sizeof(sector_t));
+		// Copy data sector into journal
+		memcpy(j_hash_block.data + v->levels * v->digest_size, &data_sector,
+			sizeof(sector_t));
+		// Copy root
+		memcpy(j_hash_block.data + v->levels * v->digest_size + sizeof(sector_t),
+			v->root_digest, v->digest_size);
+		// Copy hmac
+		r = mintegrity_hmac_hash(io);
+		if (r < 0) {
+			DMERR("failed to calculate hmac");
+			goto bad;
+		}
+		result = io_hmac_digest(v, io);
+		memcpy(j_hash_block.data + v->levels * v->digest_size + sizeof(sector_t)
+			+ v->digest_size, result, v->hmac_digest_size);
 
 		// Get ready to write to disk
 		d_data_block.data = dm_bufio_new(v->bufio, data_sector + v->data_start,
@@ -1000,12 +1108,18 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->bufio)
 		dm_bufio_client_destroy(v->bufio);
 
+	kfree(v->inner_pad);
+	kfree(v->outer_pad);
 	kfree(v->salt);
 	kfree(v->root_digest);
+
+	if(v->hmac_tfm)
+		crypto_free_shash(v->hmac_tfm);
 
 	if (v->tfm)
 		crypto_free_shash(v->tfm);
 
+	kfree(v->hmac_alg_name);
 	kfree(v->alg_name);
 
 	if (v->dev)
@@ -1025,7 +1139,8 @@ static void mintegrity_dtr(struct dm_target *ti)
  *  <root digest>
  *  <salt>
  *  <hmac hash type>
- *  <hmac secret>
+ *  <hmac inner pad>
+ *  <hmac outer pad>
  *
  * TODO: change salt support to this
  *	<salt>		Hex string or "-" if no salt.
@@ -1062,7 +1177,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	// Check argument count
-	if (argc != 10) {
+	if (argc != 11) {
 		ti->error = "Invalid argument count: exactly 11 arguments required";
 		r = -EINVAL;
 		goto bad;
@@ -1183,6 +1298,53 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		}
 	}
 
+	// argv[8] <hmac hash type>
+	v->hmac_alg_name = kstrdup(argv[8], GFP_KERNEL);
+	if (!v->hmac_alg_name) {
+		ti->error = "Cannot allocate algorithm name";
+		r = -ENOMEM;
+		goto bad;
+	}
+
+	// Allocate a crypto hash object based on algorithm name
+	v->hmac_tfm = crypto_alloc_shash(v->hmac_alg_name, 0, 0);
+	if (IS_ERR(v->hmac_tfm)) {
+		ti->error = "Cannot initialize hash function";
+		r = PTR_ERR(v->hmac_tfm);
+		v->hmac_tfm = NULL;
+		goto bad;
+	}
+	v->hmac_digest_size = crypto_shash_digestsize(v->hmac_tfm);
+	v->hmac_shash_descsize = sizeof(struct shash_desc) + crypto_shash_descsize(v->hmac_tfm);
+
+	// argv[9] <hmac inner_pad>
+	v->inner_pad = kmalloc(v->digest_size, GFP_KERNEL);
+	if (!v->inner_pad) {
+		ti->error = "Cannot allocate secret";
+		r = -ENOMEM;
+		goto bad;
+	}
+	if (strlen(argv[9]) != v->digest_size * 2 ||
+	    hex2bin(v->inner_pad, argv[9], v->digest_size)) {
+		ti->error = "Invalid secret";
+		r = -EINVAL;
+		goto bad;
+	}
+
+	// argv[10] <hmac outer_pad>
+	v->outer_pad = kmalloc(v->digest_size, GFP_KERNEL);
+	if (!v->outer_pad) {
+		ti->error = "Cannot allocate secret";
+		r = -ENOMEM;
+		goto bad;
+	}
+	if (strlen(argv[10]) != v->digest_size * 2 ||
+	    hex2bin(v->outer_pad, argv[10], v->digest_size)) {
+		ti->error = "Invalid secret";
+		r = -EINVAL;
+		goto bad;
+	}
+
 	// Compute start of each hash level
 	v->hash_per_block_bits = __fls((1 << v->dev_block_bits) / v->digest_size);
 
@@ -1265,8 +1427,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
-		v->shash_descsize + v->digest_size * 2,
-		__alignof__(struct dm_mintegrity_io));
+		v->shash_descsize + v->digest_size * 2 + v->hmac_shash_descsize +
+		v->hmac_digest_size, __alignof__(struct dm_mintegrity_io));
 
 	v->vec_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
 					BIO_MAX_PAGES * sizeof(struct bio_vec));
