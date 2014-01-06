@@ -2,6 +2,9 @@
 
 #define divide_up(x, y) (x == 0 ? x : (1 + ((x - 1) / y)))
 
+#define MS_MAGIC 0x796c694c
+#define MJ_MAGIC 0x594c494c
+
 struct mint_superblock {
 	uint32_t magic;           /**< 0x796c694c */
 	uint32_t version;         /**< dm-mintegrity superblock version */
@@ -15,21 +18,50 @@ struct mint_superblock {
 	uint16_t salt_size;       /**< Size of salt */
 	char salt[128];           /**< Salt */
 	char root[128];           /**< Root hash */     
-	char hmac[128];           /**< Signed hmac of root */
-	char pad[18];             /**< Padding */
+	char pad[146];            /**< Padding */
 }__attribute__((packed));
 
+/** Mint Journal Nothing Block */
+#define TYPE_MJNB 0
+/** Mint Journal Super Block */
+#define TYPE_MJSB 1
+/** Mint Journal Descriptor Block */
+#define TYPE_MJDB 2
+/** Mint Journal Commit Block */
+#define TYPE_MJCB 3
+
+struct mint_journal_header {
+	uint32_t magic;     /**< 0x594c494c */
+	uint32_t type;      /**< Super/Descriptor/Commit Block */
+	uint32_t sequence;  /**< Sequence number */
+	uint32_t options;   /**< Options */
+};
+
+struct mint_journal_descriptor {
+	struct mint_journal_header header;
+	/** Block fill followed by tags */
+};
+
+struct mint_journal_commit {
+	struct mint_journal_header header;
+	/** Followed by char array of hmac */
+};
+
+struct mint_journal_block_tag {
+	uint32_t low;      /**< Destination sector low */
+	uint32_t high;     /**< Destination sector high */
+	uint32_t options;  /**< Last or bits for escaped blocks */
+};
+
 struct mint_journal_superblock {
-	char magic[16];                 /**< 0x6c696c796d756666696e000000000000 */
-	uint32_t transaction_capacity;  /**< Number of max transaction */
-	uint32_t transaction_fill;      /**< Number of transactions in journal */
-	uint32_t block_size;            /**< Size of a single block */
-	uint32_t num_blocks;            /**< Number of block in this journal (including superblock) */
-	uint16_t hash_levels;           /**< Number of hash levels */
-	uint16_t hash_bytes;            /**< Number of bytes in a hash */
-	char state;                     /**< Clean, Dirty, Committing */
-	char pad[475];                  /**< 512 byte padding */
-}__attribute__((packed));
+	struct mint_journal_header header;
+	uint32_t block_size;  /**< Size of a single block */
+	uint32_t blocks;      /**< Number of block in this journal (including superblock) */
+	uint32_t head;        /**< Circular buffer head position */
+	uint32_t tail;        /**< Circular buffer tail position */
+	uint32_t fill;        /**< Number of used blocks */
+	char state;           /**< Clean, Dirty */
+};
 
 /**
 struct mint_metadata_entry {

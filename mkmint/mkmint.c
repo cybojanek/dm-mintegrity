@@ -30,7 +30,7 @@ static const char mjsb_magic[16] = {0x6c, 0x69, 0x6c, 0x79, 0x6d, 0x75, 0x66,
 static inline void progress(uint64_t i, uint64_t n, uint8_t r, uint8_t w){
 	if((n/r) != 0 && i % (n/r) != 0 && i != n){ return; }
 	char line[w + 1];
-	sprintf(line, " %3llu%% [", i != n ? i * 100 / n : 100);
+	sprintf(line, " %3ju%% [", i != n ? i * 100 / n : 100);
 	uint8_t points = i != n ? 7 + (w - 9) * i / n : 7 + w - 9;
 	for(uint8_t i = 7; i < points; i++){
 		line[i] = '=';
@@ -71,7 +71,7 @@ void bytes_to_hex(const char *bytes, size_t len, char *out){
  */
 int hex_to_bytes(const char *hex, size_t len, char *out){
 	for(size_t i = 0; i < len / 2; i++){
-		if(sscanf(hex + 2 * i, "%02x", &out[i]) != 1){
+		if(sscanf(hex + 2 * i, "%02x", (unsigned int*)&out[i]) != 1){
 			return -1;
 		}
 	}
@@ -95,7 +95,7 @@ void print_superblock(struct mint_superblock *sb){
 	printf("Hash_Type: %s\n", sb->hash_algorithm);
 	printf("Hmac_Type: %s\n", sb->hmac_algorithm);
 	printf("Block_Size: %u\n", sb->block_size);
-	printf("Data_Blocks: %llu\n", sb->data_blocks);
+	printf("Data_Blocks: %ju\n", sb->data_blocks);
 	printf("Hash_Blocks: %u\n", sb->hash_blocks);
 	printf("JB_Blocks: %u\n", sb->jb_blocks);
 	printf("Salt_Size: %u\n", sb->salt_size);
@@ -152,7 +152,7 @@ int compute_hash_blocks(uint64_t data_blocks, uint32_t fanout,
  * @return 0 if ok else error
  */
 int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
-	uint32_t jb_transactions, uint64_t *data_blocks, uint32_t *hash_blocks,
+	uint32_t journal_blocks, uint64_t *data_blocks, uint32_t *hash_blocks,
 	uint32_t *jb_blocks, uint32_t *pad_blocks, uint32_t *levels,
 	uint32_t *blocks_per_level, uint32_t hash_bytes){
 
@@ -180,12 +180,7 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 		}
 
 		// Number of jb blocks needed
-		// How many levels will fit in a block, plus one more if not enough
-		// for trasanction number
-		uint32_t blocks_per_transaction = 1 + divide_up(lev, fanout) + 
-			((lev % fanout * hash_bytes > block_size - sizeof(uint32_t)) ? 1 : 0);
-		// Suerpblock, data blocks, hash transactions
-		jb = 1 + jb_transactions * blocks_per_transaction;
+		jb = journal_blocks;
 		used = db + jb + hb;
 		pb = blocks - used;
 
@@ -243,17 +238,16 @@ int main(int argc, char const *argv[]) {
 	// Check for arguments
 	if(argc != 9){
 		exit_error_f("Usage: %s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT "
-					 "HMAC_TYPE INNER_PAD OUTER_PAD", argv[0]);
+					 "HMAC_TYPE SECRET", argv[0]);
 	}
-	const char *dev, *hash_type, *hmac_type, *salt_str, *inner_pad, *outer_pad;
-	uint32_t block_size, jb_transactions;
+	const char *dev, *hash_type, *hmac_type, *salt_str, *secret_str;
+	uint32_t block_size, journal_blocks;
 
 	dev = argv[1];
 	hash_type = argv[4];
 	salt_str = argv[5];
 	hmac_type = argv[6];
-	inner_pad = argv[7];
-	outer_pad = argv[8];
+	secret_str = argv[7];
 
 	// Open destination device
 	int file;
@@ -279,21 +273,19 @@ int main(int argc, char const *argv[]) {
 	if(block_size < 512){
 		exit_error_f("Invalid block size: '%u' < 512", block_size);
 	}
-	char block_pad[block_size - 512];
-	bzero(block_pad, block_size - 512);
 
 	// Remainder check
 	if(S_ISREG(file_stats.st_mode) && file_stats.st_size % block_size != 0){
-		warn("File is not a multiple of block_size: %d. %llu bytes left over",
+		warn("File is not a multiple of block_size: %d. %ju bytes left over",
 			block_size, file_stats.st_size % block_size);
 	} else if(S_ISBLK(file_stats.st_mode))
 
 	// Number of journal transactions
-	if(sscanf(argv[3], "%u", &jb_transactions) != 1){
+	if(sscanf(argv[3], "%u", &journal_blocks) != 1){
 		exit_error_f("Invalid journal transaction number: '%s'", argv[3]);
 	}
-	if(jb_transactions == 0){
-		exit_error_f("Journal transaction number has to be at least 1: %s", argv[3]);
+	if(journal_blocks < 35){
+		exit_error_f("Journal block number has to be at least 35: %s", argv[3]);
 	}
 
 	OpenSSL_add_all_digests();
@@ -325,25 +317,14 @@ int main(int argc, char const *argv[]) {
 	if(hex_to_bytes(salt_str, strlen(salt_str), (char*)salt) != 0){
 		exit_error_f("Invalid hex salt: '%s'", salt_str);
 	}
+
 	// Parse and check secrets
 	char secret[hash_bytes];
-	if(strlen(inner_pad) % 2 != 0){
-		exit_error_f("Invalid hex inner pad: length not a multiple of 2");
+	if(strlen(secret_str) % 2 != 0){
+		exit_error_f("Invalid hex secret: length not a multiple of 2");
 	}
-	if(strlen(inner_pad) != hash_bytes * 2){
-		exit_error_f("Invalid hex inner pad: not of length: %d", hash_bytes * 2);
-	}
-	if(hex_to_bytes(inner_pad, strlen(inner_pad), (char*)secret) != 0){
-		exit_error_f("Invalid hex inner pad: '%s'", inner_pad);
-	}
-	if(strlen(outer_pad) % 2 != 0){
-		exit_error_f("Invalid hex outer pad: length not a multiple of 2");
-	}
-	if(strlen(outer_pad) != hash_bytes * 2){
-		exit_error_f("Invalid hex outer pad: not of length: %d", hash_bytes * 2);
-	}
-	if(hex_to_bytes(outer_pad, strlen(outer_pad), (char*)secret) != 0){
-		exit_error_f("Invalid hex outer pad: '%s'", outer_pad);
+	if(hex_to_bytes(secret_str, strlen(secret_str), (char*)secret) != 0){
+		exit_error_f("Invalid hex inner pad: '%s'", secret_str);
 	}
 
 	// Calculate data size, hash block size, journal size
@@ -368,18 +349,18 @@ int main(int argc, char const *argv[]) {
 	uint32_t fanout = block_size / hash_bytes;
 
 	// Use up entire block device
-	compute_block_numbers(blocks, block_size, fanout, jb_transactions, &data_blocks,
+	compute_block_numbers(blocks, block_size, fanout, journal_blocks, &data_blocks,
 		&hash_blocks, &jb_blocks, &pad_blocks, &levels, blocks_per_level, hash_bytes);
 	
 	// Result info
-	info("Blocks: %llu = Superblock: 1, Data: %llu, Hash: %u, JB: %u, Pad: %u, Levels: %u",
+	info("Blocks: %ju = Superblock: 1, Data: %ju, Hash: %u, JB: %u, Pad: %u, Levels: %u",
 			blocks, data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
 
 	// Sanity check
 	if(data_blocks + hash_blocks + jb_blocks + pad_blocks + 1!= blocks){
-		warn("Data: %llu, Hash: %u, JB: %u, Pad: %u, Levels: %u",
+		warn("Data: %ju, Hash: %u, JB: %u, Pad: %u, Levels: %u",
 			data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
-		exit_error_f("Sanity check failed!: %llu != %llu",
+		exit_error_f("Sanity check failed!: %ju != %ju",
 			data_blocks + hash_blocks + jb_blocks + pad_blocks + 1, blocks);
 	}
 
@@ -388,6 +369,7 @@ int main(int argc, char const *argv[]) {
 	char hash_output[EVP_MAX_MD_SIZE];
 	uint32_t hash_length;
 	char *zero_block = (char*)malloc(block_size);
+	char *temp_block = (char*)malloc(block_size);
 	bzero(zero_block, block_size);
 
 	char buf[128];
@@ -439,14 +421,11 @@ int main(int argc, char const *argv[]) {
 	memcpy(msb->salt, salt, msb->salt_size);
 	// Set root hash
 	memcpy(msb->root, hash_output, hash_length);
-	// Set hmac
-	// TODO: calculate hmac
-	memcpy(msb->hmac, hash_output, hash_length);
 	// Write it out!
 	if(write(file, msb, sizeof(struct mint_superblock)) < 0){
 		exit_error_f("Failed to write MSB: %s", strerror(errno));
 	}
-	if(write(file, block_pad, block_size - 512) < 0){
+	if(write(file, zero_block, block_size - 512) < 0){
 		exit_error_f("Failed to write MSB pad: %s", strerror(errno));
 	}
 
@@ -472,38 +451,44 @@ int main(int argc, char const *argv[]) {
 		malloc(sizeof(struct mint_journal_superblock));
 	bzero(mjsb, sizeof(struct mint_journal_superblock));
 	// Magic
-	memcpy(mjsb->magic, mjsb_magic, 16);
-	// Maximum number of supported transactions
-	mjsb->transaction_capacity = jb_transactions;
-	// Current amount of transactions
-	mjsb->transaction_fill = 0;
+	mjsb->header.magic = MJ_MAGIC;
+	// Superblock
+	mjsb->header.type = TYPE_MJSB;
 	// Block size
 	mjsb->block_size = block_size;
-	// Number of blocks - including journal
-	mjsb->num_blocks = jb_blocks;
-	// Number of hash levels
-	mjsb->hash_levels = levels;
-	// Number of bytes in a hash
-	mjsb->hash_bytes = hash_bytes;
+	// Number of blocks
+	mjsb->blocks = jb_blocks;
+	// Head, tail, and fill are 0
+	mjsb->head = 0;
+	mjsb->tail = 0;
+	mjsb->fill = 0;
 	// Clean
 	mjsb->state = 0;
-	// Zeroed
-	// mjsb->hmac = 
-	// Zeroed
-	// mjsb->pad
-	// Zeroed
-	// mjsb->pad_block
 
 	info("Writing journal...");
-	// Doesn't matter that the rest are the same - just duplicate the block
-	// everywhere - I think even mkfs.ext3/ext4 does it the same way
-	for(uint32_t i = 0 ; i < jb_blocks; i++){
+	if(write(file, mjsb, sizeof(struct mint_journal_superblock)) < 0){
+		exit_error_f("Failed to write journal superblock: %u, %s", i,
+		strerror(errno));
+	}
+	if(write(file, zero_block, block_size - 512) < 0){
+		exit_error_f("Failed to write journal superblock pad: %s", strerror(errno));
+	}
+
+	struct mint_journal_header *mjh = (struct mint_journal_header*)
+		malloc(sizeof(struct mint_journal_header));
+	bzero(mjh, sizeof(struct mint_journal_header));
+	// Magic
+	mjh->magic = MJ_MAGIC;
+	// Nothing block
+	mjh->type = TYPE_MJNB;
+
+	for(uint32_t i = 1 ; i < jb_blocks; i++){
 		progress(i + 1, jb_blocks, 100, 79);
-		if(write(file, mjsb, sizeof(struct mint_journal_superblock)) < 0){
+		if(write(file, mjh, sizeof(struct mint_journal_header)) < 0){
 			exit_error_f("Failed to write journal block: %u, %s", i,
 				strerror(errno));
 		}
-		if(write(file, block_pad, block_size - 512) < 0){
+		if(write(file, zero_block, block_size - sizeof(struct mint_journal_header)) < 0){
 			exit_error_f("Failed to write journal pad: %s", strerror(errno));
 		}
 	}
@@ -514,7 +499,7 @@ int main(int argc, char const *argv[]) {
 	for(uint64_t i = 0; i < data_blocks; i++){
 		progress(i + 1, data_blocks, 100, 79);
 		if(write(file, zero_block, block_size) < 0){
-			exit_error_f("Failed to write data block: %u, %s", i,
+			exit_error_f("Failed to write data block: %ju, %s", i,
 				strerror(errno));
 		}
 	}
@@ -522,7 +507,7 @@ int main(int argc, char const *argv[]) {
 
 	print_superblock(msb);
 	bytes_to_hex(msb->root, hash_bytes, buf);
-	printf("dmsetup create meow --table \"%u %llu mintegrity %s %u %u %u %llu "
+	printf("dmsetup create meow --table \"%u %ju mintegrity %s %u %u %u %ju "
 		"%s %s %s %s %s %s\"\n",
 		0,             // Start is 0
 		data_blocks * (block_size / 512),   // Size of device given to device mapper
@@ -540,10 +525,12 @@ int main(int argc, char const *argv[]) {
 		outer_pad      // Secret for hmac
 		);
 
+	free(mjh);
 	free(mjsb);
 	free(msb);
 	free(blocks_per_level);
 	free(zero_block);
+	free(temp_block);
 	for(int i = 0; i < levels; i++){
 		free(hash_levels[i]);
 	}

@@ -34,16 +34,41 @@ static unsigned dm_mintegrity_prefetch_cluster = DM_MINTEGRITY_DEFAULT_PREFETCH_
 
 module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRUGO | S_IWUSR);
 
-struct mintegrity_journal_superblock {
-	char magic[16];                 /**< 0x6c696c796d756666696e000000000000 */
-	uint32_t transaction_capacity;  /**< Number of max transaction */
-	uint32_t transaction_fill;      /**< Number of transactions in journal */
-	uint32_t block_size;            /**< Size of a single block */
-	uint32_t num_blocks;            /**< Number of blocks in this journal */
-	uint16_t hash_levels;           /**< Number of hash levels */
-	uint16_t hash_bytes;            /**< Number of bytes in a hash */
-	char state;                     /**< Clean, Committing */
-	char hmac[128];                 /**< hmac for flush update */
+#define MJ_MAGIC 0x594c494c
+/* Mint Journal Nothing Block */
+#define TYPE_MJNB 0
+/* Mint Journal Super Block */
+#define TYPE_MJSB 1
+/* Mint Journal Descriptor Block */
+#define TYPE_MJDB 2
+/* Mint Journal Commit Block */
+#define TYPE_MJCB 3
+
+/* Tag and transaction revoked */
+#define J_TAG_REVOKE 1
+/* Last tag */
+#define J_TAG_LAST   2
+
+struct mint_journal_header {
+	uint32_t magic;     /* 0x594c494c */
+	uint32_t type;      /* Super/Descriptor/Commit Block */
+	uint32_t sequence;  /* Sequence number */
+	uint32_t options;   /* Options */
+};
+
+struct mint_journal_block_tag {
+	uint32_t low;      /* Destination sector low */
+	uint32_t high;     /* Destination sector high */
+	uint32_t options;  /* Last or bits for escaped blocks */
+};
+
+struct mint_journal_superblock {
+	struct mint_journal_header header;
+	uint32_t blocks;      /* Number of block in this journal (including superblock) */
+	uint32_t head;        /* Circular buffer head position */
+	uint32_t tail;        /* Circular buffer tail position */
+	uint32_t fill;        /* Number of used blocks */
+	char state;           /* Clean, Dirty */
 };
 
 /*
@@ -59,101 +84,117 @@ struct mintegrity_journal_superblock {
  * This condition is harmless, so we don't need locking.
  */
 struct buffer_aux {
-	unsigned hash_verified; /* Buffer has been verified */
-	unsigned journal; /* Buffer is already in journal list */
-	unsigned journal_position; /* First position buffer is part of */
-	struct dm_buffer *self_buffer; /* Pointer to own dm_buffer */
-	struct buffer_aux *next_aux; /* Next aux buffer for journal */
-	struct rw_semaphore lock; /* RW semaphore lock for async write back */
-};
-
-struct dm_mintegrity_block {
-	struct dm_buffer *buf;
-	u8 *data;
-	unsigned offset;
+	uint8_t hash_verified;          /* Buffer has been verified */
+	uint8_t journal;                /* Buffer is already in journal list */
+	struct dm_buffer *self_buffer;  /* Pointer to own dm_buffer */
+	struct buffer_aux *next_aux;    /* Next aux buffer for journal */
+	struct rw_semaphore lock;       /* RW semaphore lock for async write back */
 };
 
 struct dm_mintegrity {
+	// Block device
 	struct dm_dev *dev;
 	struct dm_target *ti;
 	struct dm_bufio_client *bufio;
 
-	char *alg_name;
-	struct crypto_shash *tfm;
-	u8 *root_digest;	/* digest of the root block */
-	u8 *salt;		/* salt: its size is salt_size */
-	unsigned salt_size;
-	char *hmac_alg_name;
-	struct crypto_shash *hmac_tfm;
-	u8 *inner_pad;
-	u8 *outer_pad;
+	// Hash
+	char *alg_name;        /* Hash algorithm name */
+	char *hmac_alg_name;   /* HMAC hash algorithm name */
 
-	unsigned digest_size;	/* digest size for the current hash algorithm */
-	unsigned shash_descsize;/* the size of temporary space for crypto */
+	uint32_t salt_size;    /* Size of salt */
+	uint32_t secret_size;  /* Size of HMAC secret */
 
-	unsigned hmac_digest_size;	/* digest size for the current hash algorithm */
-	unsigned hmac_shash_descsize;/* the size of temporary space for crypto */
+	uint8_t *root_digest;  /* Hash digest of the root block */
+	uint8_t *salt;		   /* salt: its size is salt_size */
+	uint8_t *secret;       /* HMAC secret: its size is secret_size */
 
+	struct crypto_shash *tfm;  /* Hash algorithm */
+	struct crypto_shash *hmac_tfm;  /* HMAC hash algorithm */
+
+	uint32_t digest_size;          /* hash digest size */
+	uint32_t hmac_digest_size;	   /* HMAC hash digest size */
+
+	uint32_t shash_descsize;       /* crypto temp space size */
+	uint32_t hmac_shash_descsize;  /* crypto temp space size */
+
+	// State
 	int hash_failed;	/* set to 1 if hash of any block failed */
 	int created;
 
-	sector_t hash_start;	/* hash start in blocks */
-	sector_t journal_start;	/* journal start in blocks */
-	sector_t data_start;	/* data start in blocks */
-	sector_t data_start_shift;	/* data offset in 512-byte sectors */
+	// Sector numbers
+	sector_t hash_start;	    /* hash start in blocks */
+	sector_t journal_start;	    /* journal start in blocks */
+	sector_t data_start;	    /* data start in blocks */
+	sector_t data_start_shift;  /* data offset in 512-byte sectors */
 
-	sector_t hash_blocks;	/* the number of hash blocks */
-	sector_t journal_blocks;/* the number of journal blocks */
-	sector_t data_blocks;	/* the number of data blocks */
+	sector_t hash_blocks;	    /* the number of hash blocks */
+	sector_t journal_blocks;    /* the number of journal blocks */
+	sector_t data_blocks;	    /* the number of data blocks */
 
-	unsigned char dev_block_bits;	/* log2(blocksize) */
-	unsigned char hash_per_block_bits;	/* log2(hashes in hash block) */
+	// Block size numbers
+	uint8_t dev_block_bits;	      /* log2(blocksize) */
+	uint8_t hash_per_block_bits;  /* log2(hashes in hash block) */
+	uint32_t dev_block_bytes;     /* Number of bytes in a device block */
 
-	unsigned int dev_block_bytes;
-
+	// Other
 	unsigned char levels;	/* the number of tree levels */
-
 	mempool_t *vec_mempool;	/* mempool of bio vector */
 	mempool_t *hb_mempool;  /* mempool for hash block writebacks */
 
-	struct workqueue_struct *read_wq;      /* workqueue for processing reads */
-	struct workqueue_struct *write_wq;     /* workqeue for processing writes */
-	struct rw_semaphore lock;              /* read/write lock */
+	// Work queues
+	struct workqueue_struct *read_wq;     /* workqueue for processing reads */
+	struct workqueue_struct *write_wq;    /* workqeue for processing writes */
+	struct workqueue_struct *journal_wq;  /* worqueue for journaling */
 
-	struct mintegrity_journal_superblock journal_superblock;
-	struct dm_mintegrity_block journal_block;
-	struct buffer_aux *journal_buffer_head;
-	struct buffer_aux *journal_buffer_tail;
+	// Locks
+	struct rw_semaphore lock;    /* global read/write lock */
+	struct rw_semaphore j_lock;  /* global journal read/write lock */
+
+	// Journal
+	struct mint_journal_superblock j_sb_header;  /* Current journal header */
+
+	struct dm_buffer *j_sb_buffer;  /* Journal superblock buffer */
+	struct dm_buffer *j_ds_buffer;  /* Journal descriptor buffer */
+
+	uint32_t j_ds_fill;  /* Number of tags in current descriptor buffer */
+	uint32_t j_ds_ready; /* Number of tags ready in current descriptor buffer */
+	uint32_t j_ds_max;   /* Max number of tags in descriptor buffer */
+	uint32_t j_bpt;      /* Number of blocks required per transaction */
+
+	struct buffer_aux *j_aux_buffer_head;  /* Head of modified blocks in journal */
+	struct buffer_aux *j_aux_buffer_tail;  /* Tail of modified blocks in journal */
 
 	/* starting blocks for each tree level. 0 is the lowest level. */
 	sector_t hash_level_block[DM_MINTEGRITY_MAX_LEVELS];
 };
 
 struct dm_mintegrity_io {
-	struct dm_mintegrity *v;
+	struct dm_mintegrity *v;  /* dm-mintegrity instance info */
 
-	sector_t block;
-	unsigned n_blocks;
+	sector_t block;     /* Start of block IO */
+	uint32_t n_blocks;  /* Number of blocks in IO */
 
-	/* saved bio vector */
+	/* Saved bio vector */
 	struct bio *bio;
 	struct bio_vec *io_vec;
-	struct dm_mintegrity_block *hb_vec;
-	unsigned io_vec_size;
+	uint32_t io_vec_size;
 
-	struct work_struct work;
+	struct work_struct work;  /* Work instance for read/write queue */
 
 	/* A space for short vectors; longer vectors are allocated separately. */
 	struct bio_vec io_vec_inline[DM_MINTEGRITY_IO_VEC_INLINE];
 
 	/*
-	 * Three variably-size fields follow this struct:
+	 * Five variably-size fields follow this struct:
 	 *
 	 * u8 hash_desc[v->shash_descsize];
 	 * u8 real_digest[v->digest_size];
 	 * u8 want_digest[v->digest_size];
+	 * struct dm_buffer[v->levels];
+	 * struct dm_buffer[v->j_bpt];
 	 *
-	 * To access them use: io_hash_desc(), io_real_digest() and io_want_digest().
+	 * To access them use: io_hash_desc(), io_real_digest(), io_want_digest(),
+	 * io_dm_buffers, and io_dm_j_buffers.
 	 */
 };
 
@@ -180,16 +221,28 @@ static u8 *io_want_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
 	return (u8 *)(io + 1) + v->shash_descsize + v->digest_size;
 }
 
-static struct shash_desc *io_hmac_desc(struct dm_mintegrity *v,
+static struct dm_buffer *io_dm_buffers(struct dm_mintegrity *v,
 	struct dm_mintegrity_io *io)
 {
-	return (struct shash_desc*)((u8 *)(io + 1) + v->shash_descsize + v->digest_size * 2);
+	return (struct dm_buffer**)((u8 *)(io + 1) + v->shash_descsize + 2 * v->digest_size);
 }
 
-static u8 *io_hmac_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
+static struct dm_buffer *io_dm_j_buffers(struct dm_mintegrity *v,
+	struct dm_mintegrity_io *io)
 {
-	return (u8 *)(io + 1) + v->shash_descsize + v->digest_size * 2 + v->hmac_shash_descsize;
+	return (struct dm_buffer**)((u8 *)(io + 1) + v->shash_descsize + 2 * v->digest_size) + v->levels + 1;
 }
+
+// static struct shash_desc *io_hmac_desc(struct dm_mintegrity *v,
+// 	struct dm_mintegrity_io *io)
+// {
+// 	return (struct shash_desc*)((u8 *)(io + 1) + v->shash_descsize + v->digest_size * 2);
+// }
+
+// static u8 *io_hmac_digest(struct dm_mintegrity *v, struct dm_mintegrity_io *io)
+// {
+// 	return (u8 *)(io + 1) + v->shash_descsize + v->digest_size * 2 + v->hmac_shash_descsize;
+// }
 
 /*
  * Initialize struct buffer_aux for a freshly created buffer.
@@ -209,7 +262,8 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
  */
  static void dm_bufio_write_callback(struct dm_buffer *buf)
  {
-	// ???
+	struct buffer_aux *aux = dm_bufio_get_aux_data(buf);
+	up_write(&(aux->lock));
  }
 
 /*
@@ -248,6 +302,14 @@ static void mintegrity_hash_at_level(struct dm_mintegrity *v, sector_t block,
 	*offset = idx << (v->dev_block_bits - v->hash_per_block_bits);
 }
 
+static uint32_t mintegrity_hash_buffer_offset(struct dm_mintegrity *v,
+	sector_t block, int level)
+{
+	// TODO: document this
+	return ((block >> (level * v->hash_per_block_bits)) &
+		((1 << v->hash_per_block_bits) - 1)) <<
+		(v->dev_block_bits - v->hash_per_block_bits);
+}
 
 /*
  * Calculate hash of buffer and put it in io_real_digest
@@ -367,38 +429,156 @@ static int mintegrity_hmac_hash(struct dm_mintegrity_io *io)
 	return 0;
 }
 
-static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
-	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash,
-	struct dm_mintegrity_block *buffer)
+static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 {
-	struct buffer_aux *aux = dm_bufio_get_aux_data(buffer->buf);
-	if(aux->journal){ // Already in journal
-		dm_bufio_release(buffer->buf);
+	struct mint_journal_block_tag tag;
+	struct mint_block commit;
+	struct mint_journal_header mjh = {
+		cpu_to_le32(MJ_MAGIC), cpu_to_le32(TYPE_MJCB),
+		cpu_to_le32(v->journal_sequence), 0};
+	sector_t sector;
+
+	// Nothing to checkpoint
+	if (v->journal_descriptor_fill == 0) {
 		return;
 	}
-	aux->journal = 1;
-	aux->journal_position = hash->offset;
-	aux->self_buffer = buffer->buf;
-	aux->next_aux = NULL;
 
-	if(v->journal_buffer_head == NULL){
-		v->journal_buffer_head = aux;
-		v->journal_buffer_tail = v->journal_buffer_head;
+	// Get last tag and add last tag option to it
+	memcpy(&tag, journal_descriptor_block.buf +
+		sizeof(struct mint_journal_header) +
+		sizeof(struct mint_journal_block_tag) * v->journal_descriptor_fill,
+		sizeof(struct mint_journal_block_tag));
+	tag.options = cpu_to_le32(le32_to_cpu(tag.options) | 1);
+
+	// Sync descriptor and journal blocks
+	dm_bufio_mark_buffer_dirty(journal_descriptor_block.buf);
+	dm_bufio_write_dirty_buffers(v->bufio);
+
+	// This will never fail to not have a spot
+	sector = v->journal_start + 1 + js->tail;
+	commit.data = dm_bufio_new(v->bufio, sector, &(commit.buf));
+	if (unlikely(IS_ERR(commit.data))) {
+		// TODO: what do we do?
+		return PTR_ERR(commit.data);
+	}
+	js->tail = (js->tail + 1) % (js->blocks - 1);
+	js->fill++;
+
+	// Copy ending header
+	memcpy(commit.data, &mjh, sizeof(struct mint_journal_header));
+	// TODO: hmac
+	dm_bufio_mark_buffer_dirty(commit.buf);
+	dm_bufio_write_dirty_buffers(v->bufio);
+
+	// Full! Let's sync!
+	if (js->fill == js->capacity) {
+
+	}
+	// Ok - now we can get a new commit block
+
+
+}
+
+static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
+	struct sector_t sector,
+	struct mint_block *jdata, struct mint_block *jhash,
+	struct mint_block *data, struct mint_block *hashes)
+{
+	int i;
+	struct mint_journal_block_tag tag = {0, 0, 0};
+	struct mint_journal_superblock *js = &v->journal_superblock;
+
+	// Add data block
+	struct buffer_aux *aux = dm_bufio_get_aux_data(data->buf);
+	if (aux->journal) { // Already in journal
+		dm_bufio_release(data->buf);
 	} else {
-		v->journal_buffer_tail->next_aux = aux;
-		v->journal_buffer_tail = aux;
+		aux->journal = 1;
+		aux->journal_position = hash->offset;
+		aux->self_buffer = data->buf;
+		aux->next_aux = NULL;
+
+		if(v->journal_buffer_head == NULL){
+			v->journal_buffer_head = aux;
+			v->journal_buffer_tail = v->journal_buffer_head;
+		} else {
+			v->journal_buffer_tail->next_aux = aux;
+			v->journal_buffer_tail = aux;
+		}
+	}
+
+	// Add journal blocks
+	for (i = 0; i < v->levels; i++) {
+		aux = dm_bufio_get_aux_data(hashes[i].buf);
+		if (aux->journal) {
+			dm_bufio_release(hashes[i].buf);
+		} else {
+			aux->journal = 1;
+			aux->journal_position = hash->offset;
+			aux->self_buffer = hashes[i].buf;
+			aux->next_aux = NULL;
+
+			if(v->journal_buffer_head == NULL){
+				v->journal_buffer_head = aux;
+				v->journal_buffer_tail = v->journal_buffer_head;
+			} else {
+				v->journal_buffer_tail->next_aux = aux;
+				v->journal_buffer_tail = aux;
+			}
+		}
+	}
+
+	// Add to checkpoint
+	tag.low = cpu_to_le32(sector);
+	tag.high = cpu_to_le32(sector >> 32);
+	// Escape journal data block
+	if (memcmp(journal_descriptor_block.buf, jdata.buf, 4)) {
+		bzero(jdata.buf, 4, 0);
+		tag.options = tag.options | 2;
+	}
+	dm_bufio_mark_buffer_dirty(jdata.buf);
+
+	// Escape journal hash block
+	if (memcmp(journal_descriptor_block.buf, jhash.buf, 4)) {
+		bzero(jhash.buf, 4, 0);
+		tag.options = tag.options | 4;
+	}
+	tag.options = cpu_to_le32(tag.options);
+	dm_bufio_mark_buffer_dirty(jhash.buf);
+
+	memcpy(journal_descriptor_block.buf + sizeof(struct mint_journal_header) +
+		sizeof(struct mint_journal_block_tag) * v->journal_descriptor_fill,
+		&tag, sizeof(struct mint_journal_block_tag));
+	v->journal_descriptor_fill++;
+
+	if (v->journal_descriptor_fill == v->journal_descriptor_capacity) {
+		mintegrity_checkpoint_journal(v);
 	}
 }
 
-static void mintegrity_flush_journal(struct dm_mintegrity *v)
+static void mintegrity_sync_journal(struct dm_mintegrity *v)
 {
 	struct buffer_aux *aux;
-	struct mintegrity_journal_superblock *js = &v->journal_superblock;
+	struct mint_journal_superblock *js = &v->journal_superblock;
+	uint32_t head, tail, fill;
 
 	// Write out journal and journal superblock
+	down_write(&(v->jlock));
 	js->state = 1;
-	memcpy(v->journal_block.data, js, sizeof(struct mintegrity_journal_superblock));
-	dm_bufio_mark_buffer_dirty(v->journal_block.buf);
+	head = js->head;
+	tail = js->tail;
+	fill = js->fill;
+	memcpy(v->journal_super_block.data, js, sizeof(struct mint_journal_superblock));
+
+	// Lock all buffers
+	aux = v->journal_buffer_head;
+	while(aux != NULL){
+		down_write(&(aux->lock));
+		aux = aux->next_aux;
+	}
+
+	up_write(&(v->jlock));
+	dm_bufio_mark_buffer_dirty(v->journal_super_block.buf);
 	dm_bufio_write_dirty_buffers(v->bufio);
 
 	// Mark all buffers passed to journal as dirty
@@ -418,80 +598,154 @@ static void mintegrity_flush_journal(struct dm_mintegrity *v)
 	v->journal_buffer_tail = NULL;
 
 	// Write out journal superblock - clean
-	js->transaction_fill = 0;
+	js->fill = 0;
 	js->state = 0;
-	memcpy(v->journal_block.data, js, sizeof(struct mintegrity_journal_superblock));
-	dm_bufio_mark_buffer_dirty(v->journal_block.buf);
+	memcpy(v->journal_super_block.data, js, sizeof(struct mint_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->journal_super_block.buf);
 	dm_bufio_write_dirty_buffers(v->bufio);
 }
 
 static void mintegrity_rollback_journal_slot(struct dm_mintegrity *v,
-	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
+	struct mint_block *data, struct mint_block *hash)
 {
 	// TODO: fix this for circular buffer
-	struct mintegrity_journal_superblock *js = &v->journal_superblock;
-	js->transaction_fill--;
+	// struct mint_journal_superblock *js = &v->journal_superblock;
+	// FIXME: ????
 }
 
-static int mintegrity_get_journal_slot(struct dm_mintegrity *v,
-	struct dm_mintegrity_block *data, struct dm_mintegrity_block *hash)
+static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
+	struct dm_buffer **buffers, uint8_t **tag)
 {
+	int i, j;
+	u8 *data;
 	sector_t sector;
-	struct mintegrity_journal_superblock *js = &v->journal_superblock;
-	// Check for space
-	if(js->transaction_fill == js->transaction_capacity){
-		mintegrity_flush_journal(v);
+	struct mint_journal_superblock *js = &v->journal_superblock;
+
+	// Lock journal
+	down_write(v->j_lock);
+
+	// Check if we have space in the descriptor block for a tag
+	if (v->j_ds_fill == v->j_ds_max) {
+		// Checkpoint
 	}
-	// Get next journal spot
-	sector = v->journal_start + 1 + (js->transaction_fill *
-		((js->num_blocks - 1) / js->transaction_capacity));
 
-	// Get the journal data block
-	data->data = dm_bufio_new(v->bufio, sector, &(data->buf));
-	if (unlikely(IS_ERR(data->data)))
-		return PTR_ERR(data->data);
-	data->offset = js->transaction_fill;
-
-	// Get the journal hash block
-	hash->data = dm_bufio_new(v->bufio, sector + 1, &(hash->buf));
-	if (unlikely(IS_ERR(hash->data))){
-		dm_bufio_release(data->buf);
-		return PTR_ERR(hash->data);
+	// Check for space - need 3, hash, data, and end checkpoint block
+	if (js->fill + 1 + v->j_bpt > js->capacity) {
+		// Make space in journal
 	}
-	hash->offset = js->transaction_fill;
 
+	// Get blocks for this transaction
+	for (i = 0; i < v->j_bpt; i++) {
+		sector = v->journal_start + 1 + ((js->tail + i) % (js->blocks - 1));
+		data = dm_bufio_new(v->bufio, sector, buffers + i);
+		if (unlikely(IS_ERR(data))) {
+			for (j = 0; j < i; j++) {
+				dm_bufio_release(buffers[j]);
+			}
+			up_write(v->j_lock);
+			return PTR_ERR(data);
+		}
+	}
+
+	// Increment tail position
+	js->tail = (js->tail + v->j_bpt) % (js->blocks - 1);
 	// Increment fill
-	js->transaction_fill++;
+	js->fill += v->j_bpt;
+
+	*tag = dm_bufio_get_block_data(v->j_ds_buffer) + v->j_ds_fill *
+		sizeof(struct mint_journal_block_tag);
+	v->j_ds_fill++;
+
+	// Unlock journal
+	up_write(v->j_lock);
+
 	return 0;
 }
 
-
 static int mintegrity_recover_journal(struct dm_mintegrity *v)
 {
-	struct dm_mintegrity_block j_data_block;
-	struct dm_mintegrity_block j_hash_block;
-	struct dm_mintegrity_block block;
+	u8 *data;
+
+	// Journal setup
+	data = dm_bufio_read(v->bufio, v->journal_start, &v->j_sb_buffer);
+	if (IS_ERR(data)) {
+		return -EINVAL;
+	}
+
+	// Read journal superblock and convert to local endianness
+	memcpy(&v->j_sb_header, dm_bufio_get_block_data(v->j_sb_buffer),
+		sizeof(struct mint_journal_superblock));
+	v->j_sb_header.block_size = le32_to_cpu(v->j_sb_header.block_size);
+	v->j_sb_header.blocks = le32_to_cpu(v->j_sb_header.blocks);
+	v->j_sb_header.head = le32_to_cpu(v->j_sb_header.head);
+	v->j_sb_header.tail = le32_to_cpu(v->j_sb_header.tail);
+	v->j_sb_header.fill = le32_to_cpu(v->j_sb_header.fill);
+
+	// data = dm_bufio_new(v->bufio, v->journal_start + 1, &v->j_ds_buffer);
+	// if (IS_ERR(data)) {
+	// 	return -EINVAL;
+	// }
+
+	// // Set up first journal descriptor block
+	// struct mint_journal_header mjh = {
+	// 	cpu_to_le32(MJ_MAGIC), cpu_to_le32(TYPE_MJDB), 0, 0};
+	// memcpy(v->journal_descriptor_block.data, &mjh, sizeof(struct mint_journal_header));
+	// v->journal_descriptor_fill = 0;
+	// v->journal_descriptor_capacity = (v->journal_superblock.block_size - 
+	// 	sizeof(struct mint_journal_header)) / sizeof(struct mint_journal_block_tag);
+
+	// Max number of block tags in one journal descriptor block
+	v->j_ds_max = (v->dev_block_bytes - sizeof(struct mint_journal_header)) /
+		sizeof(struct mint_journal_block_tag);
+	// Number of blocks necessary per transaction - packed digests + data blocks
+	v->j_bpt = DIV_ROUND_UP(v->levels, (v->dev_block_bytes / v->digest_size)) + 1;
+
+	// Need at least one transaction + superblock + descriptor + commit
+	if (v->journal_blocks < v->j_bpt + 3) {
+		return -EINVAL;
+	}
+
+	return 0;
+	/**
+	struct mint_block j_data_block;
+	struct mint_block j_hash_block;
+	struct mint_block block;
 	sector_t data_sector, hash_sector;
 	unsigned offset;
 	u8 *result;
 	int i;
 	int j;
 	int r;
-	struct mintegrity_journal_superblock *mjsb = &v->journal_superblock;
-	struct dm_mintegrity_io *io = (struct dm_mintegrity_io*)kzalloc(v->ti->per_bio_data_size, GFP_KERNEL);
+	struct mint_journal_superblock *mjsb = &v->journal_superblock;
+	// Check magic number
+	const char mjsb_magic[16] = {0x6c, 0x69, 0x6c, 0x79, 0x6d, 0x75, 0x66,
+		0x66, 0x69, 0x6e, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	if (memcmp(mjsb->magic, mjsb_magic, 16)) {
+		DMERR("Journal superblock magic number does not match");
+		return -EIO;
+	}
+
+	// Clean!
+	if (mjsb->state == 0)
+		return 0;
+
+	struct dm_mintegrity_io *io = (struct dm_mintegrity_io*)
+		kzalloc(v->ti->per_bio_data_size, GFP_KERNEL);
+
 	if (!io)
 		return -ENOMEM;
 
-	for (i = 0; i < mjsb->transaction_fill; i++) {
+	for (i = 0; i < mjsb->fill; i++) {
+		int b = (mjsb->head + i) % mjsb->capacity;
 		j_data_block.data = NULL;
 		j_hash_block.data = NULL;
 		block.data = NULL;
 
 		// Read hash block
-		j_hash_block.data = dm_bufio_read(v->bufio, v->journal_start + (i + 1) * 2,
+		j_hash_block.data = dm_bufio_read(v->bufio, v->journal_start + (b + 1) * 2,
 			&j_hash_block.buf);
 		if (IS_ERR(j_hash_block.data)) {
-			DMERR("Failed to read journal hash block: %d", i);
+			DMERR("Failed to read journal hash block: %d", b);
 			goto bad;
 		}
 		// Set up root
@@ -501,7 +755,7 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 		// Compute hmac
 		r = mintegrity_hmac_hash(io);
 		if (r < 0) {
-			DMERR("Failed to calculate hmac for journal block: %d", i);
+			DMERR("Failed to calculate hmac for journal block: %d", b);
 			goto bad;
 		}
 
@@ -509,7 +763,7 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 		result = io_hmac_digest(v, io);
 		if(memcmp(j_hash_block.data + v->levels * v->digest_size + sizeof(sector_t)
 			+ v->digest_size, result, v->hmac_digest_size)) {
-			DMERR("Journal hmac does not verify for block: %d", i);
+			DMERR("Journal hmac does not verify for block: %d", b);
 			goto bad;
 		}
 
@@ -545,10 +799,10 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 		j_hash_block.data = NULL;
 
 		// Read data block
-		j_data_block.data = dm_bufio_read(v->bufio, v->journal_start + 1 + i * 2,
+		j_data_block.data = dm_bufio_read(v->bufio, v->journal_start + 1 + b * 2,
 			&j_data_block.buf);
 		if (IS_ERR(j_data_block.data)) {
-			DMERR("Failed to read journal data block: %d", i);
+			DMERR("Failed to read journal data block: %d", b);
 			goto bad;
 		}
 
@@ -570,11 +824,13 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	dm_bufio_write_dirty_buffers(v->bufio);
 
 	// Write out journal superblock - clean
-	mjsb->transaction_fill = 0;
 	mjsb->state = 0;
-	memcpy(v->journal_block.data, mjsb,
-		sizeof(struct mintegrity_journal_superblock));
-	dm_bufio_mark_buffer_dirty(v->journal_block.buf);
+	mjsb->fill = 0;
+	mjsb->head = 0;
+	mjsb->tail = 0;
+	memcpy(v->journal_superblock.data, mjsb,
+		sizeof(struct mint_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->journal_superblock.buf);
 	dm_bufio_write_dirty_buffers(v->bufio);
 
 	kfree(io);
@@ -592,6 +848,7 @@ bad:
 
 	kfree(io);
 	return -EIO;
+	*/
 }
 
 /*
@@ -609,7 +866,7 @@ bad:
  * pointer and the dm-bufio buffer is NOT RELEASED
  */
 static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
-	int level, bool skip_unverified, struct dm_mintegrity_block *dmb)
+	int level, bool skip_unverified, struct dm_buffer **dmb)
 {
 	struct dm_mintegrity *v = io->v;
 	struct dm_buffer *buf;
@@ -657,9 +914,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 
 	// Return back the whole block we read and verified
 	if (dmb != NULL) {
-		dmb->buf = buf;
-		dmb->data = data;
-		dmb->offset = offset;
+		*dmb = buf;
 	} else {
 		dm_bufio_release(buf);
 	}
@@ -687,7 +942,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 		int r;
 		unsigned todo;
 		sector_t data_sector;
-		struct dm_mintegrity_block d_data_block;
+		struct mint_block d_data_block;
 
 		data_sector = io->block + b;
 
@@ -777,6 +1032,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 {
 	unsigned b;
 	int i;
+	int locked;
 	unsigned vector = 0;
 	unsigned offset = 0;
 	struct dm_mintegrity *v = io->v;
@@ -784,61 +1040,39 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 	for(b = 0; b < io->n_blocks; b++){
 		struct shash_desc *desc;
 		int r;
-		u8 * result;
+		u8 *result;
 		unsigned todo;
+		uint8_t *tag;
 
-		sector_t data_sector;
+		struct dm_buffer **dm_buffers = io_dm_buffers(v, io);
+		struct dm_buffer **dm_j_buffers = io_dm_j_buffers(v, io);
+		sector_t sector = io->block + b;
 
-		// TODO: release these back on error and ignore them in journal?
-		struct dm_mintegrity_block j_data_block;
-		struct dm_mintegrity_block j_hash_block;
-
-		struct dm_mintegrity_block d_data_block;
-
-		// Get a hash levels and data block
-		if((r = mintegrity_get_journal_slot(v, &j_hash_block, &j_data_block)) != 0){
-			DMERR("get journal slot failed: %d", r);
+		// Get journal blocks
+		if((r = mintegrity_get_journal_buffers(v, dm_j_buffers, &tag) != 0){
+			DMERR("get journal buffers failed: %d", r);
 			// Safe to return because nothing needs to be cleaned up here
 			return -EIO;
 		}
-
-		data_sector = io->block + b;
 
 		// The io digest we want is the root
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
 
 		// Set all to NULL for possible cleanup
 		for (i = 0; i < v->levels; i++) {
-			io->hb_vec[i].buf = NULL;
+			dm_buffers[i] = NULL;
 		}
 
 		// Read levels, TOP DOWN and compare to io want, which is set after
 		// every successive read
 		for (i = v->levels - 1; i >= 0; i--) {
-			int r = mintegrity_verify_level(io, data_sector, i, false,
-				&io->hb_vec[i]);
+			int r = mintegrity_verify_level(io, sector, i, false, &dm_buffers[i]);
 			if (unlikely(r)){
 				goto bad;
 			}
 		}
 
-		// Compute hash
-		desc = io_hash_desc(v, io);  // io hash description field for io request
-		desc->tfm = v->tfm;  // hash function
-		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
-		// Init hash
-		r = crypto_shash_init(desc);
-		if (r < 0) {
-			DMERR("crypto_shash_init failed: %d", r);
-			goto bad;
-		}
-		// Update with salt
-		r = crypto_shash_update(desc, v->salt, v->salt_size);
-		if (r < 0) {
-			DMERR("crypto_shash_update failed: %d", r);
-			goto bad;
-		}
-
+		// Copy from bio vector to journal data dm_buffer
 		todo = v->dev_block_bytes;
 		do {
 			struct bio_vec *bv;
@@ -852,14 +1086,9 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			if (likely(len >= todo)){
 				len = todo;
 			}
-			r = crypto_shash_update(desc, page + bv->bv_offset + offset, len);
-			memcpy(&(j_data_block.data[v->dev_block_bytes - todo]),
+			memcpy(dm_bufio_get_block_data(dm_j_buffers[0]) + b->dev_block_bytes - todo,
 				page + bv->bv_offset + offset, len);
 			kunmap_atomic(page);
-			if (r < 0) {
-				DMERR("crypto_shash_update failed: %d", r);
-				goto bad;
-			}
 			offset += len;
 			if (likely(offset == bv->bv_len)) {
 				offset = 0;
@@ -868,12 +1097,13 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			todo -= len;
 		} while (todo);
 
-		result = io_real_digest(v, io);
-		r = crypto_shash_final(desc, result);
-		if (r < 0) {
-			DMERR("crypto_shash_final failed: %d", r);
+		// Compute new data hash
+		r = mintegrity_buffer_hash(io, meow, v->dev_block_bytes);
+		if (r != 0) {
 			goto bad;
 		}
+
+		result = io_real_digest(v, io);
 
 		// Copy data hash into first level
 		memcpy(io->hb_vec[0].data + io->hb_vec[0].offset, result,
@@ -933,13 +1163,8 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			goto bad;
 		}
 		memcpy(d_data_block.data, j_data_block.data, v->dev_block_bytes);
-		mintegrity_add_buffer_to_journal(v, &j_data_block, &j_hash_block,
-			&d_data_block);
-
-		for (i = v->levels - 1; i >= 0; i--) {
-			mintegrity_add_buffer_to_journal(v, &j_data_block, &j_hash_block,
-				&io->hb_vec[i]);
-		}
+		mintegrity_add_buffers_to_journal(v, data_sector, &j_data_block,
+			&j_hash_block, &d_data_block, io->hb_vec);
 
 		// Write to journal
 		dm_bufio_mark_buffer_dirty(j_data_block.buf);
@@ -955,6 +1180,10 @@ bad:
 		dm_bufio_release(j_hash_block.buf);
 		for(i = 0; i < v->levels; i++){
 			if(io->hb_vec[i].buf != NULL){
+				if (locked) {
+					struct buffer_aux *aux = dm_bufio_get_aux_data(&io->hb_vec[i].buf);
+					up_read(&(aux->lock);
+				}
 				dm_bufio_release(io->hb_vec[i].buf);
 			}
 		}
@@ -1114,9 +1343,6 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 		switch(bio_data_dir(bio)) {
 		case WRITE:
-			// Buffer pointers for all levels
-			io->hb_vec = mempool_alloc(v->hb_mempool, GFP_NOIO);
-			/* Queue up write */
 			INIT_WORK(&(io->work), mintegrity_write_work);
 			queue_work(io->v->write_wq, &io->work);
 			break;
@@ -1231,9 +1457,8 @@ static void mintegrity_dtr(struct dm_target *ti)
 {
 	struct dm_mintegrity *v = ti->private;
 
-	// Sync everything
-	if (v->created)
-		mintegrity_sync(v);
+	if (v->journal_wq)
+		destroy_workqueue(v->journal_wq);
 
 	if (v->write_wq)
 		destroy_workqueue(v->write_wq);
@@ -1241,20 +1466,13 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->read_wq)
 		destroy_workqueue(v->read_wq);
 
-	if (v->hb_mempool)
-		mempool_destroy(v->hb_mempool);
-
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
-
-	if (v->journal_block.data)
-		dm_bufio_release(v->journal_block.buf);
 
 	if (v->bufio)
 		dm_bufio_client_destroy(v->bufio);
 
-	kfree(v->inner_pad);
-	kfree(v->outer_pad);
+	kfree(v->secret);
 	kfree(v->salt);
 	kfree(v->root_digest);
 
@@ -1284,10 +1502,8 @@ static void mintegrity_dtr(struct dm_target *ti)
  *  <root digest>
  *  <salt>
  *  <hmac hash type>
- *  <hmac inner pad>
- *  <hmac outer pad>
+ *  <hmac secret>
  *
- * TODO: change salt support to this
  *	<salt>		Hex string or "-" if no salt.
  */
 static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
@@ -1300,6 +1516,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	sector_t hash_position;
 	sector_t reserved;
 	sector_t b;
+	u8 *data;
 	char dummy;
 
 	// Allocate struct dm_mintegrity for this device mapper instance
@@ -1320,8 +1537,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	// Check argument count
-	if (argc != 11) {
-		ti->error = "Invalid argument count: exactly 11 arguments required";
+	if (argc != 10) {
+		ti->error = "Invalid argument count: exactly 10 arguments required";
 		r = -EINVAL;
 		goto bad;
 	}
@@ -1458,31 +1675,19 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 	v->hmac_digest_size = crypto_shash_digestsize(v->hmac_tfm);
-	v->hmac_shash_descsize = sizeof(struct shash_desc) + crypto_shash_descsize(v->hmac_tfm);
+	v->hmac_shash_descsize = sizeof(struct shash_desc) + 
+		crypto_shash_descsize(v->hmac_tfm);
 
-	// argv[9] <hmac inner_pad>
-	v->inner_pad = kmalloc(v->digest_size, GFP_KERNEL);
-	if (!v->inner_pad) {
+	// argv[9] <hmac secret>
+	v->secret_size = strlen(argv[9]) / 2;
+	v->secret = kmalloc(v->secret_size, GFP_KERNEL);
+	if (!v->secret) {
 		ti->error = "Cannot allocate secret";
 		r = -ENOMEM;
 		goto bad;
 	}
-	if (strlen(argv[9]) != v->digest_size * 2 ||
-	    hex2bin(v->inner_pad, argv[9], v->digest_size)) {
-		ti->error = "Invalid secret";
-		r = -EINVAL;
-		goto bad;
-	}
-
-	// argv[10] <hmac outer_pad>
-	v->outer_pad = kmalloc(v->digest_size, GFP_KERNEL);
-	if (!v->outer_pad) {
-		ti->error = "Cannot allocate secret";
-		r = -ENOMEM;
-		goto bad;
-	}
-	if (strlen(argv[10]) != v->digest_size * 2 ||
-	    hex2bin(v->outer_pad, argv[10], v->digest_size)) {
+	if (strlen(argv[9]) != v->secret_size * 2 ||
+	    hex2bin(v->secret, argv[9], v->secret_size)) {
 		ti->error = "Invalid secret";
 		r = -EINVAL;
 		goto bad;
@@ -1524,21 +1729,21 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	// Min of number of hash blocks in level and numbe of transactions
 	for (i = 0; i < v->levels; i++) {
 		b = (b == 0 ? b : (1 + ((b - 1) / (v->dev_block_bytes / v->digest_size))));
-		reserved += min(b, (v->journal_blocks - 1) / 2);
+		reserved += min(b, (v->journal_superblocks - 1) / 2);
 	}
 	// One data block per transaction
-	reserved += (v->journal_blocks - 1) / 2;
+	reserved += (v->journal_superblocks - 1) / 2;
 	// Journal blocks
-	reserved += v->journal_blocks;
+	reserved += v->journal_superblocks;
 	// One for each read operation
 	reserved += num_online_cpus();
 	// One for journal superblock
 	reserved += 1;
 
 	// Open device mapper buffered IO client
-	v->bufio = dm_bufio_client_create(v->dev->bdev,
-		1 << v->dev_block_bits, reserved, sizeof(struct buffer_aux),
-		dm_bufio_alloc_callback, dm_bufio_write_callback);
+	v->bufio = dm_bufio_client_create(v->dev->bdev, 1 << v->dev_block_bits,
+		reserved, sizeof(struct buffer_aux), dm_bufio_alloc_callback,
+		dm_bufio_write_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
 		r = PTR_ERR(v->bufio);
@@ -1546,16 +1751,12 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	if (dm_bufio_get_device_size(v->bufio) < (v->hash_blocks + v->journal_blocks
+	if (dm_bufio_get_device_size(v->bufio) < (v->hash_blocks + v->journal_superblocks
 		+ v->data_blocks)) {
 		ti->error = "Device is too small";
 		r = -E2BIG;
 		goto bad;
 	}
-
-	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
-		v->shash_descsize + v->digest_size * 2 + v->hmac_shash_descsize +
-		v->hmac_digest_size, __alignof__(struct dm_mintegrity_io));
 
 	v->vec_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
 					BIO_MAX_PAGES * sizeof(struct bio_vec));
@@ -1565,16 +1766,9 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	v->hb_mempool = mempool_create_kmalloc_pool(DM_MINTEGRITY_MEMPOOL_SIZE,
-					v->levels * sizeof(struct dm_mintegrity_block));
-	if (!v->hb_mempool){
-		ti->error = "Cannot allocate hash block mempool";
-		r = -ENOMEM;
-		goto bad;
-	}
-
 	/* Initialize lock for IO operations */
 	init_rwsem(&(v->lock));
+	init_rwsem(&(v->j_lock));
 
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
@@ -1596,29 +1790,26 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 
-	// Journal setup
-	v->journal_buffer_head = NULL;
-	v->journal_buffer_tail = NULL;
-	v->journal_block.data = dm_bufio_read(v->bufio, v->journal_start,
-		&v->journal_block.buf);
-	if (IS_ERR(v->journal_block.data)) {
-		ti->error = "Failed to read journal superblock";
-		r = -EINVAL;
+	// Journal queue
+	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
+	v->journal_wq = alloc_workqueue("kmintegrityd_journal",
+		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+	if (!v->journal_wq) {
+		ti->error = "Cannot allocate write workqueue";
+		r = -ENOMEM;
 		goto bad;
 	}
 
-	// TODO: endianness
-	memcpy(&v->journal_superblock, v->journal_block.data,
-		sizeof(struct mintegrity_journal_superblock));
-
-	if(v->journal_superblock.state != 0){
-		r = mintegrity_recover_journal(v);
-		if (r < 0) {
-			ti->error = "Could not recover journal";
-			r = -EIO;
-			goto bad;
-		}
+	r = mintegrity_recover_journal(v);
+	if (r < 0) {
+		ti->error = "Could not recover journal";
+		r = -EIO;
+		goto bad;
 	}
+
+	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
+		v->shash_descsize + v->digest_size * 2 + (v->levels + 1 + v->j_bpt) *
+		sizeof(struct dm_buffer*), __alignof__(struct dm_mintegrity_io));
 
 	v->created = 1;
 	return 0;
