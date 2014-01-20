@@ -68,6 +68,7 @@ struct mint_journal_superblock {
 	uint32_t head;        /* Circular buffer head position */
 	uint32_t tail;        /* Circular buffer tail position */
 	uint32_t fill;        /* Number of used blocks */
+	uint32_t sequence;    /* Current sequence number */
 	char state;           /* Clean, Dirty */
 };
 
@@ -83,9 +84,12 @@ struct mint_journal_superblock {
  * and write 1 to hash_verified simultaneously.
  * This condition is harmless, so we don't need locking.
  */
+// TODO: this needs cleanup
 struct buffer_aux {
 	uint8_t hash_verified;          /* Buffer has been verified */
 	uint8_t journal;                /* Buffer is already in journal list */
+	uint32_t sequence;              /* Journal sequence number */
+	uint32_t buffer_count;
 	struct dm_buffer *self_buffer;  /* Pointer to own dm_buffer */
 	struct buffer_aux *next_aux;    /* Next aux buffer for journal */
 	struct rw_semaphore lock;       /* RW semaphore lock for async write back */
@@ -107,9 +111,13 @@ struct dm_mintegrity {
 	uint8_t *root_digest;  /* Hash digest of the root block */
 	uint8_t *salt;		   /* salt: its size is salt_size */
 	uint8_t *secret;       /* HMAC secret: its size is secret_size */
+	uint8_t *outer_pad;    /* Pre-computed outer pad */
+	uint8_t *inner_pad;    /* Pre-computed inner pad */
+	uint8_t *hmac_digest;  /* HMAC digest */
 
-	struct crypto_shash *tfm;  /* Hash algorithm */
+	struct crypto_shash *tfm;       /* Hash algorithm */
 	struct crypto_shash *hmac_tfm;  /* HMAC hash algorithm */
+	struct shash_desc hmac_desc;    /* HMAC shash object */
 
 	uint32_t digest_size;          /* hash digest size */
 	uint32_t hmac_digest_size;	   /* HMAC hash digest size */
@@ -157,7 +165,6 @@ struct dm_mintegrity {
 	struct dm_buffer *j_ds_buffer;  /* Journal descriptor buffer */
 
 	uint32_t j_ds_fill;  /* Number of tags in current descriptor buffer */
-	uint32_t j_ds_ready; /* Number of tags ready in current descriptor buffer */
 	uint32_t j_ds_max;   /* Max number of tags in descriptor buffer */
 	uint32_t j_bpt;      /* Number of blocks required per transaction */
 
@@ -253,7 +260,8 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 
 	aux->hash_verified = 0;
 	aux->journal = 0;
-	aux->journal_position = 0;
+	aux->sequence = 0;
+	aux->buffer_count = 0;
 	init_rwsem(&(aux->lock));
 }
 
@@ -263,7 +271,13 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
  static void dm_bufio_write_callback(struct dm_buffer *buf)
  {
 	struct buffer_aux *aux = dm_bufio_get_aux_data(buf);
-	up_write(&(aux->lock));
+	// TODO: move this to actual write finish callback
+	// This was held by the journal - its been written back
+	// so we can release it for modification
+	if (aux->journal) {
+		// Which transaction block are we part of?
+		up_write(&(aux->lock));
+	}
  }
 
 /*
@@ -352,75 +366,59 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
 }
 
 /*
- * Calculate hmac of root buffer. Clobbers io_want_digest
+ * Calculate hmac of root buffer. Clobbers v->hmac_desc and v->hmac_digest
+ * Doesn't use locks, also assumes v->root_digest is locked.
+ * Result hmac in v->hmac_digest
+ * Based on RFC 2104
  *
- * hash((outer_pad ^ root_digest) || hash((inner_pad ^ root_digest) || message))
- * || - concatenation
  */
-static int mintegrity_hmac_hash(struct dm_mintegrity_io *io)
+static int mintegrity_hmac_hash(struct dm_mintegrity *v)
 {
-	struct dm_mintegrity *v = io->v;
-	struct shash_desc *desc;
 	int r;
-	int i;
-	u8 *temp = io_want_digest(v, io);
-	u8 *result = io_hmac_digest(v, io);
-	desc = io_hmac_desc(v, io);
-	desc->tfm = v->hmac_tfm;
-	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
-	for (i = 0; i < v->digest_size; i++) {
-		temp[i] = v->inner_pad[i] ^ v->root_digest[i];
-	}
-
-	r = crypto_shash_init(desc);
+	r = crypto_shash_init(&v->hmac_desc);
 	if(r < 0){
 		DMERR("crypto_shash_init failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(desc, temp, v->digest_size);
+	r = crypto_shash_update(&v->hmac_desc, v->inner_pad, v->hmac_digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(desc, v->root_digest, v->digest_size);
+	r = crypto_shash_update(&v->hmac_desc, v->root_digest, v->digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_final(desc, result);
+	r = crypto_shash_final(&v->hmac_desc, v->hmac_digest);
 	if (r < 0) {
 		DMERR("crypto_shash_final failed: %d", r);
 		return r;
 	}
 
-	// XOR outer_pad with root_digest
-	for (i = 0; i < v->digest_size; i++) {
-		temp[i] = v->outer_pad[i] ^ v->root_digest[i];
-	}
-
-	r = crypto_shash_init(desc);
+	r = crypto_shash_init(&v->hmac_desc);
 	if(r < 0){
 		DMERR("crypto_shash_init failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(desc, temp, v->digest_size);
+	r = crypto_shash_update(&v->hmac_desc, v->outer_pad, v->hmac_digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(desc, result, v->hmac_digest_size);
+	r = crypto_shash_update(&v->hmac_desc, v->hmac_digest, v->hmac_digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_final(desc, result);
+	r = crypto_shash_final(&v->hmac_desc, v->hmac_digest);
 	if (r < 0) {
 		DMERR("crypto_shash_final failed: %d", r);
 		return r;
@@ -431,52 +429,78 @@ static int mintegrity_hmac_hash(struct dm_mintegrity_io *io)
 
 static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 {
-	struct mint_journal_block_tag tag;
-	struct mint_block commit;
-	struct mint_journal_header mjh = {
-		cpu_to_le32(MJ_MAGIC), cpu_to_le32(TYPE_MJCB),
-		cpu_to_le32(v->journal_sequence), 0};
-	sector_t sector;
-
 	// Nothing to checkpoint
-	if (v->journal_descriptor_fill == 0) {
-		return;
+	if (!v->j_ds_fill) {
+		return 0;
 	}
 
-	// Get last tag and add last tag option to it
-	memcpy(&tag, journal_descriptor_block.buf +
-		sizeof(struct mint_journal_header) +
-		sizeof(struct mint_journal_block_tag) * v->journal_descriptor_fill,
-		sizeof(struct mint_journal_block_tag));
-	tag.options = cpu_to_le32(le32_to_cpu(tag.options) | 1);
+	struct dm_buffer *j_ch_buffer;
+	struct mint_journal_header mjh_checkpoint = {cpu_to_le32(MJ_MAGIC),
+		cpu_to_le32(TYPE_MJCB), cpu_to_le32(v->j_sb_header.sequence), 0};
+	struct mint_journal_header mjh_descriptor = {cpu_to_le32(MJ_MAGIC),
+		cpu_to_le32(TYPE_MJDB), cpu_to_le32(v->j_sb_header.sequence + 1), 0};
 
-	// Sync descriptor and journal blocks
-	dm_bufio_mark_buffer_dirty(journal_descriptor_block.buf);
-	dm_bufio_write_dirty_buffers(v->bufio);
+	// Increment sequence counter
+	v->j_sb_header.sequence++;
 
-	// This will never fail to not have a spot
-	sector = v->journal_start + 1 + js->tail;
-	commit.data = dm_bufio_new(v->bufio, sector, &(commit.buf));
-	if (unlikely(IS_ERR(commit.data))) {
-		// TODO: what do we do?
-		return PTR_ERR(commit.data);
+	// sync descriptor block
+	dm_bufio_mark_buffer_dirty(v->j_ds_buffer);
+	dm_bufio_release(v->j_ds_buffer);
+	dm_bufio_write_dirty_buffers_async(v->bufio);
+	// sync journal buffers
+	// already marked dirty
+
+	// Calculate hmac
+	mintegrity_hmac_hash(v);
+
+	// This means we're screwed and don't have room for a checkpoint block
+	BUG_ON(js->fill == js->blocks - 1);
+
+	// Get checkpoint block - always available
+	sector_t sector = v->journal_start + 1 + ((js->tail + 1) % (js->blocks - 1));
+	u8 *data = dm_bufio_new(v->bufio, sector, &j_ch_buffer);
+	if (unlikely(IS_ERR(data))) {
+		return PTR_ERR(data);
 	}
+
+	// Increment tail position
 	js->tail = (js->tail + 1) % (js->blocks - 1);
+	// Increment fill
 	js->fill++;
 
-	// Copy ending header
-	memcpy(commit.data, &mjh, sizeof(struct mint_journal_header));
-	// TODO: hmac
-	dm_bufio_mark_buffer_dirty(commit.buf);
+	// Copy over checkpoint header and following hmac
+	mempcy(data, &mjh_checkpoint, sizeof(struct mint_journal_header));
+	memcpy(data + sizeof(struct mint_journal_header), v->hmac_digest,
+		v->hmac_digest_size);
+	// Make sure descriptor block and journal buffers synced
+	dm_bufio_write_dirty_buffers(v->bufio);
+	dm_bufio_mark_buffer_dirty(j_ch_buffer);
+	dm_bufio_release(j_ch_buffer);
+	// sync checkpoint block
 	dm_bufio_write_dirty_buffers(v->bufio);
 
-	// Full! Let's sync!
-	if (js->fill == js->capacity) {
 
+	// Safe to call, because we say we don't have any un-checkpointed things
+	v->j_ds_fill = 0;
+	if (js->fill == js->blocks - 1) {
+		// TODO: fix this
+		mintegrity_sync_journal(v);
 	}
-	// Ok - now we can get a new commit block
 
+	// Get new desciptor block
+	sector = v->journal_start + 1 + ((js->tail + 1) % (js->blocks - 1));
+	data = dm_bufio_new(v->bufio, sector, &v->j_ds_buffer);
+	if (unlikely(IS_ERR(data))) {
+		return PTR_ERR(data);
+	}
 
+	// Increment tail position
+	js->tail = (js->tail + 1) % (js->blocks - 1);
+	// Increment fill
+	js->fill++;
+
+	// Copy descriptor header
+	memcpy(data, &mjh_descriptor, sizeof(struct mint_journal_header));
 }
 
 static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
@@ -488,7 +512,7 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 		cpu_to_le32(sector >> 32), 0};
 	struct mint_journal_superblock *js = &v->journal_superblock;
 
-	if (data_buffers) {
+	if (likely(data_buffers)) {
 		// Lock because we'll be modify buffers
 		down_write(v->j_lock);
 
@@ -499,6 +523,7 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 				dm_bufio_release(data_buffers[i]);
 			} else {
 				aux->journal = 1;
+				aux->sequence = v->j_sb_header.sequence;
 				aux->self_buffer = data_buffers[i];
 				aux->next_aux = NULL;
 
@@ -512,7 +537,7 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 			}
 		}
 
-		// Unlock - these modifications are local to this transaction only
+		// Unlock
 		up_write(v->j_lock);
 	}
 
@@ -528,68 +553,81 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 		}
 		dm_bufio_mark_buffer_dirty(journal_buffers[i]);
 	}
-	if (error) {
+
+	// Tell journal to ignore
+	if (unlikely(error)) {
 		tag.options = tag.options | 1;
 	}
 	memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
-
-	// Lock
-	down_write(v->j_lock);
-
-	// Increment number of ready descriptors
-	v->j_ds_ready++;
-
-	// Unlock
-	up_write(v->j_lock);
 }
 
 static void mintegrity_sync_journal(struct dm_mintegrity *v)
 {
-	struct buffer_aux *aux;
-	struct mint_journal_superblock *js = &v->journal_superblock;
-	uint32_t head, tail, fill;
+	// Checkpoint anything so far
+	// TODO: fix cross-dependency
+	mintegrity_checkpoint_journal(v);
 
-	// Write out journal and journal superblock
-	down_write(&(v->jlock));
-	js->state = 1;
-	head = js->head;
-	tail = js->tail;
-	fill = js->fill;
-	memcpy(v->journal_super_block.data, js, sizeof(struct mint_journal_superblock));
-
-	// Lock all buffers
-	aux = v->journal_buffer_head;
-	while(aux != NULL){
-		down_write(&(aux->lock));
-		aux = aux->next_aux;
+	// Mark dirty and release all data that was checkpointed
+	while (v->j_aux_buffer_head 
+		&& v->j_aux_buffer_head.sequence < v->j_sb_header.sequence) {
+		// Temp pointer
+		struct buffer_aux *b = v->j_aux_buffer_head;
+		// Increment head
+		v->j_aux_buffer_head = v->j_aux_buffer_head.next_aux;
+		// Lock down buffer until it's written back
+		down_write(b->lock);
+		dm_bufio_mark_buffer_dirty(b->self_buffer);
+		dm_bufio_release(b->self_buffer);
 	}
 
-	up_write(&(v->jlock));
-	dm_bufio_mark_buffer_dirty(v->journal_super_block.buf);
-	dm_bufio_write_dirty_buffers(v->bufio);
+	// Now write everything back
+	dm_bufio_write_dirty_buffers_async(v->bufio);
 
-	// Mark all buffers passed to journal as dirty
-	aux = v->journal_buffer_head;
-	while(aux != NULL){
-		struct buffer_aux *next = aux->next_aux;
-		aux->journal = 0;
-		aux->journal_position = 0;
-		dm_bufio_mark_buffer_dirty(aux->self_buffer);
-		dm_bufio_release(aux->self_buffer);
-		aux = next;
-	}
+	// struct buffer_aux *aux;
+	// struct mint_journal_superblock *js = &v->journal_superblock;
+	// uint32_t head, tail, fill;
 
-	// Flush buffers
-	dm_bufio_write_dirty_buffers(v->bufio);
-	v->journal_buffer_head = NULL;
-	v->journal_buffer_tail = NULL;
+	// // Write out journal and journal superblock
+	// down_write(&(v->jlock));
+	// js->state = 1;
+	// head = js->head;
+	// tail = js->tail;
+	// fill = js->fill;
+	// memcpy(v->journal_super_block.data, js, sizeof(struct mint_journal_superblock));
 
-	// Write out journal superblock - clean
-	js->fill = 0;
-	js->state = 0;
-	memcpy(v->journal_super_block.data, js, sizeof(struct mint_journal_superblock));
-	dm_bufio_mark_buffer_dirty(v->journal_super_block.buf);
-	dm_bufio_write_dirty_buffers(v->bufio);
+	// // Lock all buffers
+	// aux = v->journal_buffer_head;
+	// while(aux != NULL){
+	// 	down_write(&(aux->lock));
+	// 	aux = aux->next_aux;
+	// }
+
+	// up_write(&(v->jlock));
+	// dm_bufio_mark_buffer_dirty(v->journal_super_block.buf);
+	// dm_bufio_write_dirty_buffers(v->bufio);
+
+	// // Mark all buffers passed to journal as dirty
+	// aux = v->journal_buffer_head;
+	// while(aux != NULL){
+	// 	struct buffer_aux *next = aux->next_aux;
+	// 	aux->journal = 0;
+	// 	aux->journal_position = 0;
+	// 	dm_bufio_mark_buffer_dirty(aux->self_buffer);
+	// 	dm_bufio_release(aux->self_buffer);
+	// 	aux = next;
+	// }
+
+	// // Flush buffers
+	// dm_bufio_write_dirty_buffers(v->bufio);
+	// v->journal_buffer_head = NULL;
+	// v->journal_buffer_tail = NULL;
+
+	// // Write out journal superblock - clean
+	// js->fill = 0;
+	// js->state = 0;
+	// memcpy(v->journal_super_block.data, js, sizeof(struct mint_journal_superblock));
+	// dm_bufio_mark_buffer_dirty(v->journal_super_block.buf);
+	// dm_bufio_write_dirty_buffers(v->bufio);
 }
 
 static void mintegrity_rollback_journal_slot(struct dm_mintegrity *v,
@@ -613,6 +651,7 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 
 	// Check if we have space in the descriptor block for a tag
 	if (v->j_ds_fill == v->j_ds_max) {
+		mintegrity_checkpoint_journal(v);
 		// TODO: Checkpoint, because not enough space
 	}
 
@@ -655,6 +694,9 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 static int mintegrity_recover_journal(struct dm_mintegrity *v)
 {
 	u8 *data;
+	struct mint_journal_header mjh_descriptor = {cpu_to_le32(MJ_MAGIC),
+		cpu_to_le32(TYPE_MJDB), 0, 0};
+
 
 	// Journal setup
 	data = dm_bufio_read(v->bufio, v->journal_start, &v->j_sb_buffer);
@@ -670,6 +712,8 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	v->j_sb_header.head = le32_to_cpu(v->j_sb_header.head);
 	v->j_sb_header.tail = le32_to_cpu(v->j_sb_header.tail);
 	v->j_sb_header.fill = le32_to_cpu(v->j_sb_header.fill);
+	v->j_sb_header.sequence = le32_to_cpu(v->j_sb_header.sequence);
+	v->j_sb_header.sequence = 0;
 
 	// data = dm_bufio_new(v->bufio, v->journal_start + 1, &v->j_ds_buffer);
 	// if (IS_ERR(data)) {
@@ -694,6 +738,20 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	if (v->journal_blocks < v->j_bpt + 3) {
 		return -EINVAL;
 	}
+
+	// Read new descriptor block
+	sector_t sector = v->journal_start + 1;
+	u8 *data = dm_bufio_new(v->bufio, sector, &v->j_ds_buffer);
+	if (unlikely(IS_ERR(data))) {
+		return PTR_ERR(data);
+	}
+
+	js->tail = 1;
+	js->fill = 1;
+
+	// Copy descriptor header
+	memcpy(data, &mjh_descriptor, sizeof(struct mint_journal_header));
+
 
 	return 0;
 	/**
@@ -1443,6 +1501,9 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->bufio)
 		dm_bufio_client_destroy(v->bufio);
 
+	kfree(v->hmac_digest);
+	kfree(v->inner_pad);
+	kfree(v->outer_pad);
 	kfree(v->secret);
 	kfree(v->salt);
 	kfree(v->root_digest);
@@ -1646,8 +1707,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 	v->hmac_digest_size = crypto_shash_digestsize(v->hmac_tfm);
-	v->hmac_shash_descsize = sizeof(struct shash_desc) + 
-		crypto_shash_descsize(v->hmac_tfm);
+	v->hmac_desc.tfm = v->hmac_tfm;
+	v->hmac_desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
 	// argv[9] <hmac secret>
 	v->secret_size = strlen(argv[9]) / 2;
@@ -1662,6 +1723,61 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		ti->error = "Invalid secret";
 		r = -EINVAL;
 		goto bad;
+	}
+
+	// Precompute values for HMAC computation - RFC 2104
+	v->outer_pad = kzalloc(v->hmac_digest_size, GFP_KERNEL);
+	if (!v->outer_pad) {
+		ti->error = "Cannot allocate outer pad";
+		r = -ENOMEM;
+		goto bad;
+	}
+	v->inner_pad = kzalloc(v->hmac_digest_size, GFP_KERNEL);
+	if (!v->inner_pad) {
+		ti->error = "Cannot allocate inner pad";
+		r = -ENOMEM;
+		goto bad;
+	}
+	v->hmac_digest = kzalloc(v->hmac_digest_size, GFP_KERNEL);
+	if (!v->hmac_digest) {
+		ti->error = "Cannot allocate hmac digest";
+		r = -ENOMEM;
+		goto bad;
+	}
+
+	// len(key) > len(hash) --> key = hash(key)
+	if (v->secret_size > v->hmac_digest_size) {
+		r = crypto_shash_init(&v->hmac_desc);
+		if (r < 0) {
+			ti->error = "crypto_shash_init failed";
+			r = -EINVAL;
+			goto bad;
+		}
+		r = crypto_shash_update(&v->hmac_desc, v->secret, v->secret_size);
+		if (r < 0) {
+			ti->error = "crypto_shash_update failed";
+			r = -EINVAL;
+			goto bad;
+		}
+		r = crypto_shash_final(desc, v->hmac_digest);
+		if (r < 0) {
+			ti->error = "crypto_shash_final failed";
+			r = -EINVAL;
+			return r;
+		}
+		for (i = 0; i < v->hmac_digest_size; i++) {
+			v->outer_pad[i] = 0x5c ^ v->hmac_digest[i];
+			v->inner_pad[i] = 0x36 ^ v->hmac_digest[i];
+		}
+	} else {
+		for (i = 0; i < v->secret_size; i++) {
+			v->outer_pad[i] = 0x5c ^ v->secret[i];
+			v->inner_pad[i] = 0x36 ^ v->secret[i];
+		}
+		for (i = v->secret_size; i < v->hmac_digest_size; i++) {
+			v->outer_pad[i] = 0x5c ^ 0x00;
+			v->inner_pad[i] = 0x36 ^ 0x00;
+		}
 	}
 
 	// Compute start of each hash level
