@@ -55,11 +55,11 @@ struct mint_journal_block_tag {
 
 struct mint_journal_superblock {
 	struct mint_journal_header header;
-	uint32_t block_size;  /**< Size of a single block */
 	uint32_t blocks;      /**< Number of block in this journal (including superblock) */
 	uint32_t head;        /**< Circular buffer head position */
 	uint32_t tail;        /**< Circular buffer tail position */
 	uint32_t fill;        /**< Number of used blocks */
+	uint32_t sequence;    /* Current sequence number */
 	char state;           /**< Clean, Dirty */
 };
 

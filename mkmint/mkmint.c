@@ -236,7 +236,7 @@ void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const char *input, size_t i,
 
 int main(int argc, char const *argv[]) {
 	// Check for arguments
-	if(argc != 9){
+	if(argc != 8){
 		exit_error_f("Usage: %s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT "
 					 "HMAC_TYPE SECRET", argv[0]);
 	}
@@ -388,8 +388,8 @@ int main(int argc, char const *argv[]) {
 			}
 		}
 		// Compute hash of this level for next iteration/root
-		hash(md_hash, mdctx_hash, hash_levels[i], block_size, salt, strlen(salt_str) / 2,
-			hash_output, &hash_length);
+		hash(md_hash, mdctx_hash, hash_levels[i], block_size, salt,
+			strlen(salt_str) / 2, hash_output, &hash_length);
 	}
 
 	// Write out hash superblock
@@ -454,20 +454,19 @@ int main(int argc, char const *argv[]) {
 	mjsb->header.magic = MJ_MAGIC;
 	// Superblock
 	mjsb->header.type = TYPE_MJSB;
-	// Block size
-	mjsb->block_size = block_size;
 	// Number of blocks
 	mjsb->blocks = jb_blocks;
 	// Head, tail, and fill are 0
 	mjsb->head = 0;
 	mjsb->tail = 0;
 	mjsb->fill = 0;
+	mjsb->sequence = 0;
 	// Clean
 	mjsb->state = 0;
 
 	info("Writing journal...");
 	if(write(file, mjsb, sizeof(struct mint_journal_superblock)) < 0){
-		exit_error_f("Failed to write journal superblock: %u, %s", i,
+		exit_error_f("Failed to write journal superblock:, %s",
 		strerror(errno));
 	}
 	if(write(file, zero_block, block_size - 512) < 0){
@@ -508,7 +507,7 @@ int main(int argc, char const *argv[]) {
 	print_superblock(msb);
 	bytes_to_hex(msb->root, hash_bytes, buf);
 	printf("dmsetup create meow --table \"%u %ju mintegrity %s %u %u %u %ju "
-		"%s %s %s %s %s %s\"\n",
+		"%s %s %s %s %s\"\n",
 		0,             // Start is 0
 		data_blocks * (block_size / 512),   // Size of device given to device mapper
 		// Mintegrity options
@@ -521,8 +520,7 @@ int main(int argc, char const *argv[]) {
 		buf,           // Root digest to verity
 		salt_str,      // Salt
 		hmac_type,     // Hash type for hmac
-		inner_pad,     // Secret for hmac
-		outer_pad      // Secret for hmac
+		secret_str
 		);
 
 	free(mjh);
