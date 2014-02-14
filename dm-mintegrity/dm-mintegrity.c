@@ -118,7 +118,7 @@ struct dm_mintegrity {
 
 	struct crypto_shash *tfm;       /* Hash algorithm */
 	struct crypto_shash *hmac_tfm;  /* HMAC hash algorithm */
-	struct shash_desc hmac_desc;    /* HMAC shash object */
+	struct shash_desc *hmac_desc;   /* HMAC shash object */
 
 	uint32_t digest_size;          /* hash digest size */
 	uint32_t hmac_digest_size;	   /* HMAC hash digest size */
@@ -276,11 +276,15 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 	if (aux->journal) {
 		struct dm_mintegrity *v = aux->v;
 		struct mint_journal_superblock *js = &v->j_sb_header;
-		// Which transaction block are we part of?
+		// We are no longer part of the list of dirty buffers
+		// Do this before up_write, so that aux->journal is 0 before
+		// mintegrity_add_buffers_to_journal
+		aux->journal = 0;
 		up_write(&(aux->lock));
 		// Finished this sync
-		if (atomic_dec_return(&v->j_writeback_remaining) == 1) {
-			// js->head = (js->head + v->j_blocks_to_free) % (js->blocks - 1);
+		if (atomic_dec_return(&v->j_writeback_remaining) == 0) {
+			js->head = (js->head + v->j_blocks_to_free) %
+				(v->journal_blocks - 1);
 			atomic_sub(v->j_blocks_to_free, &v->j_fill);
 			up_write(&v->j_sync_lock);
 		}
@@ -331,9 +335,6 @@ static unsigned mintegrity_hash_buffer_offset(struct dm_mintegrity *v,
 	unsigned idx;
 	idx = position & ((1 << v->hash_per_block_bits) - 1);
 	return idx << (v->dev_block_bits - v->hash_per_block_bits);
-	// return ((block >> (level * v->hash_per_block_bits)) &
-	// 	((1 << v->hash_per_block_bits) - 1)) <<
-	// 	(v->dev_block_bits - v->hash_per_block_bits);
 }
 
 /*
@@ -387,49 +388,49 @@ static int mintegrity_hmac_hash(struct dm_mintegrity *v)
 {
 	int r;
 
-	r = crypto_shash_init(&v->hmac_desc);
+	r = crypto_shash_init(v->hmac_desc);
 	if(r < 0){
 		DMERR("crypto_shash_init failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(&v->hmac_desc, v->inner_pad, v->hmac_digest_size);
+	r = crypto_shash_update(v->hmac_desc, v->inner_pad, v->hmac_digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(&v->hmac_desc, v->root_digest, v->digest_size);
+	r = crypto_shash_update(v->hmac_desc, v->root_digest, v->digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_final(&v->hmac_desc, v->hmac_digest);
+	r = crypto_shash_final(v->hmac_desc, v->hmac_digest);
 	if (r < 0) {
 		DMERR("crypto_shash_final failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_init(&v->hmac_desc);
+	r = crypto_shash_init(v->hmac_desc);
 	if(r < 0){
 		DMERR("crypto_shash_init failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(&v->hmac_desc, v->outer_pad, v->hmac_digest_size);
+	r = crypto_shash_update(v->hmac_desc, v->outer_pad, v->hmac_digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(&v->hmac_desc, v->hmac_digest, v->hmac_digest_size);
+	r = crypto_shash_update(v->hmac_desc, v->hmac_digest, v->hmac_digest_size);
 	if (r < 0) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_final(&v->hmac_desc, v->hmac_digest);
+	r = crypto_shash_final(v->hmac_desc, v->hmac_digest);
 	if (r < 0) {
 		DMERR("crypto_shash_final failed: %d", r);
 		return r;
@@ -460,14 +461,13 @@ static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 
 	// sync descriptor block
 	dm_bufio_mark_buffer_dirty(v->j_ds_buffer);
-	// dm_bufio_release(v->j_ds_buffer);
+	dm_bufio_release(v->j_ds_buffer);
 	dm_bufio_write_dirty_buffers(v->bufio);
 	// sync journal buffers
 	// already marked dirty
 
 	// Calculate hmac
-	// WHY DOES THIS BREAK THINGS !?
-	// mintegrity_hmac_hash(v);
+	mintegrity_hmac_hash(v);
 
 	// This means we're screwed and don't have room for a checkpoint block
 	BUG_ON(atomic_read(&v->j_fill) == v->journal_blocks - 1);
@@ -479,7 +479,6 @@ static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 	data = dm_bufio_new(v->bufio, sector, &j_ch_buffer);
 	// TODO: how do we recover from this?
 	if (unlikely(IS_ERR(data))) {
-		printk(KERN_CRIT "SHIT: coudln't get a new checkpoint buffer");
 		BUG_ON(1);
 		return PTR_ERR(data);
 	}
@@ -503,7 +502,7 @@ static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 	v->j_ds_fill = 0;
 	if (atomic_read(&v->j_fill) == v->journal_blocks - 1) {
 		// No room for a new descriptor block - sync journal, blocking
-		mintegrity_sync_journal(v, 0, 1);
+		mintegrity_sync_journal(v, 1, 1);
 		ret = 1;
 	}
 
@@ -511,7 +510,6 @@ static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 	sector = v->journal_start + 1 + ((js->tail + 1) % (v->journal_blocks - 1));
 	data = dm_bufio_new(v->bufio, sector, &v->j_ds_buffer);
 	if (unlikely(IS_ERR(data))) {
-		printk(KERN_CRIT "SHIT: coudln't get a new descriptor buffer");
 		BUG_ON(1 == 1);
 		return PTR_ERR(data);
 	}
@@ -611,7 +609,7 @@ static int mintegrity_sync_journal(struct dm_mintegrity *v, int checkpoint, int 
 		b = b->next_aux;
 	}
 	atomic_set(&v->j_writeback_remaining, i);
-	v->j_blocks_to_free = atomic_read(&v->j_fill);
+	v->j_blocks_to_free = atomic_read(&v->j_fill) + (checkpoint ? 0 : -1);
 
 	// Mark dirty and release all data that was checkpointed
 	while (v->j_aux_buffer_head) {
@@ -645,7 +643,6 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 	// Lock journal
 	down_write(&v->j_lock);
 
-	// printk(KERN_CRIT "j_ds_fill: %d", v->j_ds_fill);
 	// Check if we have space in the descriptor block for a tag
 	if (v->j_ds_fill == v->j_ds_max) {
 		// We don't lets get a new one
@@ -655,7 +652,7 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 	// Check for space - need blocks per transaction + checkpoint block
 	if (atomic_read(&v->j_fill) + 1 + v->j_bpt > v->journal_blocks - 1) {
 		// Make space in journal - blocking
-		mintegrity_sync_journal(v, 1, 1);
+		mintegrity_sync_journal(v, 0, 1);
 	}
 
 	// Get blocks for this transaction
@@ -678,7 +675,6 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 	atomic_add(v->j_bpt, &v->j_fill);
 
 	// struct mint_journal_block_tag location in descriptor block
-	// BUG_ON(v->j_ds_buffer == NULL);
 	*tag = dm_bufio_get_block_data(v->j_ds_buffer) + 
 		sizeof(struct mint_journal_header) + v->j_ds_fill *
 		sizeof(struct mint_journal_block_tag);
@@ -966,7 +962,6 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 
 	// Return back the whole block we read and verified
 	if (dmb) {
-		BUG_ON(buf == NULL);
 		*dmb = buf;
 	} else {
 		dm_bufio_release(buf);
@@ -1127,7 +1122,8 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 				for (j = v->levels - 1; j > i; j--) {
 					dm_bufio_release(dm_buffers[j]);
 				}
-				mintegrity_add_buffers_to_journal(v, sector, NULL, dm_j_buffers, -EIO, tag);
+				mintegrity_add_buffers_to_journal(v, sector, NULL, dm_j_buffers,
+					-EIO, tag);
 				return -EIO;
 			}
 			BUG_ON(dm_buffers[i] == NULL);
@@ -1454,12 +1450,6 @@ static void mintegrity_status(struct dm_target *ti, status_type_t type,
 	}
 }
 
-// static void mintegrity_sync(struct dm_mintegrity *v)
-// {
-	// flush_workqueue(v->write_wq);
-	// mintegrity_flush_journal(v);
-// }
-
 static int mintegrity_ioctl(struct dm_target *ti, unsigned cmd,
 			unsigned long arg)
 {
@@ -1530,7 +1520,7 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
 
-	mintegrity_sync_journal(v, 1, 1);
+	mintegrity_sync_journal(v, 0, 1);
 
 	dm_bufio_release(v->j_sb_buffer);
 	dm_bufio_release(v->j_ds_buffer);
@@ -1545,7 +1535,10 @@ static void mintegrity_dtr(struct dm_target *ti)
 	kfree(v->salt);
 	kfree(v->root_digest);
 
-	if(v->hmac_tfm)
+	if (v->hmac_desc)
+		kfree(v->hmac_desc);
+
+	if (v->hmac_tfm)
 		crypto_free_shash(v->hmac_tfm);
 
 	if (v->tfm)
@@ -1743,8 +1736,14 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		goto bad;
 	}
 	v->hmac_digest_size = crypto_shash_digestsize(v->hmac_tfm);
-	v->hmac_desc.tfm = v->hmac_tfm;
-	v->hmac_desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+	v->hmac_desc = kzalloc(sizeof(struct shash_desc) +
+		crypto_shash_descsize(v->hmac_tfm), GFP_KERNEL);
+	if (!v->hmac_desc) {
+		ti->error = "Cannot allocate mintegrity structure";
+		return -ENOMEM;
+	}
+	v->hmac_desc->tfm = v->hmac_tfm;
+	v->hmac_desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
 	// argv[9] <hmac secret>
 	v->secret_size = strlen(argv[9]) / 2;
@@ -1783,19 +1782,19 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	// len(key) > len(hash) --> key = hash(key)
 	if (v->secret_size > v->hmac_digest_size) {
-		r = crypto_shash_init(&v->hmac_desc);
+		r = crypto_shash_init(v->hmac_desc);
 		if (r < 0) {
 			ti->error = "crypto_shash_init failed";
 			r = -EINVAL;
 			goto bad;
 		}
-		r = crypto_shash_update(&v->hmac_desc, v->secret, v->secret_size);
+		r = crypto_shash_update(v->hmac_desc, v->secret, v->secret_size);
 		if (r < 0) {
 			ti->error = "crypto_shash_update failed";
 			r = -EINVAL;
 			goto bad;
 		}
-		r = crypto_shash_final(&v->hmac_desc, v->hmac_digest);
+		r = crypto_shash_final(v->hmac_desc, v->hmac_digest);
 		if (r < 0) {
 			ti->error = "crypto_shash_final failed";
 			r = -EINVAL;
