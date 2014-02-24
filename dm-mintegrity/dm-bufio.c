@@ -98,6 +98,7 @@ struct dm_bufio_client {
 	unsigned aux_size;
 	void (*alloc_callback)(struct dm_buffer *);
 	void (*write_callback)(struct dm_buffer *);
+	void (*write_endio_callback)(struct dm_buffer *);
 
 	struct dm_io_client *dm_io;
 
@@ -596,12 +597,15 @@ static void submit_io(struct dm_buffer *b, int rw, sector_t block,
 static void write_endio(struct bio *bio, int error)
 {
 	struct dm_buffer *b = container_of(bio, struct dm_buffer, bio);
+	struct dm_bufio_client *c = b->c;
 
 	b->write_error = error;
 	if (unlikely(error)) {
-		struct dm_bufio_client *c = b->c;
 		(void)cmpxchg(&c->async_write_error, 0, error);
 	}
+
+	if (c->write_endio_callback)
+		c->write_endio_callback(b);
 
 	BUG_ON(!test_bit(B_WRITING, &b->state));
 
@@ -1502,7 +1506,8 @@ dm_bufio_shrink_count(struct shrinker *shrink, struct shrink_control *sc)
 struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsigned block_size,
 					       unsigned reserved_buffers, unsigned aux_size,
 					       void (*alloc_callback)(struct dm_buffer *),
-					       void (*write_callback)(struct dm_buffer *))
+					       void (*write_callback)(struct dm_buffer *),
+					       void (*write_endio_callback)(struct dm_buffer *))
 {
 	int r;
 	struct dm_bufio_client *c;
@@ -1533,6 +1538,7 @@ struct dm_bufio_client *dm_bufio_client_create(struct block_device *bdev, unsign
 	c->aux_size = aux_size;
 	c->alloc_callback = alloc_callback;
 	c->write_callback = write_callback;
+	c->write_endio_callback = write_endio_callback;
 
 	for (i = 0; i < LIST_SIZE; i++) {
 		INIT_LIST_HEAD(&c->lru[i]);

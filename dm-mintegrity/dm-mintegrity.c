@@ -21,6 +21,8 @@
 #include <linux/module.h>
 #include <linux/printk.h>
 #include <linux/rwsem.h>
+#include <linux/kthread.h>
+#include <linux/delay.h>
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -86,14 +88,12 @@ struct mint_journal_superblock {
  */
 // TODO: this needs cleanup
 struct buffer_aux {
-	uint8_t hash_verified;          /* Buffer has been verified */
-	uint8_t journal;                /* Buffer is already in journal list */
-	uint32_t sequence;              /* Journal sequence number */
-	uint32_t buffer_count;
 	struct dm_buffer *self_buffer;  /* Pointer to own dm_buffer */
 	struct buffer_aux *next_aux;    /* Next aux buffer for journal */
-	struct rw_semaphore lock;       /* RW semaphore lock for async write back */
 	struct dm_mintegrity *v;
+	struct rw_semaphore lock;       /* RW semaphore lock for async write back */
+	uint8_t hash_verified;          /* Buffer has been verified */
+	uint8_t type;                   /* Buffer type */
 };
 
 struct dm_mintegrity {
@@ -157,20 +157,27 @@ struct dm_mintegrity {
 	// Locks
 	struct rw_semaphore lock;    /* global read/write lock */
 	struct rw_semaphore j_lock;  /* global journal read/write lock */
-	struct rw_semaphore j_sync_lock;  /* global journal sync lock */
+	struct rw_semaphore j_checkpoint_lock;  /* global journal sync lock */
+	struct rw_semaphore j_commit_finish_lock;
+	struct semaphore flush_semaphore;
 
 	// Journal
+	struct task_struct *j_background_thread;  /* Background journal thread */
+	struct task_struct *j_flush_thread;  /* Background journal thread */
 	struct mint_journal_superblock j_sb_header;  /* Current journal header */
 
 	struct dm_buffer *j_sb_buffer;  /* Journal superblock buffer */
 	struct dm_buffer *j_ds_buffer;  /* Journal descriptor buffer */
 
 	atomic_t j_fill;     /* Number of blocks in journal - need atomic due to writeback */
-	atomic_t j_writeback_remaining;  /* Number of blocks remaining to be written back */
+	atomic_t j_checkpoint_remaining;  /* Number of blocks remaining to be written back */
+	atomic_t j_commit_remaining;
+	uint8_t committing;
 	uint32_t j_blocks_to_free;  /* Number of blocks to free in journal after sync finishes */
 	uint32_t j_ds_fill;  /* Number of tags in current descriptor buffer */
 	uint32_t j_ds_max;   /* Max number of tags in descriptor buffer */
 	uint32_t j_bpt;      /* Number of blocks required per transaction */
+	uint32_t commit_count;
 
 	struct buffer_aux *j_aux_buffer_head;  /* Head of modified blocks in journal */
 	struct buffer_aux *j_aux_buffer_tail;  /* Tail of modified blocks in journal */
@@ -192,6 +199,9 @@ struct dm_mintegrity_io {
 	struct bio_vec io_vec_inline[DM_MINTEGRITY_IO_VEC_INLINE];
 
 	struct work_struct work;  /* Work instance for read/write queue */
+
+	bio_end_io_t *orig_bi_end_io;
+	void *orig_bi_private;
 
 	/*
 	 * Five variably-size fields follow this struct:
@@ -217,7 +227,7 @@ struct dm_mintegrity_prefetch_work {
 	unsigned n_blocks;
 };
 
-static int mintegrity_sync_journal(struct dm_mintegrity *v, int checkpoint, int blocking);
+static int mintegrity_checkpoint_journal(struct dm_mintegrity *v, int commit, int blocking);
 
 static struct dm_buffer **io_dm_buffers(struct dm_mintegrity *v,
 	struct dm_mintegrity_io *io)
@@ -257,36 +267,46 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
 {
 	struct buffer_aux *aux = dm_bufio_get_aux_data(buf);
 
+	aux->self_buffer = NULL;
 	aux->hash_verified = 0;
-	aux->journal = 0;
-	aux->sequence = 0;
-	aux->buffer_count = 0;
+	aux->type = 0;
 	init_rwsem(&(aux->lock));
 }
 
 /*
  * What do we want to do on a write callback ??
  */
- static void dm_bufio_write_callback(struct dm_buffer *buf)
+ static void dm_bufio_endio_callback(struct dm_buffer *buf)
 {
 	struct buffer_aux *aux = dm_bufio_get_aux_data(buf);
+	// if (aux->self_buffer)
+	// 	printk(KERN_CRIT "got a type %i @ %lu!\n", aux->type, dm_bufio_get_block_number(aux->self_buffer));
 	// TODO: move this to actual write finish callback
 	// This was held by the journal - its been written back
 	// so we can release it for modification
-	if (aux->journal) {
+	if (aux->type == 1) {
 		struct dm_mintegrity *v = aux->v;
-		struct mint_journal_superblock *js = &v->j_sb_header;
 		// We are no longer part of the list of dirty buffers
-		// Do this before up_write, so that aux->journal is 0 before
+		// Do this before up_write, so that aux->type is 0 before
 		// mintegrity_add_buffers_to_journal
-		aux->journal = 0;
+		aux->type = 0;
 		up_write(&(aux->lock));
-		// Finished this sync
-		if (atomic_dec_return(&v->j_writeback_remaining) == 0) {
-			js->head = (js->head + v->j_blocks_to_free) %
-				(v->journal_blocks - 1);
-			atomic_sub(v->j_blocks_to_free, &v->j_fill);
-			up_write(&v->j_sync_lock);
+		// Finished this checkpoint
+		int r = atomic_dec_return(&v->j_checkpoint_remaining);
+		if (r == 0) {
+			// printk(KERN_CRIT "Flushing type 1!\n");
+			// printk(KERN_CRIT "Incrementing semaphore!!\n");
+			up(&v->flush_semaphore);
+		} else if (r % 100 == 0) {
+			// printk(KERN_CRIT "checkpoint: remaining: %i\n", r);
+		}
+	} else if (aux->type > 1) {
+		struct dm_mintegrity *v = aux->v;
+		int r = atomic_dec_return(&v->j_commit_remaining);
+		if (r == 0 && v->committing) {
+			// printk(KERN_CRIT "Finished type %i!\n", aux->type);
+			// printk(KERN_CRIT "Finished flushing type 2!\n");
+			up_write(&v->j_commit_finish_lock);
 		}
 	}
 }
@@ -439,19 +459,20 @@ static int mintegrity_hmac_hash(struct dm_mintegrity *v)
 	return 0;
 }
 
-static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
+static int mintegrity_commit_journal(struct dm_mintegrity *v)
 {
 	int ret = 0;
 	sector_t sector;
 	u8 *data;
+	struct buffer_aux *aux;
 	struct mint_journal_superblock *js = &v->j_sb_header;
-	struct dm_buffer *j_ch_buffer;
-	struct mint_journal_header mjh_checkpoint = {cpu_to_le32(MJ_MAGIC),
+	struct dm_buffer *j_cm_buffer;
+	struct mint_journal_header mjh_commit = {cpu_to_le32(MJ_MAGIC),
 		cpu_to_le32(TYPE_MJCB), cpu_to_le32(v->j_sb_header.sequence), 0};
 	struct mint_journal_header mjh_descriptor = {cpu_to_le32(MJ_MAGIC),
 		cpu_to_le32(TYPE_MJDB), cpu_to_le32(v->j_sb_header.sequence + 1), 0};
 
-	// Nothing to checkpoint
+	// Nothing to commit
 	if (v->j_ds_fill == 0) {
 		return ret;
 	}
@@ -459,24 +480,32 @@ static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 	// Increment sequence counter
 	v->j_sb_header.sequence++;
 
-	// sync descriptor block
+	// descriptor block
+	down_write(&v->j_commit_finish_lock);
+	v->committing = 1;
+	atomic_inc(&v->j_commit_remaining);
+	aux = dm_bufio_get_aux_data(v->j_ds_buffer);
+	aux->v = v;
+	aux->type = 3;
+	aux->self_buffer = v->j_ds_buffer;
 	dm_bufio_mark_buffer_dirty(v->j_ds_buffer);
 	dm_bufio_release(v->j_ds_buffer);
-	dm_bufio_write_dirty_buffers(v->bufio);
+	// Change this to ASYNC
+	dm_bufio_write_dirty_buffers_async(v->bufio);
 	// sync journal buffers
 	// already marked dirty
 
 	// Calculate hmac
 	mintegrity_hmac_hash(v);
 
-	// This means we're screwed and don't have room for a checkpoint block
+	// This means we're screwed and don't have room for a commit block
 	BUG_ON(atomic_read(&v->j_fill) == v->journal_blocks - 1);
 
-	// Get checkpoint block - always available
-	sector = v->journal_start + 1 + ((js->tail + 1) % (v->journal_blocks - 1));
+	// Get commit block - always available
+	sector = v->journal_start + 1 + ((js->tail) % (v->journal_blocks - 1));
 	BUG_ON(sector >= v->data_start);
 	BUG_ON(sector < v->journal_start);
-	data = dm_bufio_new(v->bufio, sector, &j_ch_buffer);
+	data = dm_bufio_new(v->bufio, sector, &j_cm_buffer);
 	// TODO: how do we recover from this?
 	if (unlikely(IS_ERR(data))) {
 		BUG_ON(1);
@@ -488,26 +517,43 @@ static int mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 	// Increment fill
 	atomic_inc(&v->j_fill);
 
-	// Copy over checkpoint header and following hmac
-	memcpy(data, &mjh_checkpoint, sizeof(struct mint_journal_header));
+	// Copy over commit header and following hmac
+	memcpy(data, &mjh_commit, sizeof(struct mint_journal_header));
 	memcpy(data + sizeof(struct mint_journal_header), v->hmac_digest,
 		v->hmac_digest_size);
-	// Make sure descriptor block and journal buffers synced
-	dm_bufio_write_dirty_buffers(v->bufio);
-	// sync checkpoint block	
-	dm_bufio_mark_buffer_dirty(j_ch_buffer);
-	dm_bufio_release(j_ch_buffer);
-	dm_bufio_write_dirty_buffers(v->bufio);
+	// Make sure descriptor block and journal buffers synced - wait for lock instead
+	// printk(KERN_CRIT "Waiting for commit finish lock!\n");
+	down_write(&v->j_commit_finish_lock);
+	// printk(KERN_CRIT "Stopped Waiting for commit finish lock!\n");
+	dm_bufio_issue_flush(v->bufio);
+	// printk(KERN_CRIT "Finished waiting for  flush!\n");
+	// dm_bufio_write_dirty_buffers(v->bufio);
+	// sync commit block	
+	v->committing = 1;
+	atomic_inc(&v->j_commit_remaining);
+	aux = dm_bufio_get_aux_data(j_cm_buffer);
+	aux->v = v;
+	aux->type = 4;
+	aux->self_buffer = j_cm_buffer;
+	dm_bufio_mark_buffer_dirty(j_cm_buffer);
+	dm_bufio_release(j_cm_buffer);
+	dm_bufio_write_dirty_buffers_async(v->bufio);
+	// printk(KERN_CRIT "Waiting 2 for commit finish lock!\n");
+	down_write(&v->j_commit_finish_lock);
+	dm_bufio_issue_flush(v->bufio);
+	// printk(KERN_CRIT "Stopped 2 Waiting for commit finish lock!\n");
+	up_write(&v->j_commit_finish_lock);
+	v->committing = 0;
 
 	v->j_ds_fill = 0;
 	if (atomic_read(&v->j_fill) == v->journal_blocks - 1) {
 		// No room for a new descriptor block - sync journal, blocking
-		mintegrity_sync_journal(v, 1, 1);
+		mintegrity_checkpoint_journal(v, 1, 1);
 		ret = 1;
 	}
 
 	// Get new desciptor block
-	sector = v->journal_start + 1 + ((js->tail + 1) % (v->journal_blocks - 1));
+	sector = v->journal_start + 1 + ((js->tail) % (v->journal_blocks - 1));
 	data = dm_bufio_new(v->bufio, sector, &v->j_ds_buffer);
 	if (unlikely(IS_ERR(data))) {
 		BUG_ON(1 == 1);
@@ -543,11 +589,10 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 				continue;
 			}
 			struct buffer_aux *aux = dm_bufio_get_aux_data(data_buffers[i]);
-			if (aux->journal) {  // Already held by journal
+			if (aux->type == 1) {  // Already held by journal
 				dm_bufio_release(data_buffers[i]);
 			} else {
-				aux->journal = 1;
-				aux->sequence = v->j_sb_header.sequence;
+				aux->type = 1;
 				aux->self_buffer = data_buffers[i];
 				aux->next_aux = NULL;
 				aux->v = v;
@@ -568,6 +613,11 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 
 	// Add journal blocks
 	for (i = 0; i < v->j_bpt; i++) {
+		struct buffer_aux *aux = dm_bufio_get_aux_data(journal_buffers[i]);
+		aux->type = 2;
+		aux->v = v;
+		aux->self_buffer = journal_buffers[i];
+		atomic_inc(&v->j_commit_remaining);
 		// Check if magic numbers match
 		if (memcmp(dm_bufio_get_block_data(journal_buffers[i]),
 			dm_bufio_get_block_data(v->j_ds_buffer), 4)) {
@@ -576,6 +626,7 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 			// Mark escaped
 			tag.options = tag.options | (2 << i);
 		}
+		// printk(KERN_CRIT "Marking buffer: %lu as type 2\n", dm_bufio_get_block_number(journal_buffers[i]));
 		dm_bufio_mark_buffer_dirty(journal_buffers[i]);
 		dm_bufio_release(journal_buffers[i]);
 	}
@@ -584,23 +635,35 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 	if (unlikely(error)) {
 		tag.options = tag.options | 1;
 	}
-	memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
+	// memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
 }
 
-static int mintegrity_sync_journal(struct dm_mintegrity *v, int checkpoint, int blocking)
+static int mintegrity_checkpoint_journal(struct dm_mintegrity *v, int commit, int blocking)
 {
 	// struct mint_journal_superblock *js = &v->j_sb_header;
 	struct buffer_aux *b;
 	int i = 0;
 
-	// Checkpoint anything so far - if checkpoint did not call us
-	if (!checkpoint && mintegrity_checkpoint_journal(v) == 1) {
-		// sync was called from checkpoint - we're done
+	if (blocking == 1) {
+		printk(KERN_CRIT "Blocking journal checkpoint!\n");
+	}
+	// printk(KERN_CRIT "Journal: %s, %s\n", commit ? "check" : "not check",
+	// 	blocking ? "sync" : "async");
+
+	// commit anything so far - if commit did not call us
+	if (!commit && mintegrity_commit_journal(v) == 1) {
+		// sync was called from commit - we're done
 		return 0;
 	}
 
 	// Wait until ongoing sync finishes
-	down_write(&v->j_sync_lock);
+	// printk(KERN_CRIT "Getting checkpoint lock...\n");
+	if (blocking == 3) {
+		if (!down_write_trylock(&v->j_checkpoint_lock)) { return 0;}
+	} else {
+		down_write(&v->j_checkpoint_lock);
+	}
+	// printk(KERN_CRIT "Got checkpoint lock...\n");
 
 	// Count the number of buffers that will be written back
 	b = v->j_aux_buffer_head;
@@ -608,10 +671,18 @@ static int mintegrity_sync_journal(struct dm_mintegrity *v, int checkpoint, int 
 		i++;
 		b = b->next_aux;
 	}
-	atomic_set(&v->j_writeback_remaining, i);
-	v->j_blocks_to_free = atomic_read(&v->j_fill) + (checkpoint ? 0 : -1);
+	// Nothing to sync
+	if (i == 0) {
+		up_write(&v->j_checkpoint_lock);
+		return 0;
+	}
 
-	// Mark dirty and release all data that was checkpointed
+
+	atomic_set(&v->j_checkpoint_remaining, i);
+	v->j_blocks_to_free = atomic_read(&v->j_fill) + (commit ? 0 : -1);
+	// printk(KERN_CRIT "Sync: %i blocks, free: %i\n", i, v->j_blocks_to_free);
+
+	// Mark dirty and release all data that was commited
 	while (v->j_aux_buffer_head) {
 		// Temp pointer
 		struct buffer_aux *b = v->j_aux_buffer_head;
@@ -624,7 +695,7 @@ static int mintegrity_sync_journal(struct dm_mintegrity *v, int checkpoint, int 
 	}
 
 	// Now write everything back - blocking
-	if (blocking) {
+	if (blocking == 1) {
 		dm_bufio_write_dirty_buffers(v->bufio);
 	} else {
 		dm_bufio_write_dirty_buffers_async(v->bufio);
@@ -646,13 +717,15 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 	// Check if we have space in the descriptor block for a tag
 	if (v->j_ds_fill == v->j_ds_max) {
 		// We don't lets get a new one
-		mintegrity_checkpoint_journal(v);
+		mintegrity_commit_journal(v);
+		if (v->commit_count++ % 5 == 0)
+			mintegrity_checkpoint_journal(v, 0, 3);
 	}
 
-	// Check for space - need blocks per transaction + checkpoint block
+	// Check for space - need blocks per transaction + commit block
 	if (atomic_read(&v->j_fill) + 1 + v->j_bpt > v->journal_blocks - 1) {
 		// Make space in journal - blocking
-		mintegrity_sync_journal(v, 0, 1);
+		mintegrity_checkpoint_journal(v, 0, 1);
 	}
 
 	// Get blocks for this transaction
@@ -680,6 +753,10 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 		sizeof(struct mint_journal_block_tag);
 	// Increment descriptor block fill
 	v->j_ds_fill++;
+
+	// if (v->j_ds_fill % 100 == 0) {
+	// 	dm_bufio_write_dirty_buffers_async(v->bufio);
+	// }
 
 	// Unlock journal
 	up_write(&v->j_lock);
@@ -728,6 +805,7 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	// Max number of block tags in one journal descriptor block
 	v->j_ds_max = (v->dev_block_bytes - sizeof(struct mint_journal_header)) /
 		sizeof(struct mint_journal_block_tag);
+	printk(KERN_CRIT "j_ds_max: %i\n", v->j_ds_max);
 	// Number of blocks necessary per transaction - packed digests + data block
 	v->j_bpt = DIV_ROUND_UP(v->levels, (v->dev_block_bytes / v->digest_size)) + 1;
 	v->j_ds_fill = 0;
@@ -751,7 +829,8 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	// Copy descriptor header
 	memcpy(data, &mjh_descriptor, sizeof(struct mint_journal_header));
 
-	printk(KERN_CRIT "j_ds_max: %d, j_bpt: %d, j_ds_fill: %d", v->j_ds_max, v->j_bpt, v->j_ds_fill);
+	atomic_set(&v->j_commit_remaining, 0);
+	v->committing = 0;
 
 	return 0;
 	/**
@@ -899,6 +978,62 @@ bad:
 	*/
 }
 
+static int mintegrity_background_journal_thread(void *arg)
+{
+	struct dm_mintegrity *v = (struct dm_mintegrity*)arg;
+	// Loop forever
+	while (1) {
+		// dm-mintegrity called kthread_stop
+		if (kthread_should_stop()) {
+			break;
+		}
+		// Get write lock - we need this
+		down_write(&v->lock);
+		// Call async!
+		mintegrity_checkpoint_journal(v, 0, 0);
+		// Done with write lock
+		up_write(&v->lock);
+		// Sleep 5 seconds
+		msleep(5000);
+	}
+	return 0;
+}
+
+static int mintegrity_background_flush_thread(void *arg)
+{
+	struct dm_mintegrity *v = (struct dm_mintegrity*)arg;
+	// Loop forever
+	while (1) {
+		// dm-mintegrity called kthread_stop
+		if (kthread_should_stop()) {
+			break;
+		}
+		if (v->committing != 3 && down_interruptible(&v->flush_semaphore)) {
+			// signal
+		} else {
+			if(v->committing == 3) {
+				continue;
+			}
+			// printk(KERN_CRIT "Issuing flush!\n");
+			dm_bufio_issue_flush(v->bufio);
+				struct mint_journal_superblock *js = &v->j_sb_header;
+			js->head = (js->head + v->j_blocks_to_free) %
+				(v->journal_blocks - 1);
+			atomic_sub(v->j_blocks_to_free, &v->j_fill);
+			up_write(&v->j_checkpoint_lock);
+		}
+		// // Get write lock - we need this
+		// down_write(&v->lock);
+		// // Call async!
+		// mintegrity_checkpoint_journal(v, 0, 0);
+		// // Done with write lock
+		// up_write(&v->lock);
+		// // Sleep 5 seconds
+		// msleep(5000);
+	}
+	return 0;
+}
+
 /*
  * Verify hash of a metadata block pertaining to the specified data block
  * ("block" argument) at a specified level ("level" argument).
@@ -1020,54 +1155,107 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 
 	test_block_hash:
 		// Read data block
-		data = dm_bufio_read(v->bufio, data_sector + v->data_start, &dm_buffer);
-		if(unlikely(IS_ERR(data))){
-			DMERR("data block read failed");
-			return -EIO;
-		}
+		data = dm_bufio_get(v->bufio, data_sector + v->data_start, &dm_buffer);
 
-		r = mintegrity_buffer_hash(io, data, v->dev_block_bytes);
-		if (r != 0) {
-			dm_bufio_release(dm_buffer);
-			return -EIO;
-		}
-
-		result = io_real_digest(v, io);
-
-		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
-			DMERR_LIMIT("data block %llu is corrupted",
-				(unsigned long long)(io->block + b));
-			v->hash_failed = 1;
-			dm_bufio_release(dm_buffer);
-			return -EIO;
-		}
-
-		todo = 1 << v->dev_block_bits;
-		do {
-			struct bio_vec *bv;
-			u8 *page;
-			unsigned len;
-
-			BUG_ON(vector >= io->io_vec_size);
-			bv = &io->io_vec[vector];
-			page = kmap_atomic(bv->bv_page);
-			len = bv->bv_len - offset;
-			if (likely(len >= todo))
-				len = todo;
-
-			memcpy(page + bv->bv_offset + offset,
-				data + v->dev_block_bytes - todo, len);
-			kunmap_atomic(page);
-
-			offset += len;
-			if (likely(offset == bv->bv_len)) {
-				offset = 0;
-				vector++;
+		if (data) {
+			printk(KERN_CRIT "Reading from bufio get!\n");
+			r = mintegrity_buffer_hash(io, data, v->dev_block_bytes);
+			if (r != 0) {
+				dm_bufio_release(dm_buffer);
+				return -EIO;
 			}
-			todo -= len;
-		} while (todo);
 
-		dm_bufio_release(dm_buffer);
+			result = io_real_digest(v, io);
+
+			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
+				DMERR_LIMIT("data block %llu is corrupted",
+					(unsigned long long)(io->block + b));
+				v->hash_failed = 1;
+				dm_bufio_release(dm_buffer);
+				return -EIO;
+			}
+
+			todo = 1 << v->dev_block_bits;
+			do {
+				struct bio_vec *bv;
+				u8 *page;
+				unsigned len;
+
+				BUG_ON(vector >= io->io_vec_size);
+				bv = &io->io_vec[vector];
+				page = kmap_atomic(bv->bv_page);
+				len = bv->bv_len - offset;
+				if (likely(len >= todo))
+					len = todo;
+
+				memcpy(page + bv->bv_offset + offset,
+					data + v->dev_block_bytes - todo, len);
+				kunmap_atomic(page);
+
+				offset += len;
+				if (likely(offset == bv->bv_len)) {
+					offset = 0;
+					vector++;
+				}
+				todo -= len;
+			} while (todo);
+
+			dm_bufio_release(dm_buffer);
+		} else {
+			struct shash_desc *desc;
+			desc = io_hash_desc(v, io);
+			desc->tfm = v->tfm;
+			desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+			r = crypto_shash_init(desc);
+			if (r < 0) {
+				DMERR("crypto_shash_init failed: %d", r);
+				return r;
+			}
+			r = crypto_shash_update(desc, v->salt, v->salt_size);
+			if (r < 0) {
+				DMERR("crypto_shash_update failed: %d", r);
+				return r;
+			}
+			todo = 1 << v->dev_block_bits;
+			do {
+				struct bio_vec *bv;
+				u8 *page;
+				unsigned len;
+
+				BUG_ON(vector >= io->io_vec_size);
+				bv = &io->io_vec[vector];
+				page = kmap_atomic(bv->bv_page);
+				len = bv->bv_len - offset;
+				if (likely(len >= todo))
+					len = todo;
+				r = crypto_shash_update(desc,
+						page + bv->bv_offset + offset, len);
+				kunmap_atomic(page);
+				if (r < 0) {
+					DMERR("crypto_shash_update failed: %d", r);
+					return r;
+				}
+				offset += len;
+				if (likely(offset == bv->bv_len)) {
+					offset = 0;
+					vector++;
+				}
+				todo -= len;
+			} while (todo);
+
+			result = io_real_digest(v, io);
+			r = crypto_shash_final(desc, result);
+			if (r < 0) {
+				DMERR("crypto_shash_final failed: %d", r);
+				return r;
+			}
+			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
+				DMERR_LIMIT("data block %llu is corrupted",
+					(unsigned long long)(io->block + b));
+				v->hash_failed = 1;
+				return -EIO;
+			}
+		}
 	}
 	BUG_ON(vector != io->io_vec_size);
 	BUG_ON(offset);
@@ -1273,6 +1461,24 @@ static void mintegrity_read_work(struct work_struct *w)
 	bio_endio(bio, error);
 }
 
+static void mintegrity_read_end_io(struct bio *bio, int error)
+{
+	struct dm_mintegrity_io *io = bio->bi_private;
+
+	bio->bi_sector = bio->bi_sector - (io->v->data_start << (io->v->dev_block_bits - SECTOR_SHIFT));
+	bio->bi_end_io = io->orig_bi_end_io;
+	bio->bi_private = io->orig_bi_private;
+
+	if (error) {
+		if (io->io_vec != io->io_vec_inline)
+			mempool_free(io->io_vec, io->v->vec_mempool);
+		bio_endio(bio, error);
+	}
+
+	INIT_WORK(&(io->work), mintegrity_read_work);
+	queue_work(io->v->read_wq, &io->work);
+}
+
 static void mintegrity_write_work(struct work_struct *w)
 {
 	int error;
@@ -1303,8 +1509,6 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 		container_of(work, struct dm_mintegrity_prefetch_work, work);
 	struct dm_mintegrity *v = pw->v;
 	int i;
-
-	dm_bufio_prefetch(v->bufio, pw->block, pw->n_blocks);
 
 	for (i = v->levels - 2; i >= 0; i--) {
 		sector_t hash_block_start;
@@ -1396,7 +1600,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			io->io_vec_size * sizeof(struct bio_vec));
 
 		// Prefetch blocks
-		// mintegrity_submit_prefetch(v, io);
+		mintegrity_submit_prefetch(v, io);
 
 		switch(bio_data_dir(bio)) {
 		case WRITE:
@@ -1404,8 +1608,12 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			queue_work(io->v->write_wq, &io->work);
 			break;
 		case READ:
-			INIT_WORK(&(io->work), mintegrity_read_work);
-			queue_work(io->v->read_wq, &io->work);
+			bio->bi_sector = bio->bi_sector + (v->data_start << (v->dev_block_bits - SECTOR_SHIFT));
+			io->orig_bi_end_io = bio->bi_end_io;
+			io->orig_bi_private = bio->bi_private;
+			bio->bi_end_io = mintegrity_read_end_io;
+			bio->bi_private = io;
+			generic_make_request(bio);
 			break;
 		}
 	} else {
@@ -1446,6 +1654,7 @@ static void mintegrity_status(struct dm_target *ti, status_type_t type,
 		else
 			for (x = 0; x < v->salt_size; x++)
 				DMEMIT("%02x", v->salt[x]);
+		DMEMIT(" %i %i", atomic_read(&v->j_checkpoint_remaining), v->j_blocks_to_free);
 		break;
 	}
 }
@@ -1508,6 +1717,14 @@ static void mintegrity_dtr(struct dm_target *ti)
 {
 	struct dm_mintegrity *v = ti->private;
 
+	v->committing = 3;
+	up(&v->flush_semaphore);
+	if (v->j_background_thread)
+		kthread_stop(v->j_background_thread);
+
+	if (v->j_flush_thread)
+		kthread_stop(v->j_flush_thread);
+
 	if (v->journal_wq) 
 		destroy_workqueue(v->journal_wq);
 
@@ -1520,7 +1737,7 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
 
-	mintegrity_sync_journal(v, 0, 1);
+	mintegrity_checkpoint_journal(v, 0, 1);
 
 	dm_bufio_release(v->j_sb_buffer);
 	dm_bufio_release(v->j_ds_buffer);
@@ -1865,8 +2082,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	// Open device mapper buffered IO client
 	v->bufio = dm_bufio_client_create(v->dev->bdev, 1 << v->dev_block_bits,
-		reserved, sizeof(struct buffer_aux), dm_bufio_alloc_callback,
-		dm_bufio_write_callback);
+		reserved, sizeof(struct buffer_aux), dm_bufio_alloc_callback, NULL,
+		dm_bufio_endio_callback);
 	if (IS_ERR(v->bufio)) {
 		ti->error = "Cannot initialize dm-bufio";
 		r = PTR_ERR(v->bufio);
@@ -1892,12 +2109,15 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	/* Initialize lock for IO operations */
 	init_rwsem(&(v->lock));
 	init_rwsem(&(v->j_lock));
-	init_rwsem(&(v->j_sync_lock));
+	init_rwsem(&(v->j_checkpoint_lock));
+	init_rwsem(&(v->j_commit_finish_lock));
+	sema_init(&v->flush_semaphore, 0);
+	v->commit_count = 0;
 
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
 	v->read_wq = alloc_workqueue("kmintegrityd_read",
-		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, 3);
 	if (!v->read_wq) {
 		ti->error = "Cannot allocate read workqueue";
 		r = -ENOMEM;
@@ -1934,6 +2154,22 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
 		v->shash_descsize + v->digest_size * 2 + (v->levels + 1 + v->j_bpt) *
 		sizeof(struct dm_buffer*), __alignof__(struct dm_mintegrity_io));
+
+	v->j_background_thread = kthread_run(mintegrity_background_journal_thread,
+		v, "mintegrity_background_journal");
+	if (IS_ERR(v->j_background_thread)) {
+		ti->error = "Could not allocate background journal thread";
+		r = -ENOMEM;
+		goto bad;
+	}
+
+	v->j_flush_thread = kthread_run(mintegrity_background_flush_thread,
+		v, "mintegrity_flush_journal");
+	if (IS_ERR(v->j_flush_thread)) {
+		ti->error = "Could not allocate background flush thread";
+		r = -ENOMEM;
+		goto bad;
+	}
 
 	printk(KERN_CRIT "Levels: %d", v->levels);
 
