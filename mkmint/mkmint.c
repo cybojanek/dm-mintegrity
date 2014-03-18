@@ -27,21 +27,25 @@ static const char mjsb_magic[16] = {0x6c, 0x69, 0x6c, 0x79, 0x6d, 0x75, 0x66,
  * @param r How many times to update
  * @param w Total width of progress bar
  */
-static inline void progress(uint64_t i, uint64_t n, uint8_t r, uint8_t w){
-	if((n/r) != 0 && i % (n/r) != 0 && i != n){ return; }
+static inline uint8_t progress(uint64_t i, uint64_t n, uint8_t w, uint8_t old){
+	if (i != n && (i * 100 / n) <= old) {
+		return old;
+	}
+	// if ((n/r) != 0 && i % (n/r) != 0 && i != n){ return; }
 	char line[w + 1];
 	sprintf(line, " %3ju%% [", i != n ? i * 100 / n : 100);
 	uint8_t points = i != n ? 7 + (w - 9) * i / n : 7 + w - 9;
-	for(uint8_t i = 7; i < points; i++){
+	for (uint8_t i = 7; i < points; i++) {
 		line[i] = '=';
 	}
-	for(uint8_t i = points; i < w - 2; i++){
+	for (uint8_t i = points; i < w - 2; i++) {
 		line[i] = ' ';
 	}
 	line[w - 2] = ']';
 	line[w - 1] = '\r';
 	line[w] = 0;
 	fprintf(stderr, "%s", line);
+	return i * 100 / n;
 }
 
 /** @brief Convert an array of bytes to a hex strings
@@ -53,7 +57,7 @@ static inline void progress(uint64_t i, uint64_t n, uint8_t r, uint8_t w){
  * @param out[out] Null terminated hex string of bytes
  */
 void bytes_to_hex(const char *bytes, size_t len, char *out){
-	for(size_t i = 0; i < len; i++){
+	for (size_t i = 0; i < len; i++) {
 		out += sprintf(out, "%02x", (uint8_t)bytes[i]);
 	}
 	*(out + 1) = 0;
@@ -70,8 +74,8 @@ void bytes_to_hex(const char *bytes, size_t len, char *out){
  * @return 0 no error, -1 error in parsing
  */
 int hex_to_bytes(const char *hex, size_t len, char *out){
-	for(size_t i = 0; i < len / 2; i++){
-		if(sscanf(hex + 2 * i, "%02x", (unsigned int*)&out[i]) != 1){
+	for (size_t i = 0; i < len / 2; i++){ 
+		if (sscanf(hex + 2 * i, "%02x", (unsigned int*)&out[i]) != 1) {
 			return -1;
 		}
 	}
@@ -122,7 +126,7 @@ int compute_hash_blocks(uint64_t data_blocks, uint32_t fanout,
 	*levels = 0;
 	*hash_blocks = 0;
 	uint32_t i = divide_up(data_blocks, fanout);
-	while(i != 1){
+	while (i != 1) {
 		blocks_per_level[*levels] = i;
 		*hash_blocks += i;
 		*levels += 1;
@@ -132,7 +136,7 @@ int compute_hash_blocks(uint64_t data_blocks, uint32_t fanout,
 	blocks_per_level[*levels] = 1;
 	*levels += 1;
 	*hash_blocks += 1;
-	if(i == 0){
+	if (i == 0) {
 		return -1;
 	} else {
 		return 0;
@@ -156,7 +160,7 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 	uint32_t *jb_blocks, uint32_t *pad_blocks, uint32_t *levels,
 	uint32_t *blocks_per_level, uint32_t hash_bytes){
 
-	if(blocks < 6){
+	if (blocks < 6) {
 		exit_error_f("Not enough space! Need at least 6 blocks!");
 		return -1;
 	}
@@ -169,13 +173,13 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 	uint32_t *bpl = (uint32_t*)malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 
 
-	while(high >= low && high != 0){
+	while (high >= low && high != 0) {
 		uint64_t mid = low + divide_up((high - low), 2);  // Non overflow method
 		uint64_t db = mid, used = 0;
 		uint32_t hb = 0, jb = 0, pb = 0;
 		uint32_t lev;
 		// Number of hash blocks, levels needed for this many data blocks
-		if(compute_hash_blocks(db, fanout, &lev, &hb, bpl) != 0){
+		if (compute_hash_blocks(db, fanout, &lev, &hb, bpl) != 0) {
 			break; // Barf
 		}
 
@@ -185,20 +189,20 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 		pb = blocks - used;
 
 		// Result is better
-		if(used <= blocks && pb < *pad_blocks){
+		if (used <= blocks && pb < *pad_blocks) {
 			*data_blocks = db;
 			*hash_blocks = hb;
 			*jb_blocks = jb;
 			*pad_blocks = pb;
 			*levels = lev;
-			for(int i = 0; i < *levels; i++){
+			for (int i = 0; i < *levels; i++) {
 				blocks_per_level[i] = bpl[i];
 			}
 		}
 
-		if(used > blocks){ // Too many - go down
+		if (used > blocks) { // Too many - go down
 			high = mid - 1;
-		} else if(used < blocks){ // Not enough - go up
+		} else if (used < blocks) { // Not enough - go up
 			low = mid + 1;
 		} else { // Optimal! Wow!
 			break;
@@ -206,7 +210,7 @@ int compute_block_numbers(uint64_t blocks, uint32_t block_size, uint32_t fanout,
 	}
 	free(bpl);
 	// Failed at first try
-	if(*pad_blocks == blocks){
+	if (*pad_blocks == blocks) {
 		return -1;
 	} else {
 		return 0;
@@ -236,7 +240,7 @@ void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const char *input, size_t i,
 
 int main(int argc, char const *argv[]) {
 	// Check for arguments
-	if(argc != 8){
+	if (argc != 8) {
 		exit_error_f("Usage: %s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT "
 					 "HMAC_TYPE SECRET", argv[0]);
 	}
@@ -251,40 +255,40 @@ int main(int argc, char const *argv[]) {
 
 	// Open destination device
 	int file;
-	if((file = open(dev, O_RDWR)) < 0){
+	if ((file = open(dev, O_RDWR)) < 0) {
 		exit_error_f("Could not open: '%s' for writing, %s", dev, strerror(errno));
 	}
 
 	// Get size
 	// TODO: size of file in 512 chunks?
 	struct stat file_stats;
-	if(fstat(file, &file_stats) != 0){
+	if (fstat(file, &file_stats) != 0) {
 		exit_error_f("Could not get file stats for: '%s', %s", dev, strerror(errno));
 	}
 
-	if(!(S_ISREG(file_stats.st_mode) || S_ISBLK(file_stats.st_mode))){
+	if (!(S_ISREG(file_stats.st_mode) || S_ISBLK(file_stats.st_mode))) {
 		exit_error_f("File is neither a regular file nor block device");
 	}
 
 	// Get block size
-	if(sscanf(argv[2], "%u", &block_size) != 1){
+	if (sscanf(argv[2], "%u", &block_size) != 1) {
 		exit_error_f("Invalid block size: '%s'", argv[2]);
 	}
-	if(block_size < 512){
+	if (block_size < 512) {
 		exit_error_f("Invalid block size: '%u' < 512", block_size);
 	}
 
 	// Remainder check
-	if(S_ISREG(file_stats.st_mode) && file_stats.st_size % block_size != 0){
+	if (S_ISREG(file_stats.st_mode) && file_stats.st_size % block_size != 0) {
 		warn("File is not a multiple of block_size: %d. %ju bytes left over",
 			block_size, file_stats.st_size % block_size);
-	} else if(S_ISBLK(file_stats.st_mode))
+	} //else if(S_ISBLK(file_stats.st_mode)) 
 
 	// Number of journal transactions
-	if(sscanf(argv[3], "%u", &journal_blocks) != 1){
+	if (sscanf(argv[3], "%u", &journal_blocks) != 1) {
 		exit_error_f("Invalid journal transaction number: '%s'", argv[3]);
 	}
-	if(journal_blocks < 35){
+	if (journal_blocks < 35) {
 		exit_error_f("Journal block number has to be at least 35: %s", argv[3]);
 	}
 
@@ -294,7 +298,7 @@ int main(int argc, char const *argv[]) {
 	EVP_MD_CTX *mdctx_hash = EVP_MD_CTX_create();
 	const EVP_MD *md_hash;
 	md_hash = EVP_get_digestbyname(hash_type);
-	if(!md_hash){
+	if (!md_hash) {
 		exit_error_f("Unsupported hash type: %s", hash_type);
 	}
 	uint32_t hash_bytes = EVP_MD_size(md_hash);
@@ -302,28 +306,28 @@ int main(int argc, char const *argv[]) {
 	// Hmac algorithm
 	const EVP_MD *md_hmac;
 	md_hmac = EVP_get_digestbyname(hmac_type);
-	if(!md_hmac){
+	if (!md_hmac) {
 		exit_error_f("Unsupported hmac type: %s", hmac_type);
 	}
 
 	// Parse and check salt
 	char salt[128];
-	if(strlen(salt_str) % 2 != 0){
+	if (strlen(salt_str) % 2 != 0) {
 		exit_error_f("Invalid hex salt: length not a multiple of 2");
 	}
-	if(strlen(salt_str) > 256){
+	if (strlen(salt_str) > 256) {
 		exit_error_f("Salt is too long. %lu > %d", strlen(salt_str), 256);
 	}
-	if(hex_to_bytes(salt_str, strlen(salt_str), (char*)salt) != 0){
+	if (hex_to_bytes(salt_str, strlen(salt_str), (char*)salt) != 0) {
 		exit_error_f("Invalid hex salt: '%s'", salt_str);
 	}
 
 	// Parse and check secrets
 	char secret[hash_bytes];
-	if(strlen(secret_str) % 2 != 0){
+	if (strlen(secret_str) % 2 != 0) {
 		exit_error_f("Invalid hex secret: length not a multiple of 2");
 	}
-	if(hex_to_bytes(secret_str, strlen(secret_str), (char*)secret) != 0){
+	if (hex_to_bytes(secret_str, strlen(secret_str), (char*)secret) != 0) {
 		exit_error_f("Invalid hex inner pad: '%s'", secret_str);
 	}
 
@@ -336,9 +340,9 @@ int main(int argc, char const *argv[]) {
 	uint32_t *blocks_per_level = malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 	uint32_t levels = 0;
 	uint64_t blocks;
-	if(S_ISREG(file_stats.st_mode)){
+	if (S_ISREG(file_stats.st_mode)) {
 		blocks = file_stats.st_size / block_size;
-	} else if(S_ISBLK(file_stats.st_mode)){
+	} else if (S_ISBLK(file_stats.st_mode)) {
 		if(ioctl(file, BLKGETSIZE64, &blocks) != 0){
 			exit_error_f("ioctl for block size failed: %s", strerror(errno));
 		}
@@ -346,7 +350,16 @@ int main(int argc, char const *argv[]) {
 	}
 
 	// Fanout
+	uint8_t fls, pls = 0;
 	uint32_t fanout = block_size / hash_bytes;
+	while (fanout > 0) {
+		if ((fanout & 1) == 1) {
+			fls = pls;
+		}
+		pls ++;
+		fanout = fanout >> 1;
+	}
+	fanout = 1 << fls;
 
 	// Use up entire block device
 	compute_block_numbers(blocks, block_size, fanout, journal_blocks, &data_blocks,
@@ -357,7 +370,7 @@ int main(int argc, char const *argv[]) {
 			blocks, data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
 
 	// Sanity check
-	if(data_blocks + hash_blocks + jb_blocks + pad_blocks + 1!= blocks){
+	if (data_blocks + hash_blocks + jb_blocks + pad_blocks + 1!= blocks) {
 		warn("Data: %ju, Hash: %u, JB: %u, Pad: %u, Levels: %u",
 			data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
 		exit_error_f("Sanity check failed!: %ju != %ju",
@@ -378,13 +391,13 @@ int main(int argc, char const *argv[]) {
 		strlen(salt_str) / 2, hash_output, &hash_length);
 
 	// Now loop through each level
-	for(uint32_t i = 0; i < levels; i++){
+	for (uint32_t i = 0; i < levels; i++) {
 		hash_levels[i] = (char*)malloc(block_size);
 		// Fill block with hashes - padding is zeros
 		bzero(hash_levels[i], block_size);
-		for(uint32_t f = 0; f < fanout; f++){
-			for(int b = 0; b < hash_bytes; b++){
-				hash_levels[i][f * hash_length + b] = hash_output[b];
+		for (uint32_t f = 0; f < fanout; f++) {
+			for (int b = 0; b < hash_bytes; b++) {
+				hash_levels[i][f * (block_size / (1 << fls)) + b] = hash_output[b];
 			}
 		}
 		// Compute hash of this level for next iteration/root
@@ -422,26 +435,42 @@ int main(int argc, char const *argv[]) {
 	// Set root hash
 	memcpy(msb->root, hash_output, hash_length);
 	// Write it out!
-	if(write(file, msb, sizeof(struct mint_superblock)) < 0){
+	if (write(file, msb, sizeof(struct mint_superblock)) < 0) {
 		exit_error_f("Failed to write MSB: %s", strerror(errno));
 	}
-	if(write(file, zero_block, block_size - 512) < 0){
+	if (write(file, zero_block, block_size - 512) < 0) {
 		exit_error_f("Failed to write MSB pad: %s", strerror(errno));
 	}
 
+	// Big block buffer
+	uint32_t multiple = 1024;
+	char *big_block = (char*)malloc(block_size * multiple);
+	bzero(big_block, block_size * multiple);
+
 	// Write out hash block levels
-	uint32_t blocks_written = 0;
+	uint8_t p = 0;
 	info("Writing hash blocks...");
 	uint32_t h_written = 1;
-	for(int i = levels - 1; i >= 0; i--){
-		for(uint32_t j = 0; j < blocks_per_level[i]; j++){
-			// debug("level: %u, block: %u", i, j);
-			progress(h_written++, hash_blocks, 100, 79);
+	for (int i = levels - 1; i >= 0; i--) {
+		// Copy into big buffer
+		for (uint32_t m = 0; m < multiple; m++) {
+			memcpy(big_block + m * block_size, hash_levels[i], block_size);
+		}
+		// Write out big buffer
+		for (uint32_t j = 0; j < blocks_per_level[i] / multiple; j++) {
+			h_written += multiple;
+			p = progress(h_written, hash_blocks, 79, p);
+			if(write(file, big_block, block_size * multiple) < 0){
+				exit_error_f("Failed to write hash block: %u, %s",
+					h_written - 1, strerror(errno));
+			}
+		}
+		for (uint32_t j = 0; j < blocks_per_level[i] % multiple; j++) {
+			p = progress(h_written++, hash_blocks, 79, p);
 			if(write(file, hash_levels[i], block_size) < 0){
 				exit_error_f("Failed to write hash block: %u, %s",
 					h_written - 1, strerror(errno));
 			}
-			blocks_written++;
 		}
 	}
 	fprintf(stderr, "\n");
@@ -465,11 +494,11 @@ int main(int argc, char const *argv[]) {
 	mjsb->state = 0;
 
 	info("Writing journal...");
-	if(write(file, mjsb, sizeof(struct mint_journal_superblock)) < 0){
+	if (write(file, mjsb, sizeof(struct mint_journal_superblock)) < 0) {
 		exit_error_f("Failed to write journal superblock:, %s",
 		strerror(errno));
 	}
-	if(write(file, zero_block, block_size - 512) < 0){
+	if (write(file, zero_block, block_size - 512) < 0) {
 		exit_error_f("Failed to write journal superblock pad: %s", strerror(errno));
 	}
 
@@ -481,26 +510,46 @@ int main(int argc, char const *argv[]) {
 	// Nothing block
 	mjh->type = TYPE_MJNB;
 
-	for(uint32_t i = 1 ; i < jb_blocks; i++){
-		progress(i + 1, jb_blocks, 100, 79);
-		if(write(file, mjh, sizeof(struct mint_journal_header)) < 0){
-			exit_error_f("Failed to write journal block: %u, %s", i,
+	// Copy headers into start of every block
+	bzero(big_block, block_size * multiple);
+	for (uint64_t i = 0; i < multiple; i++) {
+		memcpy(big_block + i * block_size, mjh, sizeof(struct mint_journal_header));
+	}
+	p = 0;
+	for (uint64_t i = 0; i < (jb_blocks - 1) / multiple; i++) {
+		if(write(file, big_block, block_size * multiple) < 0){
+			exit_error_f("Failed to write journal block: %ju, %s", i,
 				strerror(errno));
 		}
-		if(write(file, zero_block, block_size - sizeof(struct mint_journal_header)) < 0){
-			exit_error_f("Failed to write journal pad: %s", strerror(errno));
+		p = progress(i * multiple + 1, jb_blocks, 79, p);
+	}
+	for (uint64_t i = 0; i < (jb_blocks - 1) % multiple; i++) {
+		if(write(file, big_block, block_size) < 0){
+			exit_error_f("Failed to write journal block: %ju, %s", i,
+				strerror(errno));
 		}
+		p = progress(jb_blocks - ((jb_blocks - 1) % multiple) + i + 2, jb_blocks, 79, p);
 	}
 	fprintf(stderr, "\n");
 
 	// Zero out data
+	bzero(big_block, block_size * multiple);
 	info("Writing data blocks...");
-	for(uint64_t i = 0; i < data_blocks; i++){
-		progress(i + 1, data_blocks, 100, 79);
+	p = 0;
+	for (uint64_t i = 0; i < data_blocks / multiple; i++) {
+		if(write(file, big_block, block_size * multiple) < 0){
+			exit_error_f("Failed to write data block: %ju, %s", i,
+				strerror(errno));
+		}
+		p = progress(i * multiple, data_blocks, 79, p);
+	}
+	for (uint64_t i = 0; i < data_blocks % multiple; i++) {
 		if(write(file, zero_block, block_size) < 0){
 			exit_error_f("Failed to write data block: %ju, %s", i,
 				strerror(errno));
 		}
+		p = progress(data_blocks - (data_blocks % multiple) + i + 1,
+			data_blocks, 79, p);
 	}
 	fprintf(stderr, "\n");
 
@@ -528,8 +577,9 @@ int main(int argc, char const *argv[]) {
 	free(msb);
 	free(blocks_per_level);
 	free(zero_block);
+	free(big_block);
 	free(temp_block);
-	for(int i = 0; i < levels; i++){
+	for (int i = 0; i < levels; i++) {
 		free(hash_levels[i]);
 	}
 	free(hash_levels);
