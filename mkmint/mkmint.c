@@ -1,5 +1,6 @@
-#include <fcntl.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -240,12 +241,23 @@ void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const char *input, size_t i,
 
 int main(int argc, char const *argv[]) {
 	// Check for arguments
-	if (argc != 8) {
+	if (argc < 8) {
 		exit_error_f("Usage: %s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT "
-					 "HMAC_TYPE SECRET", argv[0]);
+					 "HMAC_TYPE SECRET [lazy]", argv[0]);
 	}
 	const char *dev, *hash_type, *hmac_type, *salt_str, *secret_str;
 	uint32_t block_size, journal_blocks;
+	bool zero;
+
+	if (argc == 9) {
+		if (!strcmp(argv[8], "lazy")) {
+			zero = false;
+		} else {
+			exit_error_f("Unsupported optional argument: %s", argv[8]);
+		}
+	} else {
+		zero = true;
+	}
 
 	dev = argv[1];
 	hash_type = argv[4];
@@ -533,30 +545,34 @@ int main(int argc, char const *argv[]) {
 	fprintf(stderr, "\n");
 
 	// Zero out data
-	bzero(big_block, block_size * multiple);
-	info("Writing data blocks...");
-	p = 0;
-	for (uint64_t i = 0; i < data_blocks / multiple; i++) {
-		if(write(file, big_block, block_size * multiple) < 0){
-			exit_error_f("Failed to write data block: %ju, %s", i,
-				strerror(errno));
+	if (zero) {
+		bzero(big_block, block_size * multiple);
+		info("Writing data blocks...");
+		p = 0;
+		for (uint64_t i = 0; i < data_blocks / multiple; i++) {
+			if(write(file, big_block, block_size * multiple) < 0){
+				exit_error_f("Failed to write data block: %ju, %s", i,
+					strerror(errno));
+			}
+			p = progress(i * multiple, data_blocks, 79, p);
 		}
-		p = progress(i * multiple, data_blocks, 79, p);
-	}
-	for (uint64_t i = 0; i < data_blocks % multiple; i++) {
-		if(write(file, zero_block, block_size) < 0){
-			exit_error_f("Failed to write data block: %ju, %s", i,
-				strerror(errno));
+		for (uint64_t i = 0; i < data_blocks % multiple; i++) {
+			if(write(file, zero_block, block_size) < 0){
+				exit_error_f("Failed to write data block: %ju, %s", i,
+					strerror(errno));
+			}
+			p = progress(data_blocks - (data_blocks % multiple) + i + 1,
+				data_blocks, 79, p);
 		}
-		p = progress(data_blocks - (data_blocks % multiple) + i + 1,
-			data_blocks, 79, p);
+		fprintf(stderr, "\n");
+	} else {
+		info("Skipping disk zeroing...");
 	}
-	fprintf(stderr, "\n");
 
 	print_superblock(msb);
 	bytes_to_hex(msb->root, hash_bytes, buf);
 	printf("dmsetup create meow --table \"%u %ju mintegrity %s %u %u %u %ju "
-		"%s %s %s %s %s\"\n",
+		"%s %s %s %s %s%s\"\n",
 		0,             // Start is 0
 		data_blocks * (block_size / 512),   // Size of device given to device mapper
 		// Mintegrity options
@@ -569,7 +585,8 @@ int main(int argc, char const *argv[]) {
 		buf,           // Root digest to verity
 		salt_str,      // Salt
 		hmac_type,     // Hash type for hmac
-		secret_str
+		secret_str,    // Hmac secret
+		zero ? "" : " lazy"
 		);
 
 	free(mjh);
@@ -583,7 +600,6 @@ int main(int argc, char const *argv[]) {
 		free(hash_levels[i]);
 	}
 	free(hash_levels);
-	close(file);
 	EVP_MD_CTX_destroy(mdctx_hash);
 	return 0;
 }

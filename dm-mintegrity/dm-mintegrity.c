@@ -51,7 +51,7 @@ module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRU
 /* Last tag */
 #define J_TAG_LAST   2
 
-#define J_PAGE_ORDER_SIZE 7
+#define J_PAGE_ORDER_SIZE 4
 #define J_PAGE_CHUNK_SIZE (1 << J_PAGE_ORDER_SIZE)
 
 struct mint_journal_header {
@@ -125,6 +125,7 @@ struct dm_mintegrity {
 	uint32_t salt_size;    /* Size of salt */
 	uint32_t secret_size;  /* Size of HMAC secret */
 
+	uint8_t *zero_digest;  /* Hash digest of a zero block */
 	uint8_t *root_digest;  /* Hash digest of the root block */
 	uint8_t *salt;		   /* salt: its size is salt_size */
 	uint8_t *secret;       /* HMAC secret: its size is secret_size */
@@ -739,7 +740,7 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 			mintegrity_checkpoint_journal(v, 0, 1);
 		}
 		int size = J_PAGE_CHUNK_SIZE;
-		if (1 + js->tail + J_PAGE_CHUNK_SIZE > v->journal_blocks) {
+		if (1 + js->tail + J_PAGE_CHUNK_SIZE >= v->journal_blocks) {
 			size = v->journal_blocks - 1 - js->tail;
 		}
 		// Get new one
@@ -1121,6 +1122,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 	unsigned b;
 	int i;
 	unsigned vector = 0, offset = 0;
+	unsigned original_vector, original_offset;
 
 	for (b = 0; b < io->n_blocks; b++) {
 		u8 *result;
@@ -1158,8 +1160,8 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 	test_block_hash:
 		// Read data block
 		// TODO: fix race condition durig endio callback for read
-		// data = dm_bufio_get(v->bufio, data_sector + v->data_start, &dm_buffer);
-		data = NULL;
+		data = dm_bufio_get(v->bufio, data_sector + v->data_start, &dm_buffer);
+
 		if (data) {
 			// printk(KERN_CRIT "Reading from bufio get!\n");
 			r = mintegrity_buffer_hash(io, data, v->dev_block_bytes);
@@ -1170,13 +1172,15 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 
 			result = io_real_digest(v, io);
 
-			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
-				DMERR_LIMIT("data block %llu is corrupted",
-					(unsigned long long)(io->block + b));
-				v->hash_failed = 1;
-				dm_bufio_release(dm_buffer);
-				return -EIO;
-			}
+			// If its in memory, it was as a result of a write - its good
+			// and we avoid the hash race condition
+			// if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
+			// 	DMERR_LIMIT("data block %llu is corrupted",
+			// 		(unsigned long long)(io->block + b));
+			// 	v->hash_failed = 1;
+			// 	dm_bufio_release(dm_buffer);
+			// 	return -EIO;
+			// }
 
 			todo = 1 << v->dev_block_bits;
 			do {
@@ -1219,6 +1223,8 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 				DMERR("crypto_shash_update failed: %d", r);
 				return r;
 			}
+			original_vector = vector;
+			original_offset = offset;
 			todo = 1 << v->dev_block_bits;
 			do {
 				struct bio_vec *bv;
@@ -1253,10 +1259,40 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 				return r;
 			}
 			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
-				DMERR_LIMIT("data block %llu is corrupted",
-					(unsigned long long)(io->block + b));
-				v->hash_failed = 1;
-				return -EIO;
+				// If zero digest is enabled and it matches the wanted digest
+				if (v->zero_digest && !memcmp(io_want_digest(v, io), v->zero_digest, v->digest_size)) {
+					// Zero it out
+					vector = original_vector;
+					offset = original_offset;
+					todo = 1 << v->dev_block_bits;
+					do {
+						struct bio_vec *bv;
+						u8 *page;
+						unsigned len;
+
+						BUG_ON(vector >= io->io_vec_size);
+						bv = &io->io_vec[vector];
+						page = kmap_atomic(bv->bv_page);
+						len = bv->bv_len - offset;
+						if (likely(len >= todo))
+							len = todo;
+
+						memset(page + bv->bv_offset + offset, 0, len);
+						kunmap_atomic(page);
+
+						offset += len;
+						if (likely(offset == bv->bv_len)) {
+							offset = 0;
+							vector++;
+						}
+						todo -= len;
+					} while (todo);
+				} else {
+					DMERR_LIMIT("data block %llu is corrupted",
+						(unsigned long long)(io->block + b));
+					v->hash_failed = 1;
+					return -EIO;
+				}
 			}
 		}
 	}
@@ -1460,6 +1496,11 @@ static void mintegrity_read_work(struct work_struct *w)
 	if (io->io_vec != io->io_vec_inline)
 		mempool_free(io->io_vec, v->vec_mempool);
 
+	if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_FUA))) {
+		down_write(&v->j_lock);
+		mintegrity_commit_journal(v);
+		up_write(&v->j_lock);
+	}
 	bio_endio(bio, error);
 }
 
@@ -1493,6 +1534,11 @@ static void mintegrity_write_work(struct work_struct *w)
 	if (io->io_vec != io->io_vec_inline)
 		mempool_free(io->io_vec, v->vec_mempool);
 
+	if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_FUA))) {
+		down_write(&v->j_lock);
+		mintegrity_commit_journal(v);
+		up_write(&v->j_lock);
+	}
 	bio_endio(bio, error);
 }
 
@@ -1588,10 +1634,6 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		io->block = bio->bi_sector >> (v->dev_block_bits - SECTOR_SHIFT);
 		io->n_blocks = bio->bi_size >> v->dev_block_bits;
 
-		if (io->n_blocks > 1) {
-			printk(KERN_CRIT "N!:%c %d\n", bio_data_dir(bio) == WRITE ? 'w' : 'c', io->n_blocks);
-		}
-
 		// Why is this here?
 		io->io_vec_size = bio_segments(bio);
 		if (io->io_vec_size < DM_MINTEGRITY_IO_VEC_INLINE)
@@ -1618,9 +1660,6 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			generic_make_request(bio);
 			break;
 		}
-	} else {
-		// Unsupported bio operation
-		return -EIO;
 	}
 
 	return DM_MAPIO_SUBMITTED;
@@ -1755,6 +1794,7 @@ static void mintegrity_dtr(struct dm_target *ti)
 	kfree(v->outer_pad);
 	kfree(v->secret);
 	kfree(v->salt);
+	kfree(v->zero_digest);
 	kfree(v->root_digest);
 
 	if (v->hmac_desc)
@@ -1787,6 +1827,7 @@ static void mintegrity_dtr(struct dm_target *ti)
  *  <salt>
  *  <hmac hash type>
  *  <hmac secret>
+ *  [<nozero>]
  *
  *	<salt>		Hex string or "-" if no salt.
  */
@@ -1820,8 +1861,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 	// Check argument count
-	if (argc != 10) {
-		ti->error = "Invalid argument count: exactly 10 arguments required";
+	if (argc < 10) {
+		ti->error = "Invalid argument count: 10 or more arguments required";
 		r = -EINVAL;
 		goto bad;
 	}
@@ -1980,6 +2021,65 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		ti->error = "Invalid secret";
 		r = -EINVAL;
 		goto bad;
+	}
+
+	// argv[10] [<nozero>]
+	// Allocate space to keep track of a zero hash block
+	if (argc > 10) {
+		if (!strcmp(argv[10], "lazy")) {
+			v->zero_digest = kmalloc(v->digest_size, GFP_KERNEL);
+			if (!v->zero_digest) {
+				ti->error = "Cannot allocate zero digest";
+				r = -ENOMEM;
+				goto bad;
+			}
+			// Pre-compute zero hash
+			struct shash_desc *desc;
+			char c = 0;
+			desc = kzalloc(sizeof(struct shash_desc) +
+				crypto_shash_descsize(v->tfm), GFP_KERNEL);
+			if (!desc) {
+				ti->error = "Cannot allocate zero shash_desc";
+				r = -ENOMEM;
+				goto bad;
+			}
+			desc->tfm = v->tfm;
+			desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+			r = crypto_shash_init(desc);
+			if (r < 0) {
+				kfree(desc);
+				ti->error = "crypto_shash_init zero failed";
+				r = -EINVAL;
+				goto bad;
+			}
+			r = crypto_shash_update(desc, v->salt, v->salt_size);
+			if (r < 0) {
+				kfree(desc);
+				ti->error = "crypto_shash_update zero failed";
+				r = -EINVAL;
+				goto bad;
+			}
+			for (i = 0; i < v->dev_block_bytes; i++) {
+				r = crypto_shash_update(desc, &c, 1);
+				if (r < 0) {
+					kfree(desc);
+					ti->error = "crypto_shash_update zero failed";
+					r = -EINVAL;
+					goto bad;
+				}
+			}
+			r = crypto_shash_final(desc, v->zero_digest);
+			if (r < 0) {
+				kfree(desc);
+				ti->error = "crypto_shash_final zero failed";
+				r = -EINVAL;
+				goto bad;
+			}
+		} else {
+			ti->error = "Invalid optional argument";
+			r = -EINVAL;
+			goto bad;
+		}
 	}
 
 	// Precompute values for HMAC computation - RFC 2104
