@@ -531,15 +531,33 @@ static int mintegrity_commit_journal(struct dm_mintegrity *v)
 	// Increment sequence counter
 	v->j_sb_header.sequence++;
 
-	// Write out jbs if it hasn't been finished
+	int i = 0;
+
+	// Write out jbs if it hasn't been completly used
 	if (v->jbs && atomic_read(&v->jbs->available) != 0) {
 		v->jbs->bio.bi_rw = WRITE_SYNC | WRITE;
-		while (atomic_read(&v->jbs->finished) + atomic_read(&v->jbs->available) != v->jbs->size) {};
+		// Busy wait for write io to finish
+		// TODO: fix this spinlock
+		while (atomic_read(&v->jbs->finished) + atomic_read(&v->jbs->available) != v->jbs->size) {
+			if (i != 0 && i % 10000000 == 0 ) {
+				printk(KERN_CRIT "1: 10 millions: %d, %d + %d != %d", i / 10000000, atomic_read(&v->jbs->finished), atomic_read(&v->jbs->available), v->jbs->size);
+			}
+			i++;
+		};
 		mintegrity_write_journal_block(v->jbs);
 		v->jbs = NULL;
 	}
-
+	// Wait for data blocks to be written out
+	// down_write(&v->j_commit_finish_lock);
 	// Write out descriptor block
+	i = 0;
+	// TODO: fix this spinlock
+	while (atomic_read(&v->j_commit_outstanding)) {
+			if (i != 0 && i % 10000000 == 0 ) {
+				printk(KERN_CRIT "2: 10 millions: %d, outstanding: %d", i / 10000000, atomic_read(&v->j_commit_outstanding));
+			}
+			i++;
+	};
 	atomic_inc(&v->j_commit_outstanding);
 	mintegrity_write_journal_block(v->j_ds_buffer);
 
@@ -598,8 +616,10 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 	int which)
 {
 	int i;
-	struct mint_journal_block_tag tag = {cpu_to_le32(sector),
-		cpu_to_le32(sector >> 32), 0};
+	struct mint_journal_block_tag tag = {
+		cpu_to_le32(sector),
+		cpu_to_le32(sector >> 32),
+		0};
 
 	if (likely(data_buffers != NULL)) {
 		// Lock because we'll be modifying buffer list
@@ -633,23 +653,17 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 		up_write(&v->l_lock);
 	}
 
-	// Add journal blocks
-	// for (i = 0; i < v->j_bpt; i++) {
-	// 	// Check if magic numbers match
-	// 	if (memcmp(journal_buffers[i]->data, v->j_ds_buffer->data, 4)) {
-	// 		// Escape magic number
-	// 		memset(journal_buffers[i]->data, 4, 0);
-	// 		// Mark escaped
-	// 		tag.options = tag.options | (2 << i);
-	// 	}
-	// }
+	char magic[4] = {0x59, 0x4c, 0x49, 0x4c};
 
-	// // Tell journal to ignore
-	// if (unlikely(error)) {
-	// 	tag.options = tag.options | 1;
-	// }
-	// memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
-	// for (i = 0; i < v->j_bpt; i++) {
+	if (unlikely(memcmp(journal_buffers[0]->data + (v->dev_block_bytes * which),
+		magic, 4))) {
+		tag.options |= 2;
+	}
+	if (unlikely(error)) {
+		tag.options |= 1;
+	}
+
+	memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
 	if (atomic_inc_return(&journal_buffers[0]->finished) == journal_buffers[0]->size) {
 		mintegrity_write_journal_block(journal_buffers[0]);
 	}
@@ -737,6 +751,7 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 		// Check for space - need blocks chunk + commit block
 		if (atomic_read(&v->j_fill) + 1 + J_PAGE_CHUNK_SIZE > v->journal_blocks - 1) {
 			// Make space in journal - blocking
+			printk(KERN_CRIT "OUT OF SPACE!\n");
 			mintegrity_checkpoint_journal(v, 0, 1);
 		}
 		int size = J_PAGE_CHUNK_SIZE;
@@ -765,9 +780,8 @@ static int mintegrity_get_journal_buffers(struct dm_mintegrity *v,
 		v->jbs = NULL;
 	}
 	// struct mint_journal_block_tag location in descriptor block
-	// *tag = v->j_ds_buffer->data + 
-	// 	sizeof(struct mint_journal_header) + v->j_ds_fill *
-	// 	sizeof(struct mint_journal_block_tag);
+	*tag = v->j_ds_buffer->data + sizeof(struct mint_journal_header)
+		+ v->j_ds_fill * sizeof(struct mint_journal_block_tag);
 	// Increment descriptor block fill
 	v->j_ds_fill++;
 
@@ -802,7 +816,8 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	// Max number of block tags in one journal descriptor block
 	v->j_ds_max = (v->dev_block_bytes - sizeof(struct mint_journal_header)) /
 		sizeof(struct mint_journal_block_tag);
-	v->j_ds_max *= 3;
+	// Don't do this until its fully supported
+	// v->j_ds_max *= 3;
 
 	// Number of blocks necessary per transaction - packed digests + data block
 	v->j_bpt = 1;
@@ -1327,24 +1342,17 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 
 		// Get journal blocks
 		if ((which = mintegrity_get_journal_buffers(v, j_buffers, &tag)) < 0) {
-			printk(KERN_CRIT "WTF: - didn't get buffers!");
 			// Safe to return because nothing needs to be cleaned up here
 			return -EIO;
 		}
-		BUG_ON(which > J_PAGE_CHUNK_SIZE);
-		BUG_ON(j_buffers[0] == NULL);
-		BUG_ON(j_buffers[0]->data == NULL);
 
 		// The io digest we want is the root
-		BUG_ON(v->root_digest == NULL);
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
-		BUG_ON(j_buffers[0]->data == NULL);
 
 		// Set all to NULL for possible cleanup
 		for (i = 0; i < v->levels + 1; i++) {
 			dm_buffers[i] = NULL;
 		}
-		BUG_ON(j_buffers[0]->data == NULL);
 
 		// Read levels, TOP DOWN and compare to io want, which is set after
 		// every successive read
@@ -1362,18 +1370,15 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			struct buffer_aux *b = dm_bufio_get_aux_data(dm_buffers[i]);
 			atomic_inc(&b->writers);
 		}
-		BUG_ON(j_buffers[0]->data == NULL);
 
 		// Get ready to write to disk
 		// TODO: on demand memory, fail gracefully
 		data = dm_bufio_new(v->bufio, sector + v->data_start,
 			dm_buffers + v->levels);
-		BUG_ON(data == NULL);
 		if (unlikely(IS_ERR(data))) {
 			dm_buffers[v->levels] = NULL;
 			goto bad;
 		}
-		BUG_ON(j_buffers[0]->data == NULL);
 
 		// Copy from bio vector to journal data buffer
 		todo = v->dev_block_bytes;
@@ -1399,18 +1404,8 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			}
 			todo -= len;
 		} while (todo);
-		if (j_buffers[0]->data == NULL) {
-			printk("WTF: which: %d, %p, %d, %d, %d", which, j_buffers[0]->v, atomic_read(&j_buffers[0]->n),
-				atomic_read(&j_buffers[0]->available), atomic_read(&j_buffers[0]->finished));
-		}
-		BUG_ON(j_buffers[0]->data == NULL);
 
 		// Copy into dm_bufio
-		if (j_buffers[0]->data + (v->dev_block_bytes * which) == NULL) {
-			printk("WTF: %p + %d = %p", j_buffers[0]->data, (v->dev_block_bytes * which),
-				j_buffers[0]->data + (v->dev_block_bytes * which));
-		}
-		BUG_ON(j_buffers[0]->data + (v->dev_block_bytes * which) == NULL);
 		memcpy(j_buffers[0]->data + (v->dev_block_bytes * which), data,
 			v->dev_block_bytes);
 
@@ -1430,7 +1425,6 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		}
 
 		// Copy data hash into first level
-		BUG_ON(result == NULL);
 		memcpy(dm_bufio_get_block_data(dm_buffers[0]) +
 			mintegrity_hash_buffer_offset(v, sector, 0),
 			result, v->digest_size);
@@ -1448,7 +1442,6 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 				}
 				result = io_real_digest(v, io);
 				// Copy hash into current level
-				BUG_ON(result == NULL);
 				memcpy(dm_bufio_get_block_data(dm_buffers[i]) +
 					mintegrity_hash_buffer_offset(v, sector, i), result,
 					v->digest_size);
@@ -1465,7 +1458,6 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 				goto bad;
 			}
 			result = io_real_digest(v, io);
-			BUG_ON(result == NULL);
 			memcpy(v->root_digest, result, v->digest_size);
 		}
 		mintegrity_add_buffers_to_journal(v, sector, dm_buffers, j_buffers,
