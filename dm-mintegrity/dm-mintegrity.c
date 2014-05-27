@@ -301,6 +301,9 @@ static void dm_bufio_alloc_callback(struct dm_buffer *buf)
  static void dm_bufio_endio_callback(struct dm_buffer *buf)
 {
 	struct buffer_aux *aux = dm_bufio_get_aux_data(buf);
+	if (aux->type == 2) {
+		return;
+	}
 	struct dm_mintegrity *v = aux->v;
 	// We are no longer part of the list of dirty buffers
 	// Do this before up_write, so that aux->type is 0 before
@@ -528,9 +531,6 @@ static int mintegrity_commit_journal(struct dm_mintegrity *v)
 		return ret;
 	}
 
-	// Increment sequence counter
-	v->j_sb_header.sequence++;
-
 	int i = 0;
 
 	// Write out jbs if it hasn't been completly used
@@ -558,6 +558,15 @@ static int mintegrity_commit_journal(struct dm_mintegrity *v)
 			}
 			i++;
 	};
+	// Mark mark actual last one
+	char *tag_ptr = v->j_ds_buffer->data + sizeof(struct mint_journal_header)
+		+ (v->j_ds_fill - 1) * sizeof(struct mint_journal_block_tag);
+	struct mint_journal_block_tag tag;
+	memcpy(&tag, tag_ptr, sizeof(struct mint_journal_block_tag));
+	tag.options = le32_to_cpu(tag.options);
+	tag.options |= 4;
+	tag.options = cpu_to_le32(tag.options);
+	memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
 	atomic_inc(&v->j_commit_outstanding);
 	mintegrity_write_journal_block(v->j_ds_buffer);
 
@@ -595,6 +604,35 @@ static int mintegrity_commit_journal(struct dm_mintegrity *v)
 		mintegrity_checkpoint_journal(v, 1, 1);
 		ret = 1;
 	}
+
+	// Write out journal header
+	struct mint_journal_superblock mjstemp = {
+		{
+			cpu_to_le32(MJ_MAGIC),
+			cpu_to_le32(TYPE_MJSB),
+			cpu_to_le32(v->j_sb_header.sequence),
+			0
+		},
+		cpu_to_le32(v->journal_blocks),
+		cpu_to_le32(0),
+		cpu_to_le32(js->tail),
+		cpu_to_le32(atomic_read(&v->j_fill)),
+		cpu_to_le32(v->j_sb_header.sequence),
+		1
+	};
+	struct journal_block *mjs;
+	mintegrity_init_journal_block(&mjs, v, v->journal_start, WRITE_SYNC, 1);
+	memcpy(mjs->data, &mjstemp, sizeof(struct mint_journal_superblock));
+	down_write(&v->j_commit_finish_lock);
+	atomic_inc(&v->j_commit_outstanding);
+	v->committing = 1;
+	mintegrity_write_journal_block(mjs);
+	down_write(&v->j_commit_finish_lock);
+	up_write(&v->j_commit_finish_lock);
+	v->committing = 0;
+
+	// Increment sequence counter
+	v->j_sb_header.sequence++;
 
 	// Get new desciptor block
 	sector = v->journal_start + 1 + ((js->tail) % (v->journal_blocks - 1));
@@ -655,13 +693,14 @@ static void mintegrity_add_buffers_to_journal(struct dm_mintegrity *v,
 
 	char magic[4] = {0x59, 0x4c, 0x49, 0x4c};
 
-	if (unlikely(memcmp(journal_buffers[0]->data + (v->dev_block_bytes * which),
+	if (unlikely(!memcmp(journal_buffers[0]->data + (v->dev_block_bytes * which),
 		magic, 4))) {
 		tag.options |= 2;
 	}
 	if (unlikely(error)) {
 		tag.options |= 1;
 	}
+	tag.options = cpu_to_le32(tag.options);
 
 	memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
 	if (atomic_inc_return(&journal_buffers[0]->finished) == journal_buffers[0]->size) {
@@ -797,6 +836,11 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	struct mint_journal_header mjh_descriptor = {cpu_to_le32(MJ_MAGIC),
 		cpu_to_le32(TYPE_MJDB), 0, 0};
 
+	// Max number of block tags in one journal descriptor block
+	v->j_ds_max = (v->dev_block_bytes - sizeof(struct mint_journal_header)) /
+		sizeof(struct mint_journal_block_tag);
+	printk(KERN_CRIT "J_DS_MAX: %d\n", v->j_ds_max);
+
 	// Journal setup
 	data = dm_bufio_read(v->bufio, v->journal_start, &v->j_sb_buffer);
 	if (IS_ERR(data)) {
@@ -811,11 +855,297 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	v->j_sb_header.tail = le32_to_cpu(v->j_sb_header.tail);
 	v->j_sb_header.fill = le32_to_cpu(v->j_sb_header.fill);
 	v->j_sb_header.sequence = le32_to_cpu(v->j_sb_header.sequence);
-	v->j_sb_header.sequence = 0;
 
-	// Max number of block tags in one journal descriptor block
-	v->j_ds_max = (v->dev_block_bytes - sizeof(struct mint_journal_header)) /
-		sizeof(struct mint_journal_block_tag);
+	// Dirty - recover
+	if (v->j_sb_header.state) {
+		printk(KERN_CRIT "Journal Super Block Dirty\n");
+		printk(KERN_CRIT "head: %d, tail: %d, fill: %d, sequence: %d\n",
+			v->j_sb_header.head, v->j_sb_header.tail, v->j_sb_header.fill,
+			v->j_sb_header.sequence);
+		u8 *ddata;
+		u8 *cdata;
+		int start;
+		struct dm_buffer *dmb;
+		struct dm_buffer *cmb;
+		uint32_t sequence;
+		uint8_t found = 0;
+		struct mint_journal_header dmjh;
+		struct mint_journal_header cmjh;
+		int i,j;
+
+		// Read descriptor
+		uint32_t descriptor;
+		uint32_t processed = 0;
+		descriptor = (v->j_sb_header.tail - v->j_sb_header.fill) % (v->journal_blocks - 1);
+		// Allocate io struct
+		// struct dm_mintegrity_io *io = kzalloc(4096, GFP
+			// roundup(
+			// 	sizeof(struct dm_mintegrity_io) +
+			// 	v->shash_descsize + v->digest_size * 2 + (v->levels + 1) *
+			// 	sizeof(struct dm_buffer*) + v->j_bpt * sizeof(struct journal_block),
+			// 	__alignof__(struct dm_mintegrity_io)
+			// ), GFP_KERNEL);
+
+		struct dm_mintegrity_io *io = kzalloc(roundup(sizeof(struct dm_mintegrity_io) +
+			v->shash_descsize + v->digest_size * 2, __alignof__(struct dm_mintegrity_io)), GFP_KERNEL);
+		io->v = v;
+
+		if (!io) {
+			printk(KERN_CRIT "Failed to allocate io block!\n");
+		}
+		while (processed != v->j_sb_header.fill) {
+			printk(KERN_CRIT "processed: %d, fill: %d, desciptor: %d\n",
+				processed, v->j_sb_header.fill, descriptor);
+			sector_t sector = v->journal_start + descriptor;
+			ddata = dm_bufio_read(v->bufio, sector, &dmb);
+			if (IS_ERR(ddata)) {
+				printk(KERN_CRIT "Failed to read first descriptor\n");
+				return -EIO;
+			}
+
+			// Find last tag
+			memcpy(&dmjh, ddata, sizeof(struct mint_journal_header));
+			dmjh.magic = le32_to_cpu(dmjh.magic);
+			dmjh.type = le32_to_cpu(dmjh.type);
+			dmjh.sequence = le32_to_cpu(dmjh.sequence);
+
+			// Not a descriptor block - error
+			if (dmjh.magic != MJ_MAGIC || dmjh.type != TYPE_MJDB) {
+				dm_bufio_release(dmb);
+				kfree(io);
+				printk(KERN_CRIT "Not a descriptor block!: %d %d\n", dmjh.magic, dmjh.type);
+				return -EIO;
+			}
+
+			int data_blocks = 0;
+			// Find last block
+			for (j = 0; j < v->j_ds_max; j++) {
+				struct mint_journal_block_tag tag;
+				memcpy(&tag, ddata + sizeof(struct mint_journal_header) + j * sizeof(struct mint_journal_block_tag),
+					sizeof(struct mint_journal_block_tag));
+				tag.options = le32_to_cpu(tag.options);
+				if ((tag.options & 4) == 4) {
+					// This is the last one
+					data_blocks = j + 1;
+					break;
+				}
+			}
+			printk(KERN_CRIT "Data blocks: %d\n", data_blocks);
+
+			// Scan forward to find matching commit block
+			int commit_block = -1;
+			for (i = data_blocks; i <= data_blocks + J_PAGE_CHUNK_SIZE; i++) {
+				sector_t s = v->journal_start + 1 + ((descriptor + i + 1) % (v->journal_blocks - 1));
+				cdata = dm_bufio_read(v->bufio, s, &cmb);
+				memcpy(&cmjh, cdata, sizeof(struct mint_journal_header));
+				cmjh.magic = le32_to_cpu(cmjh.magic);
+				cmjh.type = le32_to_cpu(cmjh.type);
+				cmjh.sequence = le32_to_cpu(cmjh.sequence);
+				printk(KERN_CRIT "Checking : %ld for commit block\n", 1 + ((descriptor + i + 1) % (v->journal_blocks - 1)));
+				printk(KERN_CRIT "MAGIC: %#x, type: %d, sequence: %d\n", cmjh.magic, cmjh.type, cmjh.sequence);
+				// Found the commit block!
+				if (cmjh.magic == MJ_MAGIC && cmjh.type == TYPE_MJCB && cmjh.sequence == dmjh.sequence) {
+					commit_block = i + 1;
+					break;
+				}
+				dm_bufio_release(cmb);
+			}
+			printk(KERN_CRIT "Commit block: %ld\n", commit_block);
+			// No matching commit block found
+			if (commit_block == -1) {
+				// dm_bufio_release(cmb);
+				dm_bufio_release(dmb);
+				kfree(io);
+				printk("No commit block!\n");
+				return -EIO;
+			}
+
+			// Write out data (descriptor to last tag), and compute hashes
+			for (i = 0; i < data_blocks; i++) {
+				// Read tag
+				struct mint_journal_block_tag tag;
+				u8 *result;
+				memcpy(&tag, ddata + sizeof(struct mint_journal_header) +
+					i * sizeof(struct mint_journal_block_tag),
+					sizeof(struct mint_journal_block_tag));
+				tag.low = le32_to_cpu(tag.low);
+				tag.high = le32_to_cpu(tag.high);
+				tag.options = le32_to_cpu(tag.options);
+				// Skip this block - revoked
+				if ((tag.options & 1)) {
+					continue;
+				}
+				// Compute sector from 2 * 32 bits
+				sector_t sector_data = tag.high;
+				sector_data = (sector_data << 32) + tag.low;
+				printk(KERN_CRIT "Writing out to sector: %d\n", sector_data);
+				// Read from journal
+				struct dm_buffer *jdmb;
+				u8 *jdata = dm_bufio_read(v->bufio,
+					v->journal_start + 1 + ((descriptor + i) % (v->journal_blocks - 1)),
+					&jdmb);
+				printk(KERN_CRIT "Data tag: %d, offset into journal: %ld\n", i, 1 + ((descriptor + i) % (v->journal_blocks - 1)));
+				if (IS_ERR(jdata)) {
+					return -EIO;
+				}
+				// Escaped
+				if (tag.options & 2) {
+					printk(KERN_CRIT "Escaping data!\n");
+					jdata[0] = 0x59;
+					jdata[1] = 0x4c;
+					jdata[2] = 0x49;
+					jdata[3] = 0x4c;
+				}
+				// Write into actual space
+				struct dm_buffer *ddmb;
+				u8 *data_new = dm_bufio_new(v->bufio, sector_data + v->data_start, &ddmb);
+				memcpy(data_new, jdata, v->dev_block_bytes);
+				struct buffer_aux *aux = dm_bufio_get_aux_data(ddmb);
+				aux->type = 2;
+				dm_bufio_mark_buffer_dirty(ddmb);
+				dm_bufio_release(ddmb);
+
+				// Compute hash
+				printk(KERN_CRIT "Computing data hash...\n");
+				// for (j = 0; j < v->dev_block_bytes; j++) {
+				// 	if (jdata[j] != 0) {
+				// 		printk(KERN_CRIT "jdata[%d] = %d\n", j, jdata[j]);
+				// 	}
+				// }
+				mintegrity_buffer_hash(io, jdata, v->dev_block_bytes);
+				result = io_real_digest(v, io);
+				print_hex_dump(KERN_CRIT, "data: ", DUMP_PREFIX_NONE, 16, 1, result, v->digest_size, 1);
+				dm_bufio_release(jdmb);
+
+				// Read/write and compute hashes up untl root
+				struct dm_buffer *hdmb;
+				unsigned offset;
+				sector_t hash_block;
+				u8 *hdata;
+
+				for (j = 0; j < v->levels; j++) {
+					mintegrity_hash_at_level(v, sector_data, j, &hash_block, &offset);
+					hdata = dm_bufio_read(v->bufio, hash_block, &hdmb);
+					if (IS_ERR(hdata)) {
+						printk(KERN_CRIT "Error reading hash for level: %d, %ld\n", j, hash_block);
+						return -EIO;
+					}
+					memcpy(hdata + offset, result, v->digest_size);
+					printk(KERN_CRIT "Computing hash hash, level: %d\n", j);
+					mintegrity_buffer_hash(io, hdata, v->dev_block_bytes);
+					result = io_real_digest(v, io);
+					struct buffer_aux *aux = dm_bufio_get_aux_data(hdmb);
+					aux->type = 2;
+					dm_bufio_mark_buffer_dirty(hdmb);
+					dm_bufio_release(hdmb);
+				}
+
+				print_hex_dump(KERN_CRIT, "old root: ", DUMP_PREFIX_NONE, 16, 1, v->root_digest, v->digest_size, 1);
+				print_hex_dump(KERN_CRIT, "new root: ", DUMP_PREFIX_NONE, 16, 1, result, v->digest_size, 1);
+				memcpy(v->root_digest, result, v->digest_size);
+			}
+
+			// Check root hash against commit block
+			mintegrity_hmac_hash(v);
+			print_hex_dump(KERN_CRIT, "calculated: ", DUMP_PREFIX_NONE, 16, 1, v->hmac_digest,
+				v->hmac_digest_size, 1);
+			print_hex_dump(KERN_CRIT, "expected: ", DUMP_PREFIX_NONE, 16, 1, cdata + sizeof(struct mint_journal_header),
+				v->hmac_digest_size, 1);
+			if (memcmp(cdata + sizeof(struct mint_journal_header), v->hmac_digest, v->hmac_digest_size)) {
+				// HMAC failed
+				dm_bufio_release(cmb);
+				dm_bufio_release(dmb);
+				kfree(io);
+				printk(KERN_CRIT "HMAC FAILED\n");
+				return -EIO;
+			}
+
+			// Processed this many blocks
+			processed += commit_block + 1;
+			descriptor = (descriptor + commit_block + 1) % (v->journal_blocks - 1);
+
+			dm_bufio_release(cmb);
+			dm_bufio_release(dmb);
+		}
+		printk(KERN_CRIT "Finished recovery!\n");
+		kfree(io);
+		dm_bufio_write_dirty_buffers(v->bufio);
+
+		// Check against commit block
+		// Reached tail?
+
+		// Read all and find lowest descriptor block as starting point
+		// for (int i = 1; i < v->journal_blocks; i++) {
+		// 	data = dm_bufio_read(v->bufio, v->journal_start + i, &dmb);
+		// 	if (IS_ERR(data)) {
+		// 		return -EIO;
+		// 	}
+		// 	memcpy(&mjh, data, sizeof(struct mint_journal_header));
+		// 	dm_bufio_release(dmb);
+		// 	mjh.magic = le32_to_cpu(mjh.magic);
+		// 	mjh.type = le32_to_cpu(mjh.type);
+		// 	mjh.sequence = le32_to_cpu(mjh.sequence);
+
+		// 	if (mjh.magic == MJ_MAGIC && mjh.type == TYPE_MJDB && (!found || mjh.sequence < sequence)) {
+		// 		sequence = mjh.sequence;
+		// 		found = 1;
+		// 		start = i;
+		// 	}
+		// }
+		// // Now go to start and check the descriptor block
+		// while (true) {
+		// 	data = dm_bufio_read(v->bufio, v->journal_start + start, &dmb);
+		// 	if (IS_ERR(data)) {
+		// 		return -EIO;
+		// 	}
+		// 	memcpy(&mjh, data, sizeof(struct mint_journal_header));
+		// 	dm_bufio_release(dmb);
+		// 	mjh.magic = le32_to_cpu(mjh.magic);
+		// 	mjh.type = le32_to_cpu(mjh.type);
+		// 	mjh.sequence = le32_to_cpu(mjh.sequence);
+
+		// 	// Not a descriptor block anymore - finished
+		// 	if (mjh.magic == MJ_MAGIC && mjh.type == TYPE_MJDB && (!found || mjh.sequence < sequence)) {
+		// 		break;
+		// 	}
+		// 	int data_blocks = 0;
+		// 	// Find last block
+		// 	for (int j = 0; j < v->j_ds_max; j++) {
+		// 		struct mint_journal_block_tag tag;
+		// 		memcpy(data + sizeof(struct mint_journal_header) + j * sizeof(struct mint_journal_block_tag));
+		// 		tag.options = le32_to_cpu(tag.options);
+		// 		if (tag.options & 4 == 4) {
+		// 			// This is the last one
+		// 			data_blocks = j + 1;
+		// 		}
+		// 	}
+		// }
+		// if it has a commit block, write out everything in between
+		// updating hashes, and check hmac
+		// sync
+		// Zero out commit block
+		// prevents bad stuff like this from working
+		// 0...0|1..
+		// 0..
+		// sync
+	} else {
+		printk("Journal Superblock Clean!\n");
+	}
+
+
+
+	// Now mark mounted
+	v->j_sb_header.state = 1;
+	// And reset fills
+	printk("Marking superblock mounted\n");
+	struct buffer_aux *aux = dm_bufio_get_aux_data(v->j_sb_buffer);
+	aux->type = 2;
+	memcpy(dm_bufio_get_block_data(v->j_sb_buffer), &v->j_sb_header,
+		sizeof(struct mint_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->j_sb_buffer);
+	dm_bufio_write_dirty_buffers(v->bufio);
+
+
 	// Don't do this until its fully supported
 	// v->j_ds_max *= 3;
 
@@ -1100,6 +1430,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 
 		result = io_real_digest(v, io);
 
+		// TODO: race condition with writes
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			DMERR_LIMIT("metadata block %llu is corrupted",
 				(unsigned long long)hash_block);
@@ -1111,6 +1442,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		}
 	}
 
+	// TODO: race condition
 	memcpy(io_want_digest(v, io), data + offset, v->digest_size);
 
 	// Return back the whole block we read and verified
@@ -1775,7 +2107,12 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->vec_mempool)
 		mempool_destroy(v->vec_mempool);
 
-
+	// Mark unmounted
+	v->j_sb_header.state = 0;
+	memcpy(dm_bufio_get_block_data(v->j_sb_buffer), &v->j_sb_header,
+		sizeof(struct mint_journal_superblock));
+	dm_bufio_mark_buffer_dirty(v->j_sb_buffer);
+	dm_bufio_write_dirty_buffers(v->bufio);
 	dm_bufio_release(v->j_sb_buffer);
 
 	if (v->bufio)
@@ -2240,6 +2577,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		r = -EIO;
 		goto bad;
 	}
+	printk("Journal recovery/setup ok\n");
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
 		v->shash_descsize + v->digest_size * 2 + (v->levels + 1) *
