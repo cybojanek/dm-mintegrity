@@ -241,33 +241,38 @@ void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const char *input, size_t i,
 
 int main(int argc, char const *argv[]) {
 	// Check for arguments
-	if (argc < 8) {
-		exit_error_f(
-			"Usage:\n"
-			"%s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT HMAC_TYPE SECRET lazy|nolazy\n"
-			"%s MINT_DEV DATA_DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT HMAC_TYPE SECRET lazy|nolazy\n",
-			argv[0], argv[0]);
+	if (argc != 11) {
+		exit_error_f("Usage:\n%s MINT_DEV DATA_DEV BLOCK_SIZE JOURNAL_BLOCKS HASH_TYPE SALT HMAC_TYPE SECRET lazy|nolazy full|sector\n", argv[0]);
 	}
 	const char *dev, *dev2, *hash_type, *hmac_type, *salt_str, *secret_str;
 	uint32_t block_size, journal_blocks;
 	bool zero;
+	bool full_journal;
+	bool two_disks;
 
-	if (!strcmp(argv[argc - 1], "lazy")) {
+	if (!strcmp(argv[9], "lazy")) {
 		zero = false;
-	} else if (!strcmp(argv[argc - 1], "nolazy")) {
+	} else if (!strcmp(argv[9], "nolazy")) {
 		zero = true;
 	} else {
-		exit_error_f("Unsupported optional argument: %s", argv[argc - 1]);
+		exit_error_f("Unsupported lazy|nolazy argument: %s", argv[9]);
 	}
 
-	bool two_disks = (argc == 10);
+	if (!strcmp(argv[10], "full")) {
+		full_journal = true;
+	} else if (!strcmp(argv[10], "sector")) {
+		full_journal = false;
+	} else {
+		exit_error_f("Unsupported full|sector argument: %s", argv[argc - 1]);
+	}
 
 	dev = argv[1];
 	dev2 = argv[2];
-	hash_type = argv[4 + two_disks];
-	salt_str = argv[5 + two_disks];
-	hmac_type = argv[6 + two_disks];
-	secret_str = argv[7 + two_disks];
+	two_disks = strcmp(argv[1], argv[2]) ? 1 : 0;
+	hash_type = argv[5];
+	salt_str = argv[6];
+	hmac_type = argv[7];
+	secret_str = argv[8];
 
 	// Open destination device
 	int file, file2;
@@ -303,8 +308,8 @@ int main(int argc, char const *argv[]) {
 	}
 
 	// Get block size
-	if (sscanf(argv[2 + two_disks], "%u", &block_size) != 1) {
-		exit_error_f("Invalid block size: '%s'", argv[2 + two_disks]);
+	if (sscanf(argv[3], "%u", &block_size) != 1) {
+		exit_error_f("Invalid block size: '%s'", argv[3]);
 	}
 	if (block_size < 512) {
 		exit_error_f("Invalid block size: '%u' < 512", block_size);
@@ -434,6 +439,7 @@ int main(int argc, char const *argv[]) {
 	bzero(zero_block, block_size);
 
 	char buf[128];
+
 	// Data hash
 	hash(md_hash, mdctx_hash, zero_block, block_size, salt,
 		strlen(salt_str) / 2, hash_output, &hash_length);
@@ -613,13 +619,13 @@ int main(int argc, char const *argv[]) {
 
 	print_superblock(msb);
 	bytes_to_hex(msb->root, hash_bytes, buf);
-	printf("dmsetup create meow --table \"%u %ju mintegrity %s%s%s %u %u %u %ju "
-		"%s %s %s %s %s%s\"\n",
+	printf("dmsetup create meow --table \"%u %ju mintegrity %s %s %u %u %u %ju "
+		"%s %s %s %s %s%s %s\"\n",
 		0,             // Start is 0
 		data_blocks * (block_size / 512),   // Size of device given to device mapper
 		// Mintegrity options
 		dev,           // String of block device
-		two_disks ? " " : "", two_disks ? dev2 : "",
+		two_disks ? dev2 : dev,
 		block_size,    // Block size
 		hash_blocks,   // Number of hash blocks
 		jb_blocks,     // Number of journaling blocks
@@ -629,7 +635,8 @@ int main(int argc, char const *argv[]) {
 		salt_str,      // Salt
 		hmac_type,     // Hash type for hmac
 		secret_str,    // Hmac secret
-		zero ? "" : " lazy"
+		zero ? "nolazy" : " lazy",
+		full_journal ? "full" : "sector"
 		);
 
 	free(mjh);
