@@ -242,38 +242,42 @@ void hash(const EVP_MD *md, EVP_MD_CTX *mdctx, const char *input, size_t i,
 int main(int argc, char const *argv[]) {
 	// Check for arguments
 	if (argc < 8) {
-		exit_error_f("Usage: %s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT "
-					 "HMAC_TYPE SECRET [lazy]", argv[0]);
+		exit_error_f(
+			"Usage:\n"
+			"%s DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT HMAC_TYPE SECRET lazy|nolazy\n"
+			"%s MINT_DEV DATA_DEV BLOCK_SIZE JB_TRANSACTIONS HASH_TYPE SALT HMAC_TYPE SECRET lazy|nolazy\n",
+			argv[0], argv[0]);
 	}
-	const char *dev, *hash_type, *hmac_type, *salt_str, *secret_str;
+	const char *dev, *dev2, *hash_type, *hmac_type, *salt_str, *secret_str;
 	uint32_t block_size, journal_blocks;
 	bool zero;
 
-	if (argc == 9) {
-		if (!strcmp(argv[8], "lazy")) {
-			zero = false;
-		} else {
-			exit_error_f("Unsupported optional argument: %s", argv[8]);
-		}
-	} else {
+	if (!strcmp(argv[argc - 1], "lazy")) {
+		zero = false;
+	} else if (!strcmp(argv[argc - 1], "nolazy")) {
 		zero = true;
+	} else {
+		exit_error_f("Unsupported optional argument: %s", argv[argc - 1]);
 	}
 
+	bool two_disks = (argc == 10);
+
 	dev = argv[1];
-	hash_type = argv[4];
-	salt_str = argv[5];
-	hmac_type = argv[6];
-	secret_str = argv[7];
+	dev2 = argv[2];
+	hash_type = argv[4 + two_disks];
+	salt_str = argv[5 + two_disks];
+	hmac_type = argv[6 + two_disks];
+	secret_str = argv[7 + two_disks];
 
 	// Open destination device
-	int file;
+	int file, file2;
 	if ((file = open(dev, O_RDWR)) < 0) {
 		exit_error_f("Could not open: '%s' for writing, %s", dev, strerror(errno));
 	}
 
 	// Get size
 	// TODO: size of file in 512 chunks?
-	struct stat file_stats;
+	struct stat file_stats, file_stats2;
 	if (fstat(file, &file_stats) != 0) {
 		exit_error_f("Could not get file stats for: '%s', %s", dev, strerror(errno));
 	}
@@ -282,9 +286,25 @@ int main(int argc, char const *argv[]) {
 		exit_error_f("File is neither a regular file nor block device");
 	}
 
+	if (two_disks) {
+		if ((file2 = open(dev2, O_RDWR)) < 0) {
+			exit_error_f("Could not open: '%s' for writing, %s", dev2, strerror(errno));
+		}
+
+		// Get size
+		// TODO: size of file in 512 chunks?
+		if (fstat(file2, &file_stats2) != 0) {
+			exit_error_f("Could not get file stats for: '%s', %s", dev2, strerror(errno));
+		}
+
+		if (!(S_ISREG(file_stats2.st_mode) || S_ISBLK(file_stats2.st_mode))) {
+			exit_error_f("File is neither a regular file nor block device");
+		}
+	}
+
 	// Get block size
-	if (sscanf(argv[2], "%u", &block_size) != 1) {
-		exit_error_f("Invalid block size: '%s'", argv[2]);
+	if (sscanf(argv[2 + two_disks], "%u", &block_size) != 1) {
+		exit_error_f("Invalid block size: '%s'", argv[2 + two_disks]);
 	}
 	if (block_size < 512) {
 		exit_error_f("Invalid block size: '%u' < 512", block_size);
@@ -294,14 +314,16 @@ int main(int argc, char const *argv[]) {
 	if (S_ISREG(file_stats.st_mode) && file_stats.st_size % block_size != 0) {
 		warn("File is not a multiple of block_size: %d. %ju bytes left over",
 			block_size, file_stats.st_size % block_size);
-	} //else if(S_ISBLK(file_stats.st_mode)) 
-
-	// Number of journal transactions
-	if (sscanf(argv[3], "%u", &journal_blocks) != 1) {
-		exit_error_f("Invalid journal transaction number: '%s'", argv[3]);
 	}
-	if (journal_blocks < 35) {
-		exit_error_f("Journal block number has to be at least 35: %s", argv[3]);
+	if (two_disks && S_ISREG(file_stats2.st_mode)
+			&& file_stats2.st_size % block_size != 0) {
+		warn("File is not a multiple of block_size: %d. %ju bytes left over",
+			block_size, file_stats.st_size % block_size);
+	}
+
+	// Number of journal blocks
+	if (sscanf(argv[3 + two_disks], "%u", &journal_blocks) != 1) {
+		exit_error_f("Invalid journal blocks number: '%s'", argv[3 + two_disks]);
 	}
 
 	OpenSSL_add_all_digests();
@@ -351,7 +373,8 @@ int main(int argc, char const *argv[]) {
 	uint32_t pad_blocks = 0;
 	uint32_t *blocks_per_level = malloc(sizeof(uint32_t) * DM_MINTEGRITY_MAX_LEVELS);
 	uint32_t levels = 0;
-	uint64_t blocks;
+	uint64_t blocks, blocks2;
+
 	if (S_ISREG(file_stats.st_mode)) {
 		blocks = file_stats.st_size / block_size;
 	} else if (S_ISBLK(file_stats.st_mode)) {
@@ -359,6 +382,17 @@ int main(int argc, char const *argv[]) {
 			exit_error_f("ioctl for block size failed: %s", strerror(errno));
 		}
 		blocks = blocks / block_size;
+	}
+
+	if (two_disks) {
+		if (S_ISREG(file_stats2.st_mode)) {
+			blocks2 = file_stats2.st_size / block_size;
+		} else if (S_ISBLK(file_stats2.st_mode)) {
+			if(ioctl(file2, BLKGETSIZE64, &blocks2) != 0){
+				exit_error_f("ioctl for block size failed: %s", strerror(errno));
+			}
+			blocks2 = blocks2 / block_size;
+		}
 	}
 
 	// Fanout
@@ -374,20 +408,22 @@ int main(int argc, char const *argv[]) {
 	fanout = 1 << fls;
 
 	// Use up entire block device
-	compute_block_numbers(blocks, block_size, fanout, journal_blocks, &data_blocks,
-		&hash_blocks, &jb_blocks, &pad_blocks, &levels, blocks_per_level, hash_bytes);
+	if (!two_disks) {
+		compute_block_numbers(blocks, block_size, fanout, journal_blocks, &data_blocks,
+			&hash_blocks, &jb_blocks, &pad_blocks, &levels, blocks_per_level, hash_bytes);
+	} else {
+		jb_blocks = journal_blocks;
+		data_blocks = blocks2;
+		compute_hash_blocks(blocks2, fanout, &levels, &hash_blocks, blocks_per_level);
+		if (hash_blocks + journal_blocks > blocks2) {
+			exit_error_f("Need: %u hash + journal blocks, but %s only has %ju",
+				hash_blocks + journal_blocks, dev, blocks);
+		}
+	}
 	
 	// Result info
 	info("Blocks: %ju = Superblock: 1, Data: %ju, Hash: %u, JB: %u, Pad: %u, Levels: %u",
 			blocks, data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
-
-	// Sanity check
-	if (data_blocks + hash_blocks + jb_blocks + pad_blocks + 1!= blocks) {
-		warn("Data: %ju, Hash: %u, JB: %u, Pad: %u, Levels: %u",
-			data_blocks, hash_blocks, jb_blocks, pad_blocks, levels);
-		exit_error_f("Sanity check failed!: %ju != %ju",
-			data_blocks + hash_blocks + jb_blocks + pad_blocks + 1, blocks);
-	}
 
 	// Calculate each hash block level
 	char **hash_levels = (char**)malloc(sizeof(char*) * levels);
@@ -546,18 +582,19 @@ int main(int argc, char const *argv[]) {
 
 	// Zero out data
 	if (zero) {
+		int f = two_disks ? file2 : file;
 		bzero(big_block, block_size * multiple);
 		info("Writing data blocks...");
 		p = 0;
 		for (uint64_t i = 0; i < data_blocks / multiple; i++) {
-			if(write(file, big_block, block_size * multiple) < 0){
+			if(write(f, big_block, block_size * multiple) < 0){
 				exit_error_f("Failed to write data block: %ju, %s", i,
 					strerror(errno));
 			}
 			p = progress(i * multiple, data_blocks, 79, p);
 		}
 		for (uint64_t i = 0; i < data_blocks % multiple; i++) {
-			if(write(file, zero_block, block_size) < 0){
+			if(write(f, zero_block, block_size) < 0){
 				exit_error_f("Failed to write data block: %ju, %s", i,
 					strerror(errno));
 			}
@@ -569,14 +606,20 @@ int main(int argc, char const *argv[]) {
 		info("Skipping disk zeroing...");
 	}
 
+	close(file);
+	if (two_disks) {
+		close(file2);
+	}
+
 	print_superblock(msb);
 	bytes_to_hex(msb->root, hash_bytes, buf);
-	printf("dmsetup create meow --table \"%u %ju mintegrity %s %u %u %u %ju "
+	printf("dmsetup create meow --table \"%u %ju mintegrity %s%s%s %u %u %u %ju "
 		"%s %s %s %s %s%s\"\n",
 		0,             // Start is 0
 		data_blocks * (block_size / 512),   // Size of device given to device mapper
 		// Mintegrity options
 		dev,           // String of block device
+		two_disks ? " " : "", two_disks ? dev2 : "",
 		block_size,    // Block size
 		hash_blocks,   // Number of hash blocks
 		jb_blocks,     // Number of journaling blocks

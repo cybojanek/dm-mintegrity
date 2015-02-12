@@ -1,0 +1,8 @@
+CC = gcc
+CFLAGS = -Wall -g -MD -O2
+
+all: sha256
+
+sha256: sha256.o
+	$(CC) $(CFLAGS) -o sha256 $(<) sha256-avx2-asm.S
+
