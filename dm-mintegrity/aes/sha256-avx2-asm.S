@@ -56,7 +56,7 @@
 
 ################################ Define Macros
 
-# addm [mem], reg
+#addm [mem], reg
 # Add reg to mem using reg-mem add and store
 .macro addm p1 p2
 	add	\p1, \p2
@@ -573,7 +573,7 @@ loop0:
 
 	## Load first 16 dwords from two blocks
 	VMOVDQ	0*32(INP),XTMP0
-	VMOVDQ	1*32(INP),XTMP1
+	VMOVDQ  1*32(INP),XTMP1
 	VMOVDQ	2*32(INP),XTMP2
 	VMOVDQ	3*32(INP),XTMP3
 
