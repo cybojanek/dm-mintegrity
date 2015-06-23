@@ -25,6 +25,8 @@
 #include <linux/jiffies.h>
 #include <linux/rbtree.h>
 
+#include <asm/smp.h>
+
 #define DM_MSG_PREFIX			"mintegrity"
 
 #define DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE	262144
@@ -261,6 +263,16 @@ struct dm_mintegrity_io {
 	 */
 }__attribute__((aligned(8)));
 
+/*
+ * Test if node is not in any list
+ */
+static inline bool node_not_in_list(struct list_head *node)
+{
+	return (node->next == NULL) || (node->prev == NULL)
+		|| (node->next == LIST_POISON1) || (node->prev == LIST_POISON2)
+		|| list_empty(node);
+}
+
 
 /* Search tree for sector block - assumes exclusive access
  */
@@ -312,7 +324,7 @@ static inline void block_release(struct data_block *d)
 	if ((ref_count = atomic_dec_return(&d->ref_count)) == 0 && !d->dirty) {
 		list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
-	} else if (ref_count == 0 && list_empty(&d->list)) {
+	} else if (ref_count == 0 && node_not_in_list(&d->list)) {
 		// Last one holding onto it, its dirty, and its not in the dirty list
 		struct list_head *list;
 		struct mutex *list_lock;
@@ -364,6 +376,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		dev = v->dev->bdev;
 	}
 
+	mutex_lock(&v->block_list_clean_lock);
 	mutex_lock(list_lock);
 
 	// TODO: sort this?
@@ -395,6 +408,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	}
 
 	mutex_unlock(list_lock);
+	mutex_unlock(&v->block_list_clean_lock);
 
 	if (flush) {
 		blkdev_issue_flush(dev, GFP_KERNEL, NULL);
@@ -532,6 +546,7 @@ static void delete_all_blocks(struct dm_mintegrity *v) {
 	list_for_each_safe(pos, n, list) {
 		d = container_of(pos, struct data_block, list);
 		d->type = TYPE_EMPTY;
+		BUG_ON(1);
 		list_del(&d->list);
 		list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
@@ -1515,7 +1530,8 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			// Retry once in case of write race condition
 			if (ACCESS_ONCE(d->verified)) {
-				return 0;
+				// FIXME: should we just cast the data_block?
+				goto normal_return;
 			}
 			memcpy(io_want_digest(v, io), io->previous_hash, v->digest_size);
 			r = mintegrity_buffer_hash(io, d->data, v->dev_block_bytes);
@@ -1539,6 +1555,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 	memcpy(io_want_digest(v, io), d->data + offset, v->digest_size);
 	io->previous_hash = d->data + offset;
 
+normal_return:
 	// Return back the whole block we read and verified
 	if (dmb) {
 		*dmb = d;
