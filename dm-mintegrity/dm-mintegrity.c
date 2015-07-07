@@ -321,7 +321,13 @@ static inline void block_release(struct data_block *d)
 	int ref_count;
 	struct dm_mintegrity *v = d->v;
 	mutex_lock(&v->block_list_clean_lock);
-	if ((ref_count = atomic_dec_return(&d->ref_count)) == 0 && !d->dirty) {
+	ref_count = atomic_dec_return(&d->ref_count);
+	if (ref_count < 0) {
+		printk(KERN_ERR "%s %d: sector %lu ref_count %d writers %d type %d dirty %d verified %d\n",
+			__FILE__, __LINE__, d->sector, ref_count, atomic_read(&d->writers), d->type, d->dirty, d->verified);
+	}
+	BUG_ON(ref_count < 0);
+	if (ref_count == 0 && !d->dirty) {
 		list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
 	} else if (ref_count == 0 && node_not_in_list(&d->list)) {
@@ -357,6 +363,28 @@ static void block_end_io(struct bio *bio, int error)
 	// block_release(d);
 }
 
+static void block_dirty_end_io(struct bio *bio, int error)
+{
+	struct data_block *d = bio->bi_private;
+	struct dm_mintegrity *v = d->v;
+	struct mutex *lock;
+	complete_all(&d->event);
+	d->dirty = false;
+
+	BUG_ON(v == NULL);
+	lock = (d->type == TYPE_DATA) ? &v->block_list_data_dirty_lock : &v->block_list_hash_dirty_lock;
+
+	mutex_lock(&v->block_list_clean_lock);
+	mutex_lock(lock);
+
+	list_del(&d->list);
+	list_add_tail(&d->list, &v->block_list_clean);
+	atomic_inc(&v->block_tokens);
+
+	mutex_unlock(lock);
+	mutex_unlock(&v->block_list_clean_lock);
+}
+
 static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 {
 	struct data_block *d;
@@ -385,6 +413,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		struct bio *bio;
 
 		d = container_of(pos, struct data_block, list);
+		BUG_ON(atomic_read(&d->ref_count) != 0);
 		list_del(&d->list);
 		init_completion(&d->event);
 
@@ -471,6 +500,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		d->sector = sector;
 		d->type = data_block ? TYPE_DATA : TYPE_HASH;
 		INIT_LIST_HEAD(&d->list);
+		BUG_ON(atomic_read(&d->ref_count) != 0);
 		atomic_set(&d->ref_count, 1);
 		init_completion(&d->event);
 		init_rwsem(&d->lock);
@@ -504,14 +534,30 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			return NULL;
 		}
 	} else if (d && !prefetch) {
+		int ref_count = atomic_inc_return(&d->ref_count);
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 4);
+		if (ref_count == 1 && d->dirty && !node_not_in_list(&d->list)) {
+			//printk(KERN_CRIT "%s %d %s: sector %llu flags %x\n",
+			//	__FILE__, __LINE__, __func__, sector, flags);
+			struct mutex *lock;
+			if (d->type == TYPE_HASH)
+				lock = &v->block_list_hash_dirty_lock;
+			else
+				lock = &v->block_list_data_dirty_lock;
+
+			mutex_lock(lock);
+			list_del(&d->list);
+			INIT_LIST_HEAD(&d->list);
+			mutex_unlock(lock);
+		}
 
 		// Its in our buffer, its not a prefetch, so reuse it
 		mutex_lock(&v->block_list_clean_lock);
-		if (atomic_inc_return(&d->ref_count) == 1 && !d->dirty) {
+		if (ref_count == 1 && !d->dirty) {
 			// we're the first to get it and its clean, so we need to move it
 			// out of the free list
 			list_del(&d->list);
+			INIT_LIST_HEAD(&d->list);
 			*tokens -= 1;
 		}
 		mutex_unlock(&v->block_list_clean_lock);
@@ -1552,10 +1598,10 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		d->verified = true;
 	}
 
+normal_return:
 	memcpy(io_want_digest(v, io), d->data + offset, v->digest_size);
 	io->previous_hash = d->data + offset;
 
-normal_return:
 	// Return back the whole block we read and verified
 	if (dmb) {
 		*dmb = d;
@@ -1597,7 +1643,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 			 * First, we try to get the requested hash for
 			 * the current block. If the hash block itself is
 			 * verified, zero is returned. If it isn't, this
-			 * function returns 0 and we fall back to whole
+			 * function returns non-0 and we fall back to whole
 			 * chain verification.
 			 */
 			tokens = 1;
@@ -1634,7 +1680,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 		}
 		mintegrity_return_memory_tokens(v, tokens);
 
-	test_block_hash:
+test_block_hash:
 		desc = io_hash_desc(v, io);
 		desc->tfm = v->tfm;
 		desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
@@ -1716,10 +1762,11 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 				goto release_ret_r;
 			}
 		}
-	}
-	if (!skip_chain) {
-		for (i = v->levels - 1; i >= 0; i--) {
-			block_release(dm_buffers[i]);
+
+		if (!skip_chain) {
+			for (i = v->levels - 1; i >= 0; i--) {
+				block_release(dm_buffers[i]);
+			}
 		}
 	}
 
@@ -2662,6 +2709,25 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	v->created = 1;
 	barrier();
+        printk(KERN_DEBUG "dm-mintegrity init:\n"                                                                      
+                        "\thash_start = %lu\n"                                                                         
+                        "\tjournal_start = %lu\n"
+                        "\tdata_start = %lu\n"
+                        "\tdata_start_shift = %lu\n"
+                        "\thash_blocks = %lu\n"                                                                        
+                        "\tjournal_blocks = %lu\n"
+                        "\tdata_blocks = %lu\n"
+                        "\tlevels = %u\n",                                                                             
+                        v->hash_start, 
+                        v->journal_start,                                                                              
+                        v->data_start,                                                                                 
+                        v->data_start_shift,
+                        v->hash_blocks,                                                                                
+                        v->journal_blocks,                                                                             
+                        v->data_blocks,                                                                                
+                        v->levels); 
+	for (i = v->levels-1; i >= 0; i--)
+		printk(KERN_DEBUG "\tlevel[%d] = %lu\n", i, v->hash_level_block[i]);
 	return 0;
 
 bad:
