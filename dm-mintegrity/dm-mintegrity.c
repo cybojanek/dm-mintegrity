@@ -2132,35 +2132,74 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			// FIXME: multiple block support
 			struct data_block *b;
 			int tokens = 1;
-			// printk(KERN_CRIT "Start map read...\n");
-			mintegrity_get_memory_tokens(v, tokens);
-			b = block_get(v, io->block + v->data_start, BLOCK_MEMORY, &tokens);
-			mintegrity_return_memory_tokens(v, tokens);
-			if (b) {
-				unsigned int todo = v->dev_block_bytes;
-				unsigned long flags;
-				struct bio_vec bv;
-				struct bvec_iter iter;
-				bio_for_each_segment(bv, bio, iter) {
-					char *data = bvec_kmap_irq(&bv, &flags);
-					memcpy(data, b->data + v->dev_block_bytes - todo, bv.bv_len);
-					flush_dcache_page(bv.bv_page);
-					bvec_kunmap_irq(data, &flags);
-				}
+			bool all_in_memory = true;
+			sector_t block_idx = 0;
+			struct bio *split = NULL;
 
-				block_release(b);
+			// last block state
+			// 0: no last block
+			// 1: last block in buffer
+			// 2: last block not in buffer
+			int last_block = 0;
+
+			// printk(KERN_CRIT "Start map read...\n");
+			for (block_idx = 0; block_idx < io->n_blocks; block_idx += 1) {
+				tokens = 1;
+				mintegrity_get_memory_tokens(v, tokens);
+				b = block_get(v, io->block + block_idx + v->data_start, BLOCK_MEMORY, &tokens);
+				mintegrity_return_memory_tokens(v, tokens);
+				if (b) {
+					unsigned int todo = v->dev_block_bytes;
+					unsigned int copied = 0;
+					unsigned long flags;
+					struct bio_vec bv;
+					struct bvec_iter iter;
+					bio_for_each_segment(bv, bio, iter) {
+						BUG_ON(bv.bv_len > todo);
+						char *data = bvec_kmap_irq(&bv, &flags);
+						memcpy(data, b->data + v->dev_block_bytes - todo, bv.bv_len);
+						flush_dcache_page(bv.bv_page);
+						bvec_kunmap_irq(data, &flags);
+
+						copied += bv.bv_len;
+						todo -= copied;
+						if (todo == 0)
+							break;
+					}
+
+					bio_advance_iter(bio, &bio->bi_iter, copied);
+
+					block_release(b);
+					last_block = 1;
+				} else {
+					int split_sectors = min(1 << (v->dev_block_bits - SECTOR_SHIFT), (int)bio_sectors(bio));;
+					// Send out read request
+					if (all_in_memory) {
+						all_in_memory = false;
+						bio->bi_iter.bi_sector = bio->bi_iter.bi_sector
+							+ (v->data_start << (v->dev_block_bits - SECTOR_SHIFT));
+
+						io->orig_bi_end_io = bio->bi_end_io;
+						io->orig_bi_private = bio->bi_private;
+						bio->bi_end_io = mintegrity_read_end_io;
+						bio->bi_private = io;
+					}
+
+					if (split_sectors == bio_sectors(bio)) {
+						generic_make_request(bio);
+					} else {
+						split = bio_split(bio, split_sectors, GFP_NOIO, fs_bio_set);
+						bio_chain(split, bio);
+						generic_make_request(split);
+					}
+					last_block = 2;
+				}
+			}
+
+			if (all_in_memory) {
+				// got all pages from buffer, finalize read request
 				up(&v->request_limit);
 				bio_endio(bio, 0);
-			} else {
-				// Send out read request
-				bio->bi_iter.bi_sector = bio->bi_iter.bi_sector
-					+ (v->data_start << (v->dev_block_bits - SECTOR_SHIFT));
-
-				io->orig_bi_end_io = bio->bi_end_io;
-				io->orig_bi_private = bio->bi_private;
-				bio->bi_end_io = mintegrity_read_end_io;
-				bio->bi_private = io;
-				generic_make_request(bio);
 			}
 			// printk(KERN_CRIT "End map read...\n");
 		}
@@ -2709,23 +2748,29 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	v->created = 1;
 	barrier();
-        printk(KERN_DEBUG "dm-mintegrity init:\n"                                                                      
-                        "\thash_start = %lu\n"                                                                         
+        printk(KERN_DEBUG "dm-mintegrity init:\n"
+                        "\thash_start = %lu\n"
                         "\tjournal_start = %lu\n"
                         "\tdata_start = %lu\n"
                         "\tdata_start_shift = %lu\n"
-                        "\thash_blocks = %lu\n"                                                                        
+                        "\thash_blocks = %lu\n"
                         "\tjournal_blocks = %lu\n"
                         "\tdata_blocks = %lu\n"
-                        "\tlevels = %u\n",                                                                             
-                        v->hash_start, 
-                        v->journal_start,                                                                              
-                        v->data_start,                                                                                 
+			"\tdev_block_bits = %u\n"
+			"\thash_per_block_bits = %u\n"
+			"\tdev_block_bytes = %u\n"
+                        "\tlevels = %u\n",
+                        v->hash_start,
+                        v->journal_start,
+                        v->data_start,
                         v->data_start_shift,
-                        v->hash_blocks,                                                                                
-                        v->journal_blocks,                                                                             
-                        v->data_blocks,                                                                                
-                        v->levels); 
+                        v->hash_blocks,
+                        v->journal_blocks,
+                        v->data_blocks,
+			v->dev_block_bits,
+			v->hash_per_block_bits,
+			v->dev_block_bytes,
+                        v->levels);
 	for (i = v->levels-1; i >= 0; i--)
 		printk(KERN_DEBUG "\tlevel[%d] = %lu\n", i, v->hash_level_block[i]);
 	return 0;
