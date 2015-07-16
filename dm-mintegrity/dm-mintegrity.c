@@ -2135,6 +2135,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			bool all_in_memory = true;
 			sector_t block_idx = 0;
 			struct bio *split = NULL;
+			int split_sectors = 0;
 
 			// last block state
 			// 0: no last block
@@ -2154,6 +2155,15 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 					unsigned long flags;
 					struct bio_vec bv;
 					struct bvec_iter iter;
+
+					if (last_block == 2) {
+						split = bio_split(bio, split_sectors, GFP_NOIO, fs_bio_set);
+						bio_chain(split, bio);
+						generic_make_request(split);
+						split = NULL;
+						split_sectors = 0;
+					}
+
 					bio_for_each_segment(bv, bio, iter) {
 						BUG_ON(bv.bv_len > todo);
 						char *data = bvec_kmap_irq(&bv, &flags);
@@ -2171,8 +2181,9 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 					block_release(b);
 					last_block = 1;
+
 				} else {
-					int split_sectors = min(1 << (v->dev_block_bits - SECTOR_SHIFT), (int)bio_sectors(bio));;
+					split_sectors += min(1 << (v->dev_block_bits - SECTOR_SHIFT), (int)bio_sectors(bio));;
 					// Send out read request
 					if (all_in_memory) {
 						all_in_memory = false;
@@ -2186,18 +2197,15 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 					}
 
 					if (split_sectors == bio_sectors(bio)) {
+						// last block, directly send down
 						generic_make_request(bio);
-					} else {
-						split = bio_split(bio, split_sectors, GFP_NOIO, fs_bio_set);
-						bio_chain(split, bio);
-						generic_make_request(split);
 					}
 					last_block = 2;
 				}
 			}
 
-			if (all_in_memory) {
-				// got all pages from buffer, finalize read request
+			if (all_in_memory || last_block == 1) {
+				// got all pages from buffer, or last block is from buffer, finalize read request
 				up(&v->request_limit);
 				bio_endio(bio, 0);
 			}
