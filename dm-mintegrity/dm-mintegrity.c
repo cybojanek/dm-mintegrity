@@ -1023,6 +1023,7 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 		cpu_to_le32(sector >> 32),
 		0
 	};
+	int hpb = v->dev_block_bytes / (2 * v->digest_size);
 
 	if (likely(data_buffers)) {
 		for (i = 0; i < v->levels; i++) {
@@ -1031,7 +1032,7 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 		}
 	}
 
-	if (unlikely(!memcmp(journal_buffer->data + (v->dev_block_bytes * which),
+	if (unlikely(v->full_journal && !memcmp(journal_buffer->data + (v->dev_block_bytes * which),
 			magic, 4))) {
 		tag.options |= 2;
 		memset(journal_buffer->data + (v->dev_block_bytes * which), 0, 4);
@@ -2664,6 +2665,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		ti->error = "Invalid optional argument";
 		r = -EINVAL;
 		goto bad;
+	} else {
+		v->full_journal = false;
 	}
 
 	// Compute start of each hash level
