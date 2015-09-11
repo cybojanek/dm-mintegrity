@@ -23,15 +23,24 @@
 #include <linux/delay.h>
 #include <linux/time.h>
 #include <linux/jiffies.h>
-#include <linux/rbtree.h>
+#include <linux/rbtree_augmented.h>
+#include <linux/radix-tree.h>
+#include <linux/gfp.h>
 
 #include <asm/smp.h>
+
+#define USE_RADIX 1
+#define CHECKPOINT 1
+#define DEBUG 0
 
 #define DM_MSG_PREFIX			"mintegrity"
 
 #define DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE	262144
-#define DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT 16384
+#define DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT 	32768
 #define DM_MINTEGRITY_MAX_LEVELS		63
+#define DM_MINTEGRITY_BLOCK_TOKENS		131072
+
+//16384 32768 65536 131072 
 
 static unsigned dm_mintegrity_prefetch_cluster = DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE;
 
@@ -71,6 +80,43 @@ module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRU
 // #define DEBUG_DONT_USE_JOURNAL
 // #define DEBUG_DONT_USE_JOURNALT_MARK_MERKLE_DIRTY
 // #define DEBUG_SKIP_WRITE_HASH_UPDATE
+
+
+#if DEBUG
+static int dump_once = 0;
+static uint64_t search_counter = 0;
+static uint64_t search_hash_counter = 0;
+static uint64_t search_data_counter = 0;
+static uint64_t search_found_counter = 0;
+static uint64_t tree_insert_counter = 0;
+static uint64_t clean_counter = 0;
+static uint64_t data_dirty_counter = 0;
+static uint64_t hash_dirty_counter = 0;
+static uint64_t bio_add_page_counter = 0;
+static uint64_t block_get_counter = 0;
+static uint64_t tree_delete_counter = 0;
+static uint64_t compute_hash_counter = 0;
+static uint64_t compute_hmac_counter = 0;
+static uint64_t journal_release_counter = 0;
+static uint64_t journal_write_complete_counter = 0;
+static uint64_t journal_commit_counter = 0;
+static uint64_t journal_checkpoint_counter = 0;
+static uint64_t verify_level_counter = 0;
+static uint64_t prefetch_counter = 0;
+static uint64_t tree_delete_empty_counter = 0;
+static uint64_t tree_delete_hash_counter = 0;
+static uint64_t tree_delete_data_counter = 0;
+static uint64_t tree_delete_journal_counter = 0;
+static uint64_t bio_add_page_read_counter = 0;
+static uint64_t bio_add_page_write_counter = 0;
+static uint64_t tree_insert_empty_counter = 0;
+static uint64_t tree_insert_hash_counter = 0;
+static uint64_t tree_insert_data_counter = 0;
+static uint64_t tree_insert_journal_counter = 0;
+static uint64_t total_tree_nodes = 0;
+#endif
+static uint64_t token_counter = 0;
+static uint64_t checkpoint_work_counter = 0;
 
 struct mint_journal_header {
 	uint32_t magic;     /* 0x594c494c */
@@ -115,8 +161,9 @@ struct data_block {
 	struct dm_mintegrity *v;
 
 	struct list_head list;
+#if !USE_RADIX
 	struct rb_node node;
-
+#endif
 	uint8_t *data;
 	sector_t sector;
 
@@ -211,7 +258,11 @@ struct dm_mintegrity {
 	sector_t hash_level_block[DM_MINTEGRITY_MAX_LEVELS];
 
 	// Block cache data structures
+#if USE_RADIX
+	struct radix_tree_root block_tree_root;
+#else
 	struct rb_root block_tree_root;
+#endif
 	struct list_head block_list_clean;
 	struct list_head block_list_hash_dirty;
 	struct list_head block_list_data_dirty;
@@ -230,6 +281,9 @@ struct dm_mintegrity {
 	int num_hash_nodes;
 	bool two_disks;
 	bool full_journal;
+#if CHECKPOINT
+	struct delayed_work delayed_work;  /* Work instance for commit and checkpointing */
+#endif
 };
 
 struct dm_mintegrity_io {
@@ -274,11 +328,87 @@ static inline bool node_not_in_list(struct list_head *node)
 }
 
 
+
+
+#if USE_RADIX
+
+static inline struct data_block *tree_search(struct radix_tree_root *root, sector_t sector)
+{
+	struct data_block *data = (struct data_block *)radix_tree_lookup(root, (unsigned long)sector);
+	return data;
+}
+
+static inline int tree_insert(struct radix_tree_root *root, struct data_block *data)
+{
+	int r;
+	if((r = radix_tree_insert(root, data->sector, data)) == -EEXIST)
+	{
+		radix_tree_delete(root, data->sector);
+		r = radix_tree_insert(root, data->sector, data);
+	}
+	return r;
+}
+
+static inline int tree_delete(struct radix_tree_root *root, struct data_block *data)
+{
+       return (radix_tree_delete(root, data->sector) != NULL);
+}
+
+#else /*USE_RADIX*/
+
+#if DEBUG
+/* Dump tree for sector block - assumes exclusive access
+ */
+static inline void tree_dump(struct rb_node *node, int level)
+{
+        if(node)
+        {
+                struct data_block *data = container_of(node, struct data_block, node);
+                char *ty = "";
+                total_tree_nodes++;
+		if(data)
+		{
+                	switch(data->type)
+        	        {
+	                        case TYPE_EMPTY:
+                        	        ty = "Empty";
+                	                break;
+        	                case TYPE_HASH:
+	                                ty = "Hash";
+                        	        break;
+                	        case TYPE_DATA:
+        	                        ty = "Data";
+	                                break;
+	                        case TYPE_JOURNAL:
+                        	        ty = "Journal";
+                	                break;
+        	        }
+	                printk(KERN_ERR "Tree node at level %d is of type %s and sector number %d\n", level, ty, data->sector);
+		}
+		else
+		{
+			printk(KERN_ERR "Tree node at level %d is NULL\n", level);
+		}
+                printk(KERN_ERR "Left Tree child of level %d:\n",level);
+                tree_dump(node->rb_left, level+1);
+                printk(KERN_ERR "Right Tree child of level %d:\n",level);
+                tree_dump(node->rb_right, level+1);
+        }
+}
+#endif
+
+
 /* Search tree for sector block - assumes exclusive access
  */
 static inline struct data_block *tree_search(struct rb_root *root, sector_t sector)
 {
 	struct rb_node *node = root->rb_node;
+	int while_counter=0;
+#if DEBUG
+	search_counter++;
+#endif
+
+
 	while (node) {
 		struct data_block *data = container_of(node, struct data_block, node);
 		if (sector < data->sector) {
@@ -286,11 +416,35 @@ static inline struct data_block *tree_search(struct rb_root *root, sector_t sect
 		} else if (sector > data->sector) {
 			node = node->rb_right;
 		} else {
+#if DEBUG
+//			printk(KERN_ERR "Search counter is %llu. The while counter is %d.\n",search_counter, while_counter);
+			search_found_counter++;
+			if(data->type == TYPE_DATA)
+				search_data_counter++;
+			else if(data->type == TYPE_HASH)
+				search_hash_counter++;
+#endif
 			return data;
 		}
+#if DEBUG
+		while_counter++;
+#endif
 	}
+#if DEBUG
+#if 0
+                        if(while_counter >= 27)
+			{
+				total_tree_nodes=0;
+                                tree_dump(root->rb_node, 1);
+				printk(KERN_ERR "Search Not found. The while counter is %d. Total nodes in the tree are %llu\n", while_counter,total_tree_nodes);
+				total_tree_nodes=0;
+			}
+#endif
+//                        printk(KERN_ERR "Search Not found. The while counter is %d. Total nodes in the tree are %llu\n", while_counter, tree_insert_counter-tree_delete_counter);
+#endif
 	return NULL;
 }
+
 
 /* Insert sector block into tree - assumes exclusive access
  */
@@ -298,6 +452,31 @@ static inline int tree_insert(struct rb_root *root, struct data_block *data)
 {
 	struct rb_node **node = &(root->rb_node), *parent = NULL;
 
+#if DEBUG
+			tree_insert_counter++;
+		char *ty = "";
+                switch(data->type)
+                {
+                        case TYPE_EMPTY:
+                                tree_insert_empty_counter++;
+                                ty = "Empty";
+				break;
+                        case TYPE_HASH:
+                                tree_insert_hash_counter++;
+                                ty = "Hash";
+				break;
+                        case TYPE_DATA:
+                                tree_insert_data_counter++;
+                                ty = "Data";
+                                break;
+                        case TYPE_JOURNAL:
+                                tree_insert_journal_counter++;
+                                ty = "Journal";
+                                break;
+                }
+
+//                printk(KERN_ERR "Tree insert counter is %llu. Inserted node of type %s\n",tree_insert_counter,ty);
+#endif                  
 	while (*node) {
 		struct data_block *this = container_of(*node, struct data_block, node);
 		parent = *node;
@@ -314,6 +493,7 @@ static inline int tree_insert(struct rb_root *root, struct data_block *data)
 	return 1;
 }
 
+#endif /*USE_RADIX*/
 /* Release block
  */
 static inline void block_release(struct data_block *d)
@@ -328,6 +508,15 @@ static inline void block_release(struct data_block *d)
 	}
 	BUG_ON(ref_count < 0);
 	if (ref_count == 0 && !d->dirty) {
+#if DEBUG
+                        clean_counter++;
+#endif
+#if DEBUG
+//                tree_delete_counter++;
+#endif
+//		mutex_lock(&v->block_tree_lock);
+//		rb_erase(&d->node, &v->block_tree_root);
+//		mutex_unlock(&v->block_tree_lock);
 		list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
 	} else if (ref_count == 0 && node_not_in_list(&d->list)) {
@@ -338,9 +527,16 @@ static inline void block_release(struct data_block *d)
 		if (d->type == TYPE_DATA) {
 			list = &v->block_list_data_dirty;
 			list_lock = &v->block_list_data_dirty_lock;
+#if DEBUG
+                        data_dirty_counter++;
+#endif
+
 		} else {
 			list = &v->block_list_hash_dirty;
 			list_lock = &v->block_list_hash_dirty_lock;
+#if DEBUG
+                        hash_dirty_counter++;
+#endif
 		}
 
 		mutex_lock(list_lock);
@@ -377,6 +573,19 @@ static void block_dirty_end_io(struct bio *bio, int error)
 	mutex_lock(&v->block_list_clean_lock);
 	mutex_lock(lock);
 
+#if DEBUG
+                        clean_counter++;
+                        printk("Release clean counter is %d.\n",clean_counter);
+			data_dirty_counter--;
+                        printk("Release data dirty counter is %d.\n",data_dirty_counter);
+#endif
+#if DEBUG
+//                tree_delete_counter++;
+#endif
+	
+//	mutex_lock(&v->block_tree_lock);
+//	rb_erase(&d->node, &v->block_tree_root);
+//	mutex_unlock(&v->block_tree_lock);
 	list_del(&d->list);
 	list_add_tail(&d->list, &v->block_list_clean);
 	atomic_inc(&v->block_tokens);
@@ -392,16 +601,22 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	struct list_head *list;
 	struct mutex *list_lock;
 	struct block_device *dev;
-
+	uint64_t *counter;
 	// Get list, and locks
 	if (data) {
 		list = &v->block_list_data_dirty;
 		list_lock = &v->block_list_data_dirty_lock;
 		dev = (v->data_dev) ? v->data_dev->bdev : v->dev->bdev;
+#if DEBUG
+		counter = &data_dirty_counter;
+#endif
 	} else {
 		list = &v->block_list_hash_dirty;
 		list_lock = &v->block_list_hash_dirty_lock;
 		dev = v->dev->bdev;
+#if DEBUG
+                counter = &hash_dirty_counter;
+#endif
 	}
 
 	mutex_lock(&v->block_list_clean_lock);
@@ -416,6 +631,10 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		BUG_ON(atomic_read(&d->ref_count) != 0);
 		list_del(&d->list);
 		init_completion(&d->event);
+#if DEBUG
+                (*counter)--;
+		clean_counter++;
+#endif
 
 		list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
@@ -433,6 +652,9 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		bio->bi_end_io = block_end_io;
 		bio->bi_private = d;
 		bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
+#if DEBUG
+                bio_add_page_write_counter += v->dev_block_bytes;
+#endif
 		generic_make_request(bio);
 	}
 
@@ -443,6 +665,8 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		blkdev_issue_flush(dev, GFP_KERNEL, NULL);
 	}
 }
+
+static inline void dummy_rotate(struct rb_node *old, struct rb_node *new) {}
 
 /** Get a block of data, with absolute physical disk sector
  * Flags:
@@ -466,11 +690,18 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	bool data_block = (flags & BLOCK_DATA) == BLOCK_DATA;
 
 	// printk(KERN_CRIT "block_get start: %ld, %d, %d\n", sector, flags, *tokens);
+#if DEBUG
+                block_get_counter++;
+#endif
 
 	// Lock
 	mutex_lock(&v->block_tree_lock);
 
-	d = tree_search(&v->block_tree_root, sector);
+//	if(!data_block)
+//
+		d = tree_search(&v->block_tree_root, sector);
+//	else
+//		d = NULL;
 	if (!d && !memory_only) {
 		// Not here, and we need to allocate it
 		uint8_t *data;
@@ -479,7 +710,15 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		// Get a clean buffer
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 1);
 		mutex_lock(&v->block_list_clean_lock);
+
+#if DEBUG
+                BUG_ON(list_empty(v->block_list_clean.next) != 0);
+#endif
+
 		d = list_entry(v->block_list_clean.next, struct data_block, list);
+#if DEBUG
+                clean_counter--;
+#endif
 		list_del(&d->list);
 		mutex_unlock(&v->block_list_clean_lock);
 
@@ -488,7 +727,36 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 		// If its part of the tree, we need to remove it
 		if (d->type != TYPE_EMPTY) {
-			rb_erase(&d->node, &v->block_tree_root);
+#if USE_RADIX
+		tree_delete(&v->block_tree_root, d);
+#else
+		rb_erase(&d->node, &v->block_tree_root);
+#endif
+
+#if DEBUG
+                tree_delete_counter++;
+		char *ty;
+		switch(d->type)
+		{
+			case TYPE_EMPTY:
+				tree_delete_empty_counter++;
+				ty = "Empty";
+				break;
+			case TYPE_HASH:
+                                tree_delete_hash_counter++;
+                                ty = "Hash";
+                                break;
+			case TYPE_DATA:
+                                tree_delete_data_counter++;
+                                ty = "Data";
+                                break;
+			case TYPE_JOURNAL:
+                                tree_delete_journal_counter++;
+                                ty = "Journal";
+                                break;
+		}
+//		printk("Deleting node of type %s.\n", ty);
+#endif
 		}
 
 		// Store data pointer, for easier zeroization
@@ -504,7 +772,8 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		atomic_set(&d->ref_count, 1);
 		init_completion(&d->event);
 		init_rwsem(&d->lock);
-		tree_insert(&v->block_tree_root, d);
+//		if(!data_block)
+			tree_insert(&v->block_tree_root, d);
 
 		// Set up bio
 		// Only send it out if its a read
@@ -520,6 +789,10 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			bio->bi_end_io = block_end_io;
 			bio->bi_private = d;
 			bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
+#if DEBUG
+                bio_add_page_read_counter+=v->dev_block_bytes;
+#endif
+
 			generic_make_request(bio);
 		} else {
 			// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 3);
@@ -541,9 +814,19 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			//	__FILE__, __LINE__, __func__, sector, flags);
 			struct mutex *lock;
 			if (d->type == TYPE_HASH)
+{
 				lock = &v->block_list_hash_dirty_lock;
+#if DEBUG
+		                hash_dirty_counter--;
+#endif
+}
 			else
+{
 				lock = &v->block_list_data_dirty_lock;
+#if DEBUG
+		                data_dirty_counter--;
+#endif
+}
 
 			mutex_lock(lock);
 			list_del(&d->list);
@@ -559,6 +842,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			list_del(&d->list);
 			INIT_LIST_HEAD(&d->list);
 			*tokens -= 1;
+#if DEBUG
+	                clean_counter--;
+#endif
 		}
 		mutex_unlock(&v->block_list_clean_lock);
 	}
@@ -595,6 +881,11 @@ static void delete_all_blocks(struct dm_mintegrity *v) {
 		BUG_ON(1);
 		list_del(&d->list);
 		list_add_tail(&d->list, &v->block_list_clean);
+#if DEBUG
+                clean_counter++;
+		hash_dirty_counter--;
+#endif
+//		rb_erase(&d->node, &v->block_tree_root);
 		atomic_inc(&v->block_tokens);
 	}
 
@@ -604,6 +895,14 @@ static void delete_all_blocks(struct dm_mintegrity *v) {
 		d->type = TYPE_EMPTY;
 		list_del(&d->list);
 		list_add_tail(&d->list, &v->block_list_clean);
+#if DEBUG
+                clean_counter++;
+                data_dirty_counter--;
+#endif
+#if DEBUG
+//                tree_delete_counter++;
+#endif
+//		rb_erase(&d->node, &v->block_tree_root);
 		atomic_inc(&v->block_tokens);
 	}
 
@@ -613,14 +912,28 @@ static void delete_all_blocks(struct dm_mintegrity *v) {
 	// INIT_LIST_HEAD(&v->block_list_data_dirty);
 
 	// down_write(&v->hash_tree_semaphore);
+
+#if USE_RADIX
+	void **slot;
+	struct radix_tree_iter iter;
+
+	radix_tree_for_each_slot(slot, &v->block_tree_root, &iter, 0)
+	{
+		d = (struct data_block *) *slot;
+		d->type = TYPE_EMPTY;
+	}
+#else
 	node = rb_first(&v->block_tree_root);
 	while (node) {
 		d = container_of(node, struct data_block, node);
 		d->type = TYPE_EMPTY;
-		rb_erase(node, &v->block_tree_root);
+//		rb_erase(node, &v->block_tree_root);
+#if DEBUG
+//                tree_delete_counter++;
+#endif
 		node = rb_first(&v->block_tree_root);
 	}
-
+#endif
 		// wait_for_completion(&data->event);
 	// 	mempool_free(data->data, v->data_page_mempool);
 	// 	mempool_free(data, v->data_block_mempool);
@@ -729,6 +1042,9 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
 	desc = io_hash_desc(v, io);
 	desc->tfm = v->tfm;
 	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+#if DEBUG
+        compute_hash_counter++;
+#endif
 
 	r = crypto_shash_init(desc);
 	if (unlikely(r)) {
@@ -765,6 +1081,10 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
 static int mintegrity_hmac_hash(struct dm_mintegrity *v)
 {
 	int r = crypto_shash_setkey(v->hmac_tfm, v->secret, v->secret_size);
+#if DEBUG
+        compute_hmac_counter++;
+#endif
+
 	if (unlikely(r)) {
 		DMERR("crypto_shash_setkey failed: %d", r);
 		return r;
@@ -795,6 +1115,10 @@ static void mintegrity_journal_release(struct journal_block *j)
 {
 	struct dm_mintegrity *v = j->v;
 
+#if DEBUG
+        journal_release_counter++;
+#endif
+
 	// Return data
 	mempool_free(j->data, v->journal_page_mempool);
 	memset(j, 0, sizeof(struct journal_block));
@@ -808,6 +1132,9 @@ static void mintegrity_journal_write_end_io(struct bio *bio, int error)
 	if (j->event) {
 		complete_all(j->event);
 	}
+#if DEBUG
+        journal_write_complete_counter++;
+#endif
 
 	mintegrity_journal_release(j);	
 }
@@ -823,6 +1150,12 @@ static void mintegrity_journal_read_end_io(struct bio *bio, int error)
 
 static void mintegrity_do_journal_block_io(struct journal_block *j)
 {
+#if DEBUG
+//        if(j->bio.bi_rw & WRITE)
+//		bio_add_page_write_counter = bio_add_page_write_counter + j->bio.bi_max_vecs;
+//	else
+//		bio_add_page_read_counter = bio_add_page_read_counter + j->bio.bi_max_vecs;
+#endif
 	generic_make_request(&j->bio);
 }
 
@@ -853,6 +1186,12 @@ static void mintegrity_init_journal_block(struct journal_block **jb,
 	bio->bi_private = j;
 	if (setPages) {
 		for (i = 0; i < min(J_PAGE_CHUNK_SIZE, size); i++) {
+#if DEBUG
+			if(rw & WRITE)
+				bio_add_page_write_counter+= v->dev_block_bytes;
+			else
+				bio_add_page_read_counter+= v->dev_block_bytes;
+#endif
 			BUG_ON(!bio_add_page(bio, virt_to_page(
 				j->data + v->dev_block_bytes * i), v->dev_block_bytes, 0));
 		}
@@ -885,6 +1224,9 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		return;
 	}
 
+#if DEBUG
+        journal_commit_counter++;
+#endif
 	// Journal block isn't fully used up
 	if (v->jbs && ((v->full_journal && atomic_read(&v->jbs->available) != 0)
 			|| (!v->full_journal && atomic_read(&v->jbs_available) >= hpb))) {
@@ -914,6 +1256,12 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		tag.options |= 4;
 		memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
 
+#if DEBUG
+                if( v->jbs->bio.bi_rw & WRITE)
+			bio_add_page_write_counter += v->dev_block_bytes;
+		else
+			bio_add_page_read_counter += v->dev_block_bytes;
+#endif
 		BUG_ON(!bio_add_page(&v->jbs->bio, virt_to_page(
 			v->jbs->data + v->dev_block_bytes * which), v->dev_block_bytes, 0));
 		memcpy(v->jbs->data + (v->dev_block_bytes * which),
@@ -961,6 +1309,10 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 		v->j_ds_buffer->bio.bi_rw = WRITE;
 		v->j_ds_buffer->bio.bi_iter.bi_sector = sector << (v->dev_block_bits - SECTOR_SHIFT);
+#if DEBUG
+                bio_add_page_write_counter += v->dev_block_bytes;
+#endif
+
 		BUG_ON(!bio_add_page(&v->j_ds_buffer->bio,
 			virt_to_page(v->j_ds_buffer->data), v->dev_block_bytes, 0));
 
@@ -1052,6 +1404,9 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 static void mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 {
 	struct mint_journal_superblock *js = &v->j_sb_header;
+#if DEBUG
+        journal_checkpoint_counter++;
+#endif
 
 	if (v->full_journal) {
 		block_write_dirty(v, false, false);
@@ -1073,6 +1428,8 @@ static void mintegrity_get_memory_tokens(struct dm_mintegrity *v, int tokens)
 	down_write(&v->j_lock);
 
 	if (atomic_read(&v->block_tokens) < tokens) {
+		printk("Not enough tokens %llu", token_counter);
+		token_counter++;
 		// Not enough memory - commit everything
 		mintegrity_commit_journal(v, true);
 		mintegrity_checkpoint_journal(v);
@@ -1173,6 +1530,12 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 
 	if (v->full_journal) {
 		r = (v->jbs->size - 1) - atomic_dec_return(&v->jbs->available);
+#if DEBUG
+                if( v->jbs->bio.bi_rw & WRITE)
+			bio_add_page_write_counter += v->dev_block_bytes;
+		else
+			bio_add_page_read_counter += v->dev_block_bytes;
+#endif
 		BUG_ON(!bio_add_page(&v->jbs->bio, virt_to_page(
 			v->jbs->data + v->dev_block_bytes * r), v->dev_block_bytes, 0));
 		if (r == v->jbs->size - 1) {
@@ -1182,6 +1545,12 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 		int hpb = v->dev_block_bytes / (2 * v->digest_size);
 		r = (v->jbs->size * hpb - 1) - atomic_dec_return(&v->jbs->available);
 		if (r % hpb == 0) {
+#if DEBUG
+                if( v->jbs->bio.bi_rw & WRITE)
+			bio_add_page_write_counter += v->dev_block_bytes; 
+		else
+			bio_add_page_read_counter += v->dev_block_bytes;
+#endif
 			BUG_ON(!bio_add_page(&v->jbs->bio, virt_to_page(
 				v->jbs->data + v->dev_block_bytes * (r / hpb)),
 				v->dev_block_bytes, 0));
@@ -1550,6 +1919,9 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 	struct dm_mintegrity *v = io->v;
 
 	mintegrity_hash_at_level(v, block, level, &hash_block, &offset);
+#if DEBUG
+        verify_level_counter++;
+#endif
 
 	// printk(KERN_CRIT "mintegrity_verify_level: %ld, %d, %d, %p, %d\n",
 	// 	block, level, skip_unverified, dmb, *tokens);
@@ -1720,6 +2092,9 @@ test_block_hash:
 			todo -= len;
 		} while (todo);
 
+#if DEBUG
+	        compute_hash_counter++;
+#endif
 		r = crypto_shash_final(desc, result);
 		if (r) {
 			DMERR("crypto_shash_final failed: %d", r);
@@ -1967,6 +2342,25 @@ static void mintegrity_read_work(struct work_struct *w)
 	bio_endio_nodec(bio, error);
 }
 
+#if CHECKPOINT
+static void mintegrity_commit_checkpoint_work(struct work_struct *w)
+{
+	struct delayed_work *dwork = NULL;
+	struct dm_mintegrity *v = NULL;
+
+	checkpoint_work_counter++;
+	printk(KERN_ERR "Checkpoint work scheduled %llu",checkpoint_work_counter);
+	dwork = container_of(w, struct delayed_work, work);
+	BUG_ON(!dwork);
+	v = container_of(dwork, struct dm_mintegrity, delayed_work);
+	BUG_ON(!v);
+	mintegrity_commit_journal(v, true);
+	mintegrity_checkpoint_journal(v);
+	INIT_DELAYED_WORK(&(v->delayed_work), mintegrity_commit_checkpoint_work);
+	queue_delayed_work(v->workqueue, &v->delayed_work, msecs_to_jiffies(5000));
+}
+#endif
+
 static void mintegrity_read_end_io(struct bio *bio, int error)
 {
 	struct dm_mintegrity_io *io = bio->bi_private;
@@ -2121,9 +2515,13 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 		// Limit the number of requests
 		down(&v->request_limit);
+#if DEBUG
+	        prefetch_counter++;
+#endif
 
 		// Prefetch blocks
 		mintegrity_submit_prefetch(v, io);
+
 
 		if (bio_data_dir(bio) == WRITE) {
 			INIT_WORK(&(io->work), mintegrity_write_work);
@@ -2318,6 +2716,19 @@ static void mintegrity_dtr(struct dm_target *ti)
 {
 	struct dm_mintegrity *v = ti->private;
 
+#if DEBUG
+//	tree_dump(v->block_tree_root.rb_node, 1);
+//	printk(KERN_ERR "Total tree nodes: %llu\n", total_tree_nodes);
+	printk(KERN_ERR "Total search counters: %llu.\n Tree inserts: %llu.\n Tree deletes: %llu.\n", search_counter, tree_insert_counter, tree_delete_counter);
+        printk(KERN_ERR "Total search found counters: %llu.\n Search data counters: %llu.\n Search hash counters: %llu.\n", search_found_counter, search_data_counter, search_hash_counter);
+        printk(KERN_ERR "Empty delete counters: %llu.\n Data delete counters: %llu.\n Hash delete counters: %llu.\n Journal delete counters: %llu.", tree_delete_empty_counter, tree_delete_data_counter, tree_delete_hash_counter, tree_delete_journal_counter);
+        printk(KERN_ERR "Empty insert counters: %llu.\n Data insert counters: %llu.\n Hash insert counters: %llu.\n Journal insert counters: %llu.", tree_insert_empty_counter, tree_insert_data_counter, tree_insert_hash_counter, tree_insert_journal_counter);
+	printk(KERN_ERR "Clean counter: %llu.\n Data dirty counter: %llu.\n Hash dirty counter: %llu.\n", clean_counter, data_dirty_counter, hash_dirty_counter);
+	printk(KERN_ERR "Total bio pages: %llu.\n Write bio pages: %llu.\n Read bio pages: %llu.\n", bio_add_page_read_counter+bio_add_page_write_counter, bio_add_page_write_counter, bio_add_page_read_counter);
+	printk(KERN_ERR "Block get counter: %llu.\n Compute hash counter: %llu.\n Compute hmac counter: %llu.\n", block_get_counter, compute_hash_counter, compute_hmac_counter);
+	printk(KERN_ERR "journal_release_counter: %llu.\n journal_write_complete_counter: %llu.\n journal_commit_counter: %llu. \n journal_checkpoint_counter: %llu.\n", journal_release_counter, journal_write_complete_counter, journal_commit_counter, journal_checkpoint_counter);
+	printk(KERN_ERR "verify_level_counter: %llu. \n prefetch_counter: %llu. \n", verify_level_counter, prefetch_counter);
+#endif
 	if (v->workqueue) {
 		destroy_workqueue(v->workqueue);
 	}
@@ -2703,16 +3114,53 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	mutex_init(&v->block_list_clean_lock);
 	mutex_init(&v->block_list_hash_dirty_lock);
 	mutex_init(&v->block_list_data_dirty_lock);
-
+#if USE_RADIX
+	INIT_RADIX_TREE(&v->block_tree_root, GFP_ATOMIC|GFP_KERNEL);
+#else
 	v->block_tree_root = RB_ROOT;
+#endif
 	INIT_LIST_HEAD(&v->block_list_clean);
 	INIT_LIST_HEAD(&v->block_list_hash_dirty);
 	INIT_LIST_HEAD(&v->block_list_data_dirty);
-
+#if DEBUG
+	search_counter = 0;
+	search_hash_counter = 0;
+	search_data_counter = 0;
+	search_found_counter = 0;
+	tree_insert_counter = 0;
+	clean_counter = 0;
+	data_dirty_counter = 0;
+	hash_dirty_counter = 0;
+	bio_add_page_counter = 0;
+	block_get_counter = 0;
+	tree_delete_counter = 0;
+	compute_hash_counter = 0;
+	compute_hmac_counter = 0;
+	journal_release_counter = 0;
+	journal_write_complete_counter = 0;
+	journal_commit_counter = 0;
+	journal_checkpoint_counter = 0;
+	verify_level_counter = 0;
+	prefetch_counter = 0;
+	tree_delete_empty_counter = 0;
+	tree_delete_hash_counter = 0;
+	tree_delete_data_counter = 0;
+	tree_delete_journal_counter = 0;
+	bio_add_page_read_counter = 0;
+	bio_add_page_write_counter = 0;
+	tree_insert_empty_counter = 0;
+	tree_insert_hash_counter = 0;
+	tree_insert_data_counter = 0;
+	tree_insert_journal_counter = 0;
+	total_tree_nodes = 0;
+#endif
+	checkpoint_work_counter = 0;
+	token_counter = 0;
 	init_rwsem(&(v->j_lock));
 	sema_init(&v->request_limit, DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT);
 
-	atomic_set(&v->block_tokens, 32768);
+//	atomic_set(&v->block_tokens, 32768);
+	atomic_set(&v->block_tokens, DM_MINTEGRITY_BLOCK_TOKENS);
 	for (i = 0; i < atomic_read(&v->block_tokens); i++) {
 		// Replace with kmem_cache
 		struct data_block *d = (struct data_block*) kzalloc(
@@ -2745,6 +3193,11 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		r = -ENOMEM;
 		goto bad;
 	}
+
+#if CHECKPOINT
+	INIT_DELAYED_WORK(&(v->delayed_work), mintegrity_commit_checkpoint_work);
+	queue_delayed_work(v->workqueue, &v->delayed_work, msecs_to_jiffies(5000));
+#endif
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
 		v->shash_descsize + v->digest_size * 2 + (v->levels + 1) *
@@ -2832,3 +3285,4 @@ MODULE_AUTHOR("Mandeep Baines <msb@chromium.org>");
 MODULE_AUTHOR("Will Drewry <wad@chromium.org>");
 MODULE_DESCRIPTION(DM_NAME " target for transparent RW disk integrity checking");
 MODULE_LICENSE("GPL");
+
