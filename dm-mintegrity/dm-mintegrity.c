@@ -304,7 +304,18 @@ struct dm_mintegrity_io {
 	uint32_t n_blocks;  /* Number of blocks in IO */
 
 	struct work_struct work;  /* Work instance for read/write queue */
-
+/*	struct work_struct verify_level_work;
+	struct work_struct update_hash_work;
+	struct work_struct write_back_work;
+	int which;
+        int tokens;
+	sector_t sector;
+	uint8_t *tag;
+	int r;
+        u8 *result;
+        u8 *data;
+        unsigned todo;
+*/
 	bio_end_io_t *orig_bi_end_io;
 	void *orig_bi_private;
 
@@ -527,6 +538,14 @@ static inline void block_release(struct data_block *d)
 //		mutex_lock(&v->block_tree_lock);
 //		rb_erase(&d->node, &v->block_tree_root);
 //		mutex_unlock(&v->block_tree_lock);
+#if USE_RADIX
+		if(d->type == TYPE_DATA)
+		{
+			mutex_lock(&v->block_tree_lock);
+	                tree_delete(&v->block_tree_root, d);
+			mutex_unlock(&v->block_tree_lock);
+		}
+#endif
 		list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
 	} else if (ref_count == 0 && node_not_in_list(&d->list)) {
