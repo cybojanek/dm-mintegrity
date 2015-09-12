@@ -32,6 +32,8 @@
 #define USE_RADIX 1
 #define CHECKPOINT 1
 #define DEBUG 0
+#define TRICK 1
+
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -117,6 +119,7 @@ static uint64_t total_tree_nodes = 0;
 #endif
 static uint64_t token_counter = 0;
 static uint64_t checkpoint_work_counter = 0;
+static uint64_t wait_counter = 0;
 
 struct mint_journal_header {
 	uint32_t magic;     /* 0x594c494c */
@@ -245,8 +248,11 @@ struct dm_mintegrity {
 
 	struct semaphore request_limit;
 	atomic_t j_fill;     /* Number of blocks in journal - need atomic due to writeback */
+#if TRICK
+	struct rw_semaphore j_commit_outstanding;
+#else
 	atomic_t j_commit_outstanding;
-
+#endif
 	uint32_t j_ds_fill;  /* Number of tags in current descriptor buffer */
 	uint32_t j_ds_max;   /* Max number of tags in descriptor buffer */
 
@@ -283,6 +289,7 @@ struct dm_mintegrity {
 	bool full_journal;
 #if CHECKPOINT
 	struct delayed_work delayed_work;  /* Work instance for commit and checkpointing */
+	struct workqueue_struct *delayed_workqueue;     /* workqueue for processing writes */
 #endif
 };
 
@@ -602,6 +609,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	struct mutex *list_lock;
 	struct block_device *dev;
 	uint64_t *counter;
+	uint64_t dirty_blocks;
 	// Get list, and locks
 	if (data) {
 		list = &v->block_list_data_dirty;
@@ -623,7 +631,8 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	mutex_lock(list_lock);
 
 	// TODO: sort this?
-
+	
+	dirty_blocks = 0;
 	list_for_each_safe(pos, n, list) {
 		struct bio *bio;
 
@@ -649,14 +658,17 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		bio->bi_rw = WRITE;
 		bio->bi_max_vecs = 1;
 		bio->bi_io_vec = &d->bio_vec;
-		bio->bi_end_io = block_end_io;
+		bio->bi_end_io = block_end_io; //Bhu: block_dirty_end_io;
 		bio->bi_private = d;
 		bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
 #if DEBUG
                 bio_add_page_write_counter += v->dev_block_bytes;
 #endif
+//		printk(KERN_ERR "Write dirty making request. \n");
 		generic_make_request(bio);
+		dirty_blocks++;
 	}
+	printk(KERN_ERR "Written %d Dirty blocks.\n", dirty_blocks);
 
 	mutex_unlock(list_lock);
 	mutex_unlock(&v->block_list_clean_lock);
@@ -809,7 +821,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	} else if (d && !prefetch) {
 		int ref_count = atomic_inc_return(&d->ref_count);
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 4);
-		if (ref_count == 1 && d->dirty && !node_not_in_list(&d->list)) {
+		if (ref_count >= 1 && d->dirty && !node_not_in_list(&d->list)) {
 			//printk(KERN_CRIT "%s %d %s: sector %llu flags %x\n",
 			//	__FILE__, __LINE__, __func__, sector, flags);
 			struct mutex *lock;
@@ -846,6 +858,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	                clean_counter--;
 #endif
 		}
+
 		mutex_unlock(&v->block_list_clean_lock);
 	}
 
@@ -1230,6 +1243,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 	// Journal block isn't fully used up
 	if (v->jbs && ((v->full_journal && atomic_read(&v->jbs->available) != 0)
 			|| (!v->full_journal && atomic_read(&v->jbs_available) >= hpb))) {
+		//printk(KERN_ERR "Journal isnt full yet!!");
 		// Use this spot for the descriptor block
 		int which = 0;
 		int toFree = 0;
@@ -1238,18 +1252,22 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 			v->full_journal ? 1 : hpb);
 		toFree = (v->jbs->size - 1) - which;
 
+#if TRICK
+		printk(KERN_ERR "First down_write\n");
+		down_write(&v->j_commit_outstanding);
+#else
 		while (true) {
 			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
 			if (atomic_read(a) == 0) {
 				break;
 			}
-			if (i != 0 && i % 100000000 == 0 ) {
-				// printk(KERN_CRIT "1: millions: %d, %d",
-				// 		i / 10000000, atomic_read(&v->j_commit_outstanding));
+			if (i != 0 && i % 10000000 == 0 ) {
+				 printk(KERN_CRIT "1: 10 millions: %d, %d",
+				 		i / 10000000, atomic_read(&v->j_commit_outstanding));
 			}
 			i++;
 		}
-
+#endif
 		tag_ptr = v->j_ds_buffer->data + sizeof(struct mint_journal_header)
 			+ (v->j_ds_fill - 1) * sizeof(struct mint_journal_block_tag);
 		memcpy(&tag, tag_ptr, sizeof(struct mint_journal_block_tag));
@@ -1266,11 +1284,15 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 			v->jbs->data + v->dev_block_bytes * which), v->dev_block_bytes, 0));
 		memcpy(v->jbs->data + (v->dev_block_bytes * which),
 			v->j_ds_buffer->data, v->dev_block_bytes);
+		//printk(KERN_ERR "Sending to mintegrity_do_journal_block_io \n");
 		mintegrity_do_journal_block_io(v->jbs);
+		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
 
 		v->jbs = NULL;
 		v->j_ds_buffer->event = NULL;
+		//printk(KERN_ERR "Sending to mintegrity_journal_write_end_io \n");
 		mintegrity_journal_write_end_io(&v->j_ds_buffer->bio, 0);
+		//printk(KERN_ERR "Return from mintegrity_journal_write_end_io \n");
 
 		if (toFree) {
 			atomic_add(-toFree, &v->j_fill);
@@ -1284,18 +1306,29 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 				js->tail -= toFree;
 			}
 		}
+#if TRICK
+		printk(KERN_ERR "First up_write\n");
+		up_write(&v->j_commit_outstanding);
+#endif
 	} else {
+		//printk(KERN_ERR "Journal is totally full!!");
+#if TRICK
+		printk(KERN_ERR "Second down_write\n");
+                down_write(&v->j_commit_outstanding);
+#else
 		while (true) {
 			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
 			if (atomic_read(a) == 0) {
 				break;
 			}
-			if (i != 0 && i % 100000000 == 0 ) {
-				// printk(KERN_CRIT "2: millions: %d, %d",
-				// 		i / 10000000, atomic_read(&v->j_commit_outstanding));
+			if (i != 0 && i % 10000000 == 0 ) {
+				 printk(KERN_CRIT "2: 10 millions: %d, %d, wait_counter: %llu",
+				 		i / 10000000, atomic_read(&v->j_commit_outstanding), wait_counter);
 			}
 			i++;
 		}
+		wait_counter++;
+#endif
 
 		tag_ptr = v->j_ds_buffer->data + sizeof(struct mint_journal_header)
 			+ (v->j_ds_fill - 1) * sizeof(struct mint_journal_block_tag);
@@ -1315,11 +1348,18 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 		BUG_ON(!bio_add_page(&v->j_ds_buffer->bio,
 			virt_to_page(v->j_ds_buffer->data), v->dev_block_bytes, 0));
-
+		
+		//printk(KERN_ERR "Sending to mintegrity_do_journal_block_io \n");
 		mintegrity_do_journal_block_io(v->j_ds_buffer);
+		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
+#if TRICK
+		printk(KERN_ERR "Second up_write\n");
+                up_write(&v->j_commit_outstanding);
+#endif
 	}
 
 	if (flush) {
+		//printk(KERN_ERR "Flushing the journal \n");
 		struct completion event;
 		struct journal_block *jb;
 		struct mint_journal_superblock *js = &v->j_sb_header;
@@ -1344,7 +1384,9 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 		init_completion(&event);
 		jb->event = &event;
+		//printk(KERN_ERR "Sending to mintegrity_do_journal_block_io \n");
 		mintegrity_do_journal_block_io(jb);
+		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
 		wait_for_completion(&event);
 		if (v->two_disks) {
 			block_write_dirty(v, true, false);
@@ -1398,7 +1440,12 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 	if (atomic_inc_return(&journal_buffer->finished) == i) {
 		mintegrity_do_journal_block_io(journal_buffer);
 	}
+#if TRICK
+	//printk(KERN_ERR "up_read\n");
+	up_read(&v->j_commit_outstanding);
+#else
 	atomic_dec(&v->j_commit_outstanding);
+#endif
 }
 
 static void mintegrity_checkpoint_journal(struct dm_mintegrity *v)
@@ -1407,7 +1454,7 @@ static void mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 #if DEBUG
         journal_checkpoint_counter++;
 #endif
-
+	//printk(KERN_ERR "Checkpointing!! \n");
 	if (v->full_journal) {
 		block_write_dirty(v, false, false);
 		block_write_dirty(v, true, true);
@@ -1417,6 +1464,9 @@ static void mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 	} else {
 		block_write_dirty(v, true, true);
 		block_write_dirty(v, false, true);
+		if (v->two_disks) {
+			blkdev_issue_flush(v->dev->bdev, GFP_KERNEL, NULL);
+		}
 	}
 	atomic_set(&v->j_fill, 0);
 	js->tail = 0;
@@ -1489,6 +1539,7 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 	// Check if we have space in the descriptor block for a tag
 	if (v->j_ds_fill == v->j_ds_max) {
 		// We don't lets get a new one
+		//printk(KERN_ERR "We dont have enough descriptors\n");
 		mintegrity_commit_journal(v, false);
 	}
 
@@ -1500,6 +1551,7 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 		// Check for space - need blocks chunk + commit block
 		if (atomic_read(&v->j_fill) + 1 + J_PAGE_CHUNK_SIZE >= v->journal_blocks - 1) {
 			// Make space in journal
+			printk(KERN_ERR "Making space in the jornal\n");
 			mintegrity_commit_journal(v, true);
 			mintegrity_checkpoint_journal(v);
 		}
@@ -1565,11 +1617,15 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 		+ v->j_ds_fill * sizeof(struct mint_journal_block_tag);
 	// Increment descriptor block fill
 	v->j_ds_fill++;
-
-	atomic_inc(&v->j_commit_outstanding);
-
-	// Unlock journal
+        // Unlock journal
 	up_write(&v->j_lock);
+	
+#if TRICK
+	//printk(KERN_ERR "down_read\n");
+	down_read(&v->j_commit_outstanding);
+#else
+	atomic_inc(&v->j_commit_outstanding);
+#endif
 	return r;
 }
 
@@ -1887,7 +1943,12 @@ Sector journal:
 	js->tail = 0;
 	atomic_set(&v->j_fill, 0);
 
+#if TRICK
+	init_rwsem(&(v->j_lock));
+#else
 	atomic_set(&v->j_commit_outstanding, 0);
+#endif
+
 	atomic_set(&v->jbs_available, 0);
 	atomic_set(&v->jbs_finished, 0);
 	v->jbs = NULL;
@@ -2164,6 +2225,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 	struct data_block *data_block, *d;
 	struct dm_mintegrity *v = io->v;
 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
+	int hpb = v->dev_block_bytes / (2 * v->digest_size);
 
 	for (b = 0; b < io->n_blocks; b++) {
 		int r;
@@ -2186,9 +2248,21 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			dm_buffers[i] = NULL;
 		}
 
+//		while (true)
+//		{
+//			if((!v->full_journal && atomic_read(&v->jbs_available) >= hpb) && atomic_read(v->j_commit_outstanding) > 0)
+//			{
+//				//Wait for the journal buffer to be refilled.
+//				printk("Waiting for journal buffer to be refilled\n");
+//			}
+//			else
+//				break;
+//		
+//		}
+
 		// Get memory buffer tokens
-		tokens = v->levels + 1;
-		mintegrity_get_memory_tokens(v, tokens);
+                tokens = v->levels + 1;
+                mintegrity_get_memory_tokens(v, tokens);
 
 		// Get journal block
 		if ((which = mintegrity_get_journal_buffer(v, &j_buffer, &tag)) < 0) {
@@ -2349,15 +2423,17 @@ static void mintegrity_commit_checkpoint_work(struct work_struct *w)
 	struct dm_mintegrity *v = NULL;
 
 	checkpoint_work_counter++;
-	printk(KERN_ERR "Checkpoint work scheduled %llu",checkpoint_work_counter);
+	//printk(KERN_ERR "Checkpoint work scheduled %llu\n",checkpoint_work_counter);
 	dwork = container_of(w, struct delayed_work, work);
 	BUG_ON(!dwork);
 	v = container_of(dwork, struct dm_mintegrity, delayed_work);
 	BUG_ON(!v);
-	mintegrity_commit_journal(v, true);
+//	printk(KERN_ERR "Work checkpoint comit jornal\n");
+//	mintegrity_commit_journal(v, true);
 	mintegrity_checkpoint_journal(v);
+	//printk(KERN_ERR "Queueing next checkpoint work %llu\n",checkpoint_work_counter);
 	INIT_DELAYED_WORK(&(v->delayed_work), mintegrity_commit_checkpoint_work);
-	queue_delayed_work(v->workqueue, &v->delayed_work, msecs_to_jiffies(5000));
+	queue_delayed_work(v->delayed_workqueue, &v->delayed_work, msecs_to_jiffies(5000));
 }
 #endif
 
@@ -2369,6 +2445,11 @@ static void mintegrity_read_end_io(struct bio *bio, int error)
 		- (io->v->data_start << (io->v->dev_block_bits - SECTOR_SHIFT));
 	bio->bi_end_io = io->orig_bi_end_io;
 	bio->bi_private = io->orig_bi_private;
+	if(atomic_read(&bio->bi_remaining) <= 0)
+	{
+//		printk(KERN_ERR "Going to trigger a bug in mintegrity_read_end_io.\n");
+//		atomic_set(&bio->bi_remaining, 1);
+	}
 
 	if (error) {
 		up(&io->v->request_limit);
@@ -2391,6 +2472,7 @@ static void mintegrity_write_work(struct work_struct *w)
 	// FIXME: should this happen before?
 	if (unlikely(bio->bi_rw & (REQ_FLUSH | REQ_FUA))) {
 		down_write(&io->v->j_lock);
+		printk(KERN_ERR "We are in mintegrity_write_work. Commiting journal.\n");
 		mintegrity_commit_journal(io->v, true);
 		up_write(&io->v->j_lock);
 	}
@@ -2606,6 +2688,12 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			if (all_in_memory || last_block == 1) {
 				// got all pages from buffer, or last block is from buffer, finalize read request
 				up(&v->request_limit);
+        			if(atomic_read(&bio->bi_remaining) <= 0)
+		        	{
+					printk(KERN_ERR "Going to trigger a bug in multiblock support.\n");
+//					atomic_set(&bio->bi_remaining, 1);
+				}
+
 				bio_endio(bio, 0);
 			}
 			// printk(KERN_CRIT "End map read...\n");
@@ -2732,6 +2820,15 @@ static void mintegrity_dtr(struct dm_target *ti)
 	if (v->workqueue) {
 		destroy_workqueue(v->workqueue);
 	}
+
+#if CHECKPOINT
+	cancel_delayed_work(&v->delayed_work);
+
+	if (v->delayed_workqueue) {
+		flush_workqueue(v->delayed_workqueue);
+		destroy_workqueue(v->delayed_workqueue);
+	}
+#endif
 
 	if (v->created) {
 		mintegrity_unmount_journal(v);
@@ -3156,6 +3253,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 #endif
 	checkpoint_work_counter = 0;
 	token_counter = 0;
+	wait_counter = 0;
 	init_rwsem(&(v->j_lock));
 	sema_init(&v->request_limit, DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT);
 
@@ -3187,7 +3285,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
 	v->workqueue = alloc_workqueue("kmintegrityd",
-		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
+		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus()*2);
 	if (!v->workqueue) {
 		ti->error = "Cannot allocate read workqueue";
 		r = -ENOMEM;
@@ -3195,8 +3293,15 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
 #if CHECKPOINT
+	v->delayed_workqueue = alloc_workqueue("kmintegrityd-write",
+			                WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
+        if (!v->delayed_workqueue) {
+                ti->error = "Cannot allocate write workqueue";
+                r = -ENOMEM;
+                goto bad;
+        }
 	INIT_DELAYED_WORK(&(v->delayed_work), mintegrity_commit_checkpoint_work);
-	queue_delayed_work(v->workqueue, &v->delayed_work, msecs_to_jiffies(5000));
+	queue_delayed_work(v->delayed_workqueue, &v->delayed_work, msecs_to_jiffies(5000));
 #endif
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +
