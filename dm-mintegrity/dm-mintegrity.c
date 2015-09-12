@@ -237,6 +237,9 @@ struct dm_mintegrity {
 
 	// Work queues
 	struct workqueue_struct *workqueue;     /* workqueue for processing reads */
+	struct workqueue_struct *verify_level_workqueue; //verify levels for write
+	struct workqueue_struct *update_hash_workqueue; // calculate hash for write
+	struct workqueue_struct *write_back_workqueue; // update the tree for write
 
 	// Locks
 	struct rw_semaphore j_lock;  /* global journal read/write lock */
@@ -632,7 +635,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 
 	// TODO: sort this?
 	
-	dirty_blocks = 0;
+	//dirty_blocks = 0;
 	list_for_each_safe(pos, n, list) {
 		struct bio *bio;
 
@@ -666,9 +669,9 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 #endif
 //		printk(KERN_ERR "Write dirty making request. \n");
 		generic_make_request(bio);
-		dirty_blocks++;
+		//dirty_blocks++;
 	}
-	printk(KERN_ERR "Written %d Dirty blocks.\n", dirty_blocks);
+	//printk(KERN_ERR "Written %d Dirty blocks.\n", dirty_blocks);
 
 	mutex_unlock(list_lock);
 	mutex_unlock(&v->block_list_clean_lock);
@@ -1253,7 +1256,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		toFree = (v->jbs->size - 1) - which;
 
 #if TRICK
-		printk(KERN_ERR "First down_write\n");
+		//printk(KERN_ERR "First down_write\n");
 		down_write(&v->j_commit_outstanding);
 #else
 		while (true) {
@@ -1307,13 +1310,13 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 			}
 		}
 #if TRICK
-		printk(KERN_ERR "First up_write\n");
+		//printk(KERN_ERR "First up_write\n");
 		up_write(&v->j_commit_outstanding);
 #endif
 	} else {
 		//printk(KERN_ERR "Journal is totally full!!");
 #if TRICK
-		printk(KERN_ERR "Second down_write\n");
+		//printk(KERN_ERR "Second down_write\n");
                 down_write(&v->j_commit_outstanding);
 #else
 		while (true) {
@@ -1353,7 +1356,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		mintegrity_do_journal_block_io(v->j_ds_buffer);
 		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
 #if TRICK
-		printk(KERN_ERR "Second up_write\n");
+		//printk(KERN_ERR "Second up_write\n");
                 up_write(&v->j_commit_outstanding);
 #endif
 	}
@@ -1944,7 +1947,7 @@ Sector journal:
 	atomic_set(&v->j_fill, 0);
 
 #if TRICK
-	init_rwsem(&(v->j_lock));
+	init_rwsem(&(v->j_commit_outstanding));
 #else
 	atomic_set(&v->j_commit_outstanding, 0);
 #endif
@@ -2433,7 +2436,7 @@ static void mintegrity_commit_checkpoint_work(struct work_struct *w)
 	mintegrity_checkpoint_journal(v);
 	//printk(KERN_ERR "Queueing next checkpoint work %llu\n",checkpoint_work_counter);
 	INIT_DELAYED_WORK(&(v->delayed_work), mintegrity_commit_checkpoint_work);
-	queue_delayed_work(v->delayed_workqueue, &v->delayed_work, msecs_to_jiffies(5000));
+	queue_delayed_work(v->delayed_workqueue, &v->delayed_work, msecs_to_jiffies(2000));
 }
 #endif
 
@@ -3285,7 +3288,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
 	v->workqueue = alloc_workqueue("kmintegrityd",
-		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus()*2);
+		WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
 	if (!v->workqueue) {
 		ti->error = "Cannot allocate read workqueue";
 		r = -ENOMEM;
@@ -3301,7 +3304,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
                 goto bad;
         }
 	INIT_DELAYED_WORK(&(v->delayed_work), mintegrity_commit_checkpoint_work);
-	queue_delayed_work(v->delayed_workqueue, &v->delayed_work, msecs_to_jiffies(5000));
+	queue_delayed_work(v->delayed_workqueue, &v->delayed_work, msecs_to_jiffies(2000));
 #endif
 
 	ti->per_bio_data_size = roundup(sizeof(struct dm_mintegrity_io) +

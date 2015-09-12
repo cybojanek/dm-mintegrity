@@ -71,12 +71,12 @@ file_systems["full_shdd"]="ext4_regular"
 drop_cache() {
     echo "Dropping caches..."
     echo 3 | sudo tee --append /proc/sys/vm/drop_caches > /dev/null
-    echo "Sleeping 10 seconds..."
-    sleep 10
+    echo "Sleeping 2 seconds..."
+    sleep 2
 }
 
 DD_STREAM_SIZE=1048576 # 4096 MiB
-
+#DD_STREAM_SIZE=5120
 # Turn off and on tests here FALSE / TRUE, or comma seperater / empty
 DD=TRUE
 DATABASE=FALSE
@@ -118,7 +118,8 @@ for MODE in $MODES; do
         
         drop_cache
         echo "Running dd write...${BLOCK_DEVICE}"
-        sudo dd of=${BLOCK_DEVICE} if=/dev/zero bs=4k count=${DD_STREAM_SIZE} conv=fsync &>> ${DIRECTORY}/${FILE_PREFIX}_dd_write.txt
+#        sudo dd of=${BLOCK_DEVICE} if=/dev/zero bs=1M count=${DD_STREAM_SIZE} conv=fsync &>> ${DIRECTORY}/${FILE_PREFIX}_dd_write.txt
+	sudo dd of=${BLOCK_DEVICE} if=/dev/zero bs=4k count=${DD_STREAM_SIZE} conv=fsync &>> ${DIRECTORY}/${FILE_PREFIX}_dd_write.txt
     fi
     
 
