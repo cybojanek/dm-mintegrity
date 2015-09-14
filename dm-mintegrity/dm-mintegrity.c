@@ -31,16 +31,16 @@
 
 #define USE_RADIX 1
 #define CHECKPOINT 1
-#define DEBUG 0
+#define DEBUG 1
 #define TRICK 1
 
 
 #define DM_MSG_PREFIX			"mintegrity"
 
 #define DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE	524288
-#define DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT 	65536
+#define DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT 	262144
 #define DM_MINTEGRITY_MAX_LEVELS		63
-#define DM_MINTEGRITY_BLOCK_TOKENS		262144
+#define DM_MINTEGRITY_BLOCK_TOKENS		131072
 
 //16384 32768 65536 131072 262144 524288
 
@@ -90,6 +90,8 @@ static int dump_once = 0;
 static uint64_t search_counter = 0;
 static uint64_t search_hash_counter = 0;
 static uint64_t search_data_counter = 0;
+static uint64_t search_hash_missing_counter = 0;
+static uint64_t search_data_missing_counter = 0;
 static uint64_t search_found_counter = 0;
 static uint64_t tree_insert_counter = 0;
 static uint64_t clean_counter = 0;
@@ -105,7 +107,6 @@ static uint64_t journal_write_complete_counter = 0;
 static uint64_t journal_commit_counter = 0;
 static uint64_t journal_checkpoint_counter = 0;
 static uint64_t verify_level_counter = 0;
-static uint64_t prefetch_counter = 0;
 static uint64_t tree_delete_empty_counter = 0;
 static uint64_t tree_delete_hash_counter = 0;
 static uint64_t tree_delete_data_counter = 0;
@@ -117,6 +118,15 @@ static uint64_t tree_insert_hash_counter = 0;
 static uint64_t tree_insert_data_counter = 0;
 static uint64_t tree_insert_journal_counter = 0;
 static uint64_t total_tree_nodes = 0;
+static uint64_t hash_reuse = 0;
+static uint64_t prefetch_reuse = 0;
+static uint64_t prefetch_useful = 0;
+static uint64_t prefetch_counter = 0;
+static uint64_t wait_completion_counter = 0;
+static uint64_t journal_full = 0;
+static uint64_t total_requests = 0;
+static uint64_t pending_write = 0;
+static uint64_t pending_prefetch = 0;
 #endif
 static uint64_t token_counter = 0;
 static uint64_t checkpoint_work_counter = 0;
@@ -183,6 +193,7 @@ struct data_block {
 	bool dirty;
 	bool verified;
 	bool completion_initialized;
+	bool is_prefetch;
 };
 
 struct dm_mintegrity {
@@ -276,12 +287,16 @@ struct dm_mintegrity {
 	struct rb_root block_tree_root;
 #endif
 	struct list_head block_list_clean;
+	struct list_head block_list_clean_hash;
+	struct list_head block_list_prefetch;
 	struct list_head block_list_hash_dirty;
 	struct list_head block_list_data_dirty;
 
 	// Locks for block cache
 	struct mutex block_tree_lock;
 	struct mutex block_list_clean_lock;
+	struct mutex block_list_clean_hash_lock;
+	struct mutex block_list_prefetch_lock;
 	struct mutex block_list_hash_dirty_lock;
 	struct mutex block_list_data_dirty_lock;
 
@@ -359,12 +374,49 @@ static inline bool node_not_in_list(struct list_head *node)
 static inline struct data_block *tree_search(struct radix_tree_root *root, sector_t sector)
 {
 	struct data_block *data = (struct data_block *)radix_tree_lookup(root, (unsigned long)sector);
+#if DEBUG
+	search_counter++;
+	if(data)
+	{
+		search_found_counter++;
+		if(data->type == TYPE_DATA)
+			search_data_counter++;         
+		else if(data->type == TYPE_HASH)
+			search_hash_counter++;
+	}
+#endif
 	return data;
 }
 
 static inline int tree_insert(struct radix_tree_root *root, struct data_block *data)
 {
 	int r;
+#if DEBUG
+	tree_insert_counter++;
+	char *ty = "";
+	switch(data->type)
+	{
+		case TYPE_EMPTY:
+			tree_insert_empty_counter++;
+			ty = "Empty";
+			break;
+		case TYPE_HASH:
+			tree_insert_hash_counter++;
+			ty = "Hash";
+			break;
+		case TYPE_DATA:
+			tree_insert_data_counter++;
+			ty = "Data";
+			break;
+		case TYPE_JOURNAL:
+			tree_insert_journal_counter++;
+			ty = "Journal";
+			break;
+	}
+
+	//printk(KERN_ERR "Tree insert counter is %llu. Inserted node of type %s\n",tree_insert_counter,ty);
+#endif
+
 	if((r = radix_tree_insert(root, data->sector, data)) == -EEXIST)
 	{
 		radix_tree_delete(root, data->sector);
@@ -525,6 +577,8 @@ static inline void block_release(struct data_block *d)
 	int ref_count;
 	struct dm_mintegrity *v = d->v;
 	mutex_lock(&v->block_list_clean_lock);
+	mutex_lock(&v->block_list_clean_hash_lock);
+	mutex_lock(&v->block_list_prefetch_lock);
 	ref_count = atomic_dec_return(&d->ref_count);
 	if (ref_count < 0) {
 		printk(KERN_ERR "%s %d: sector %lu ref_count %d writers %d type %d dirty %d verified %d\n",
@@ -549,7 +603,10 @@ static inline void block_release(struct data_block *d)
 //			mutex_unlock(&v->block_tree_lock);
 //		}
 #endif
-		list_add_tail(&d->list, &v->block_list_clean);
+		if(d->type == TYPE_HASH)
+			list_add_tail(&d->list, &v->block_list_clean_hash);
+		else
+			list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
 	} else if (ref_count == 0 && node_not_in_list(&d->list)) {
 		// Last one holding onto it, its dirty, and its not in the dirty list
@@ -580,6 +637,8 @@ static inline void block_release(struct data_block *d)
 */		list_add_tail(&d->list, list);
 		mutex_unlock(list_lock);
 	}
+	mutex_unlock(&v->block_list_prefetch_lock);
+	mutex_unlock(&v->block_list_clean_hash_lock);
 	mutex_unlock(&v->block_list_clean_lock);
 }
 
@@ -597,6 +656,7 @@ static void block_end_io(struct bio *bio, int error)
 	// block_release(d);
 }
 
+#if 0
 static void block_dirty_end_io(struct bio *bio, int error)
 {
 	struct data_block *d = bio->bi_private;
@@ -632,6 +692,7 @@ static void block_dirty_end_io(struct bio *bio, int error)
 	mutex_unlock(lock);
 	mutex_unlock(&v->block_list_clean_lock);
 }
+#endif
 
 static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 {
@@ -663,11 +724,14 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	mutex_lock(&v->block_tree_lock);
 #endif
 	mutex_lock(&v->block_list_clean_lock);
+	mutex_lock(&v->block_list_clean_hash_lock);
+	mutex_lock(&v->block_list_prefetch_lock);
 	mutex_lock(list_lock);
 
 	// TODO: sort this?
 	
-	//dirty_blocks = 0;
+	dirty_blocks = 0;
+
 	list_for_each_safe(pos, n, list) {
 		struct bio *bio;
 
@@ -689,14 +753,21 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 #endif
 
 #if USE_RADIX
-                if(d->type == TYPE_DATA)
+/*                if(d->type == TYPE_DATA)
                 {
                         tree_delete(&v->block_tree_root, d);
                 }
+*/
 #endif
 		
-		list_add_tail(&d->list, &v->block_list_clean);
+		if(d->is_prefetch)
+			list_add_tail(&d->list, &v->block_list_prefetch);
+		else if(d->type == TYPE_HASH)
+			list_add_tail(&d->list, &v->block_list_clean_hash);
+		else
+			list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
+
 
 		// RACE: 123
 		d->dirty = false;
@@ -716,11 +787,13 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 #endif
 //		printk(KERN_ERR "Write dirty making request. \n");
 		generic_make_request(bio);
-		//dirty_blocks++;
+		dirty_blocks++;
 	}
-	//printk(KERN_ERR "Written %d Dirty blocks.\n", dirty_blocks);
+	printk(KERN_ERR "Written %d Dirty blocks.\n", dirty_blocks);
 
 	mutex_unlock(list_lock);
+	mutex_unlock(&v->block_list_prefetch_lock);
+	mutex_unlock(&v->block_list_clean_hash_lock);
 	mutex_unlock(&v->block_list_clean_lock);
 #if USE_RADIX
 	mutex_unlock(&v->block_tree_lock);
@@ -770,6 +843,16 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 //		d = NULL;
 	if(d)
 		found = true;
+
+#if DEBUG
+	if(found && !prefetch && d->is_prefetch)
+		prefetch_useful++;
+	if(!found && data_block)
+		search_data_missing_counter++;
+	else if(!found && !data_block)
+		search_hash_missing_counter++;
+#endif
+
 	if (!found && !memory_only) {
 		// Not here, and we need to allocate it
 		uint8_t *data;
@@ -778,16 +861,45 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		// Get a clean buffer
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 1);
 		mutex_lock(&v->block_list_clean_lock);
+		mutex_lock(&v->block_list_clean_hash_lock);
+		mutex_lock(&v->block_list_prefetch_lock);
 
 #if DEBUG
-                BUG_ON(list_empty(v->block_list_clean.next) != 0);
+                BUG_ON(list_empty(v->block_list_clean.next) && list_empty(v->block_list_clean_hash.next) && list_empty(v->block_list_prefetch.next));
 #endif
 
-		d = list_entry(v->block_list_clean.next, struct data_block, list);
+		if(!list_empty(v->block_list_clean.next))		
+			d = list_entry(v->block_list_clean.next, struct data_block, list);
+		else if(list_empty(v->block_list_prefetch.next))
+		{
+#if DEBUG
+			prefetch_reuse++;
+			if(prefetch_reuse%1000 == 0 )
+			{               
+				printk(KERN_ERR "We prefetched %llu blocks and reused %llu prefetch blocks and %llu hash blocks. Prefetch usefulness is %llu.\n",prefetch_counter, prefetch_reuse, hash_reuse, prefetch_useful);
+				printk(KERN_ERR "Wait completion counter is %llu\n", wait_completion_counter);
+			}               
+#endif
+			d = list_entry(v->block_list_prefetch.next, struct data_block, list);
+		}
+		else
+		{
+#if DEBUG
+			hash_reuse++;
+			if(hash_reuse%1000 == 0)
+			{               
+				printk(KERN_ERR "We prefetched %llu blocks and reused %llu prefetch blocks and %llu hash blocks. Prefetch usefulness is %llu.\n",prefetch_counter, prefetch_reuse, hash_reuse, prefetch_useful);
+				printk(KERN_ERR "Wait completion counter is %llu\n", wait_completion_counter);
+			}               
+#endif
+			d = list_entry(v->block_list_clean_hash.next, struct data_block, list);
+		}
 #if DEBUG
                 clean_counter--;
 #endif
 		list_del(&d->list);
+		mutex_unlock(&v->block_list_prefetch_lock);
+		mutex_unlock(&v->block_list_clean_hash_lock);
 		mutex_unlock(&v->block_list_clean_lock);
 		
 		//if(read && !prefetch)
@@ -797,7 +909,19 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			//wait_for_completion(&d->event);
 			//printk(KERN_ERR "1: Done waiting in block_get\n");
 		//}
-
+		
+		
+#if DEBUG
+		if(prefetch)
+		{
+			prefetch_counter++;
+			if(prefetch_counter%1000 == 0)
+			{               
+				printk(KERN_ERR "We prefetched %llu blocks and reused %llu prefetch blocks and %llu hash blocks. Prefetch usefulness is %llu.\n",prefetch_counter, prefetch_reuse, hash_reuse, prefetch_useful);
+				printk(KERN_ERR "Wait completion counter is %llu\n", wait_completion_counter);
+			} 
+		}
+#endif
 		// If its part of the tree, we need to remove it
 		if (d->type != TYPE_EMPTY) {
 #if USE_RADIX
@@ -845,6 +969,10 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		atomic_set(&d->ref_count, 1);
 		init_completion(&d->event);
 		d->completion_initialized = true;
+		if(prefetch)
+			d->is_prefetch = true;
+		else
+			d->is_prefetch = false;
 		init_rwsem(&d->lock);
 //		if(!data_block)
 			tree_insert(&v->block_tree_root, d);
@@ -911,6 +1039,8 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 		// Its in our buffer, its not a prefetch, so reuse it
 		mutex_lock(&v->block_list_clean_lock);
+		mutex_lock(&v->block_list_clean_hash_lock);
+		mutex_lock(&v->block_list_prefetch_lock);
 		if (ref_count == 1 && !d->dirty) {
 			// we're the first to get it and its clean, so we need to move it
 			// out of the free list
@@ -922,6 +1052,8 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 #endif
 		}
 
+		mutex_unlock(&v->block_list_prefetch_lock);
+		mutex_unlock(&v->block_list_clean_hash_lock);
 		mutex_unlock(&v->block_list_clean_lock);
 	}
 
@@ -936,6 +1068,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	// Wait for read/write to finish
 	if ((!found && !memory_only && !prefetch && read) || (!memory_only && !prefetch && !data_block && d->completion_initialized)) {
 		//printk(KERN_ERR "2: Waiting for completion in block_get\n");
+#if DEBUG
+		wait_completion_counter++;
+#endif
 		wait_for_completion_io(&d->event);
 		//printk(KERN_ERR "2: Done waiting in block_get\n");
 	}
@@ -1378,6 +1513,15 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		up_write(&v->j_commit_outstanding);
 #endif
 	} else {
+
+#if DEBUG
+                journal_full++;
+                if(journal_full%2000 == 0)
+                {
+                      printk(KERN_ERR "Journal Full %llu times.\n", journal_full);
+                }
+#endif
+
 		//printk(KERN_ERR "Journal is totally full!!");
 #if TRICK
 		//printk(KERN_ERR "Second down_write\n");
@@ -1396,6 +1540,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		}
 		wait_counter++;
 #endif
+
 
 		tag_ptr = v->j_ds_buffer->data + sizeof(struct mint_journal_header)
 			+ (v->j_ds_fill - 1) * sizeof(struct mint_journal_block_tag);
@@ -1495,17 +1640,29 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 		}
 	}
 
-	if (unlikely(v->full_journal && !memcmp(journal_buffer->data + (v->dev_block_bytes * which),
+/*	if (unlikely(v->full_journal && !memcmp(journal_buffer->data + (v->dev_block_bytes * which),
 			magic, 4))) {
 		tag.options |= 2;
+		printk(KERN_ERR "data is bad  1!!\n");
 		memset(journal_buffer->data + (v->dev_block_bytes * which), 0, 4);
 	}
+	if (unlikely(!v->full_journal && !memcmp(journal_buffer->data + (hpb * which),
+					                        magic, 4))) {
+                tag.options |= 2;
+		printk(KERN_ERR "data is bad  2!!\n");
+                memset(journal_buffer->data + (hpb * which), 0, 4);
+        }
+*/
 	if (unlikely(error)) {
 		tag.options |= 1;
 	}
-	memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
+	if(tag_ptr)
+	{
+		//printk(KERN_ERR "data is bad  3!!\n");
+		memcpy(tag_ptr, &tag, sizeof(struct mint_journal_block_tag));
+	}
 
-	i = journal_buffer->size * (v->full_journal ? 1 : (v->dev_block_bytes / v->digest_size / 2));
+	i = journal_buffer->size * (v->full_journal ? 1 : hpb);
 	if (atomic_inc_return(&journal_buffer->finished) == i) {
 		mintegrity_do_journal_block_io(journal_buffer);
 	}
@@ -1578,6 +1735,7 @@ static int mintegrity_get_memory_tokens_pre(struct dm_mintegrity *v, int tokens)
 			init_completion(&d->event);
 			complete_all(&d->event);
 			d->completion_initialized = false;
+			d->is_prefetch = false;
 		}
 		atomic_add(tokens, &v->block_tokens);
 		// block_write_dirty(v, false, false);
@@ -1610,7 +1768,6 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 	if (v->j_ds_fill == v->j_ds_max) {
 		// We don't lets get a new one
 		//printk(KERN_ERR "We dont have enough descriptors\n");
-		mintegrity_commit_journal(v, false);
 	}
 
 	// NO jbs or current one is full
@@ -1743,8 +1900,8 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 		sizeof(struct mint_journal_block_tag);
 	v->j_ds_max = (v->j_ds_max) - (v->j_ds_max % J_PAGE_CHUNK_SIZE) - 1;
 
-	v->journal_block_mempool = mempool_create_kmalloc_pool(4000, sizeof(struct journal_block));
-	v->journal_page_mempool = mempool_create(2000, __get_free_pages, free_pages, J_PAGE_ORDER_SIZE);
+	v->journal_block_mempool = mempool_create_kmalloc_pool(12000, sizeof(struct journal_block));
+	v->journal_page_mempool = mempool_create(12000, __get_free_pages, free_pages, J_PAGE_ORDER_SIZE);
 
 	// Allocate io struct for usage
 	io = kzalloc(v->ti->per_bio_data_size, GFP_KERNEL);
@@ -2484,6 +2641,12 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			-EIO, tag, which);
 		return -EIO;
 	}
+#if DEBUG
+        pending_write--;
+	if(pending_write%4000 == 0)
+		printk(KERN_ERR "Pending writes: %llu \n", pending_write);
+#endif
+
 	// Finished!
 	return 0;
 }
@@ -2587,7 +2750,7 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 		mintegrity_hash_at_level(v, pw->block, i, &hash_block_start, NULL);
 		mintegrity_hash_at_level(v, pw->block + pw->n_blocks - 1, i,
 			&hash_block_end, NULL);
-		if (!i) {
+/*		if (!i) {
 			unsigned cluster = ACCESS_ONCE(dm_mintegrity_prefetch_cluster);
 
 			cluster >>= v->dev_block_bits;
@@ -2602,8 +2765,8 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 			if (unlikely(hash_block_end >= v->hash_blocks))
 				hash_block_end = v->hash_blocks - 1;
 		}
-	no_prefetch_cluster:
-		for (s = hash_block_start; s < hash_block_end - hash_block_start + 1; s++) {
+*/	no_prefetch_cluster:
+		for (s = hash_block_start; s < hash_block_end + 1; s++) {
 			int tokens = 1;
 
 			down_write(&v->j_lock);
@@ -2624,6 +2787,12 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 	}
 
 	kfree(pw);
+#if DEBUG
+        pending_prefetch--;
+        if(pending_prefetch%4000 == 0)
+                printk(KERN_ERR "Pending prefetch: %llu \n", pending_prefetch);
+#endif
+
 }
 
 static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
@@ -2642,6 +2811,9 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
 	pw->block = io->block;
 	pw->n_blocks = io->n_blocks;
 	queue_work(v->prefetch_workqueue, &pw->work);
+#if DEBUG
+	pending_prefetch++;
+#endif
 }
 
 /*
@@ -2682,19 +2854,26 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		io->n_blocks = bio->bi_iter.bi_size >> v->dev_block_bits;
 		io->iter = bio->bi_iter;
 
+#if DEBUG
+		total_requests++;
+		if(v->request_limit.count == 0)
+		{
+			printk(KERN_ERR "This is the last request in a while. Total requests: %llu\n", total_requests);
+		}
+#endif
+
 		// Limit the number of requests
 		down(&v->request_limit);
-#if DEBUG
-	        prefetch_counter++;
-#endif
 
 		// Prefetch blocks
 		mintegrity_submit_prefetch(v, io);
 
-
 		if (bio_data_dir(bio) == WRITE) {
 			INIT_WORK(&(io->work), mintegrity_write_work);
 			queue_work(io->v->workqueue, &io->work);
+#if DEBUG
+		        pending_write++;
+#endif
 		} else {
 			// Check local cache for non-written out blocks
 			// FIXME: multiple block support
@@ -2894,9 +3073,13 @@ static void mintegrity_dtr(struct dm_target *ti)
 
 #if DEBUG
 //	tree_dump(v->block_tree_root.rb_node, 1);
-//	printk(KERN_ERR "Total tree nodes: %llu\n", total_tree_nodes);
+	printk(KERN_ERR "Total requests: %llu\n", total_requests);
+	printk(KERN_ERR "Journal Full %llu times.\n", journal_full);
+	printk(KERN_ERR "Total tree nodes: %llu. Total wait for completion counter: %llu. The useful prefetch blocks: %llu\n", tree_insert_counter-tree_delete_counter, wait_completion_counter, prefetch_useful);
+	printk(KERN_ERR "We prefetched %llu blocks and reused %llu prefetch blocks and %llu hash blocks.\n",prefetch_counter, prefetch_reuse, hash_reuse);
 	printk(KERN_ERR "Total search counters: %llu.\n Tree inserts: %llu.\n Tree deletes: %llu.\n", search_counter, tree_insert_counter, tree_delete_counter);
         printk(KERN_ERR "Total search found counters: %llu.\n Search data counters: %llu.\n Search hash counters: %llu.\n", search_found_counter, search_data_counter, search_hash_counter);
+	printk(KERN_ERR "Total search missing counters: %llu.\n Search missing data counters: %llu.\n Search missing hash counters: %llu.\n", search_counter-search_found_counter, search_data_missing_counter, search_hash_missing_counter);
         printk(KERN_ERR "Empty delete counters: %llu.\n Data delete counters: %llu.\n Hash delete counters: %llu.\n Journal delete counters: %llu.", tree_delete_empty_counter, tree_delete_data_counter, tree_delete_hash_counter, tree_delete_journal_counter);
         printk(KERN_ERR "Empty insert counters: %llu.\n Data insert counters: %llu.\n Hash insert counters: %llu.\n Journal insert counters: %llu.", tree_insert_empty_counter, tree_insert_data_counter, tree_insert_hash_counter, tree_insert_journal_counter);
 	printk(KERN_ERR "Clean counter: %llu.\n Data dirty counter: %llu.\n Hash dirty counter: %llu.\n", clean_counter, data_dirty_counter, hash_dirty_counter);
@@ -2906,10 +3089,12 @@ static void mintegrity_dtr(struct dm_target *ti)
 	printk(KERN_ERR "verify_level_counter: %llu. \n prefetch_counter: %llu. \n", verify_level_counter, prefetch_counter);
 #endif
 	if (v->workqueue) {
+		flush_workqueue(v->workqueue);
 		destroy_workqueue(v->workqueue);
 	}
 
         if (v->prefetch_workqueue) {
+		flush_workqueue(v->prefetch_workqueue);
 		destroy_workqueue(v->prefetch_workqueue);
         }
 
@@ -2935,6 +3120,17 @@ static void mintegrity_dtr(struct dm_target *ti)
 			free_page((unsigned long)d->data);
 			kfree(d);
 		}
+		list_for_each_safe(pos, n, &v->block_list_clean_hash) {
+                        d = container_of(pos, struct data_block, list);
+                        free_page((unsigned long)d->data);
+                        kfree(d);
+                }
+		list_for_each_safe(pos, n, &v->block_list_prefetch) {
+                        d = container_of(pos, struct data_block, list);
+                        free_page((unsigned long)d->data);
+                        kfree(d);
+                }
+
 	}
 
 	if (v->journal_page_mempool) {
@@ -3301,6 +3497,8 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	/* Initialize lock for IO operations */
 	mutex_init(&v->block_tree_lock);
 	mutex_init(&v->block_list_clean_lock);
+	mutex_init(&v->block_list_clean_hash_lock);
+	mutex_init(&v->block_list_prefetch_lock);
 	mutex_init(&v->block_list_hash_dirty_lock);
 	mutex_init(&v->block_list_data_dirty_lock);
 #if USE_RADIX
@@ -3309,12 +3507,16 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	v->block_tree_root = RB_ROOT;
 #endif
 	INIT_LIST_HEAD(&v->block_list_clean);
+	INIT_LIST_HEAD(&v->block_list_clean_hash);
+	INIT_LIST_HEAD(&v->block_list_prefetch);
 	INIT_LIST_HEAD(&v->block_list_hash_dirty);
 	INIT_LIST_HEAD(&v->block_list_data_dirty);
 #if DEBUG
 	search_counter = 0;
 	search_hash_counter = 0;
 	search_data_counter = 0;
+	search_hash_missing_counter = 0;
+	search_data_missing_counter = 0;
 	search_found_counter = 0;
 	tree_insert_counter = 0;
 	clean_counter = 0;
@@ -3342,10 +3544,20 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	tree_insert_data_counter = 0;
 	tree_insert_journal_counter = 0;
 	total_tree_nodes = 0;
+	hash_reuse = 0;
+	prefetch_reuse = 0;
+	prefetch_counter = 0;
+	prefetch_useful = 0;
+	wait_completion_counter = 0;
+	journal_full = 0;
+	total_requests = 0;
+	pending_write = 0;
+	pending_prefetch = 0;
 #endif
 	checkpoint_work_counter = 0;
 	token_counter = 0;
 	wait_counter = 0;
+
 	init_rwsem(&(v->j_lock));
 	sema_init(&v->request_limit, DM_MINTEGRITY_DEFAULT_REQUEST_LIMIT);
 
@@ -3371,6 +3583,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		init_completion(&d->event);
 		complete_all(&d->event);
 		d->completion_initialized = false;
+		d->is_prefetch = false;
 	}
 
 	printk(KERN_CRIT "ALLOCATED MEMORY");
@@ -3378,7 +3591,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
 	v->workqueue = alloc_workqueue("kmintegrityd",
-		WQ_HIGHPRI | WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus()*2);
+		WQ_HIGHPRI | WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, 64);
 	if (!v->workqueue) {
 		ti->error = "Cannot allocate read workqueue";
 		r = -ENOMEM;
@@ -3386,13 +3599,13 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
         v->prefetch_workqueue = alloc_workqueue("kmintegrityd-prefetch",
-                 WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus()*4);
+                 WQ_MEM_RECLAIM | WQ_UNBOUND, 512);
         if (!v->prefetch_workqueue) {
                 ti->error = "Cannot allocate prefetch workqueue";
                 r = -ENOMEM;
                 goto bad;
         }
-			
+
 #if CHECKPOINT
 	v->delayed_workqueue = alloc_workqueue("kmintegrityd-write",
 			                WQ_CPU_INTENSIVE | WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, 1);
