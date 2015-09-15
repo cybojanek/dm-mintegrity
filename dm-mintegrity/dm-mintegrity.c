@@ -31,9 +31,9 @@
 
 #define USE_RADIX 1
 #define CHECKPOINT 1
-#define DEBUG 1
+#define DEBUG 0
 #define TRICK 1
-
+#define COARSE_LOCK 1
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -63,7 +63,7 @@ module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRU
 /* Last tag */
 #define J_TAG_LAST   2
 
-#define J_PAGE_ORDER_SIZE 2
+#define J_PAGE_ORDER_SIZE 4
 #define J_PAGE_CHUNK_SIZE (1 << J_PAGE_ORDER_SIZE)
 
 #define BLOCK_READ (1 << 0)
@@ -86,7 +86,7 @@ module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRU
 
 
 #if DEBUG
-static int dump_once = 0;
+//static int dump_once = 0;
 static uint64_t search_counter = 0;
 static uint64_t search_hash_counter = 0;
 static uint64_t search_data_counter = 0;
@@ -392,8 +392,8 @@ static inline int tree_insert(struct radix_tree_root *root, struct data_block *d
 {
 	int r;
 #if DEBUG
-	tree_insert_counter++;
 	char *ty = "";
+	tree_insert_counter++;
 	switch(data->type)
 	{
 		case TYPE_EMPTY:
@@ -578,7 +578,6 @@ static inline void block_release(struct data_block *d)
 	struct dm_mintegrity *v = d->v;
 	mutex_lock(&v->block_list_clean_lock);
 	mutex_lock(&v->block_list_clean_hash_lock);
-	mutex_lock(&v->block_list_prefetch_lock);
 	ref_count = atomic_dec_return(&d->ref_count);
 	if (ref_count < 0) {
 		printk(KERN_ERR "%s %d: sector %lu ref_count %d writers %d type %d dirty %d verified %d\n",
@@ -637,7 +636,6 @@ static inline void block_release(struct data_block *d)
 */		list_add_tail(&d->list, list);
 		mutex_unlock(list_lock);
 	}
-	mutex_unlock(&v->block_list_prefetch_lock);
 	mutex_unlock(&v->block_list_clean_hash_lock);
 	mutex_unlock(&v->block_list_clean_lock);
 }
@@ -701,7 +699,9 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	struct list_head *list;
 	struct mutex *list_lock;
 	struct block_device *dev;
+#if DEBUG
 	uint64_t *counter;
+#endif
 	uint64_t dirty_blocks;
 	// Get list, and locks
 	if (data) {
@@ -721,7 +721,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	}
 
 #if USE_RADIX	
-	mutex_lock(&v->block_tree_lock);
+//	mutex_lock(&v->block_tree_lock);
 #endif
 	mutex_lock(&v->block_list_clean_lock);
 	mutex_lock(&v->block_list_clean_hash_lock);
@@ -789,14 +789,14 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		generic_make_request(bio);
 		dirty_blocks++;
 	}
-	printk(KERN_ERR "Written %d Dirty blocks.\n", dirty_blocks);
+	printk(KERN_ERR "Written %llu Dirty blocks.\n", dirty_blocks);
 
 	mutex_unlock(list_lock);
 	mutex_unlock(&v->block_list_prefetch_lock);
 	mutex_unlock(&v->block_list_clean_hash_lock);
 	mutex_unlock(&v->block_list_clean_lock);
 #if USE_RADIX
-	mutex_unlock(&v->block_tree_lock);
+//	mutex_unlock(&v->block_tree_lock);
 #endif
 	if (flush) {
 		blkdev_issue_flush(dev, GFP_KERNEL, NULL);
@@ -816,6 +816,8 @@ static inline void dummy_rotate(struct rb_node *old, struct rb_node *new) {}
  * Valid flags:
  * BLOCK_MEMORY - just get from memory
  *
+ * Get the block_tree_lock before calling this function
+ *
  */
 static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	int flags, int *tokens)
@@ -827,14 +829,20 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	bool data_block = (flags & BLOCK_DATA) == BLOCK_DATA;
 	bool read = (flags & BLOCK_READ) == BLOCK_READ;
 	bool found = false;
-
+#if DEBUG
+        char *ty;
+#endif
 	// printk(KERN_CRIT "block_get start: %ld, %d, %d\n", sector, flags, *tokens);
 #if DEBUG
                 block_get_counter++;
 #endif
 
 	// Lock
+#if !COARSE_LOCK
+	printk(KERN_ERR "Waiting to get tree lock for sector %d.\n", sector);
 	mutex_lock(&v->block_tree_lock);
+	printk(KERN_ERR "Got the tree lock for        sector %d.\n", sector);
+#endif
 
 //	if(!data_block)
 //
@@ -932,7 +940,6 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 #if DEBUG
                 tree_delete_counter++;
-		char *ty;
 		switch(d->type)
 		{
 			case TYPE_EMPTY:
@@ -1005,7 +1012,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		*tokens -= 1;
 
 		if (prefetch) {
+#if !COARSE_LOCK
 			mutex_unlock(&v->block_tree_lock);
+#endif
 			block_release(d);
 			return NULL;
 		}
@@ -1061,8 +1070,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 	// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 5);
 
 	// Unlock
+#if !COARSE_LOCK
 	mutex_unlock(&v->block_tree_lock);
-
+#endif
 	// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 6);
 
 	// Wait for read/write to finish
@@ -1084,8 +1094,12 @@ static void delete_all_blocks(struct dm_mintegrity *v) {
 	struct data_block *d;
 	struct list_head *pos, *n;
 	struct list_head *list;
+#if USE_RADIX
+        void **slot;
+        struct radix_tree_iter iter;
+#else
 	struct rb_node *node;
-
+#endif
 	list = &v->block_list_hash_dirty;
 
 	list_for_each_safe(pos, n, list) {
@@ -1127,9 +1141,6 @@ static void delete_all_blocks(struct dm_mintegrity *v) {
 	// down_write(&v->hash_tree_semaphore);
 
 #if USE_RADIX
-	void **slot;
-	struct radix_tree_iter iter;
-
 	radix_tree_for_each_slot(slot, &v->block_tree_root, &iter, 0)
 	{
 		d = (struct data_block *) *slot;
@@ -1426,7 +1437,9 @@ static void mintegrity_read_journal_block(struct journal_block **jb,
 
 static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 {
+#if !TRICK
 	int i = 0;
+#endif
 	char *tag_ptr;
 	sector_t sector;
 	struct mint_journal_header mjh;
@@ -1625,7 +1638,7 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 	int which)
 {
 	int i;
-	char magic[4] = {0x59, 0x4c, 0x49, 0x4c};
+	//char magic[4] = {0x59, 0x4c, 0x49, 0x4c};
 	struct mint_journal_block_tag tag = {
 		cpu_to_le32(sector),
 		cpu_to_le32(sector >> 32),
@@ -1701,13 +1714,16 @@ static void mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 static void mintegrity_get_memory_tokens(struct dm_mintegrity *v, int tokens)
 {
 	// Lock journal
+	// Bhu: move the lock in the if?
 	down_write(&v->j_lock);
 
 	if (atomic_read(&v->block_tokens) < tokens) {
 		printk("Not enough tokens %llu", token_counter);
 		token_counter++;
 		// Not enough memory - commit everything
+		//down_write(&v->j_lock);
 		mintegrity_commit_journal(v, true);
+		//up_write(&v->j_lock);
 		mintegrity_checkpoint_journal(v);
 	}
 	BUG_ON(atomic_read(&v->block_tokens) < tokens);
@@ -1768,6 +1784,7 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 	if (v->j_ds_fill == v->j_ds_max) {
 		// We don't lets get a new one
 		//printk(KERN_ERR "We dont have enough descriptors\n");
+		mintegrity_commit_journal(v, false);
 	}
 
 	// NO jbs or current one is full
@@ -1844,14 +1861,14 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 		+ v->j_ds_fill * sizeof(struct mint_journal_block_tag);
 	// Increment descriptor block fill
 	v->j_ds_fill++;
-        // Unlock journal
+#if !TRICK
+	atomic_inc(&v->j_commit_outstanding);
+#endif
+	// Unlock journal
 	up_write(&v->j_lock);
-	
 #if TRICK
 	//printk(KERN_ERR "down_read\n");
 	down_read(&v->j_commit_outstanding);
-#else
-	atomic_inc(&v->j_commit_outstanding);
 #endif
 	return r;
 }
@@ -1901,7 +1918,7 @@ static int mintegrity_recover_journal(struct dm_mintegrity *v)
 	v->j_ds_max = (v->j_ds_max) - (v->j_ds_max % J_PAGE_CHUNK_SIZE) - 1;
 
 	v->journal_block_mempool = mempool_create_kmalloc_pool(12000, sizeof(struct journal_block));
-	v->journal_page_mempool = mempool_create(12000, __get_free_pages, free_pages, J_PAGE_ORDER_SIZE);
+	v->journal_page_mempool = mempool_create(12000, (void * (*)(gfp_t,  void *))__get_free_pages, (void (*)(void *, void *))free_pages, (void *)J_PAGE_ORDER_SIZE);
 
 	// Allocate io struct for usage
 	io = kzalloc(v->ti->per_bio_data_size, GFP_KERNEL);
@@ -2200,7 +2217,10 @@ Sector journal:
  *
  * If dmb is not NULL, then the buffer, data and offset are stored into that
  * pointer and the dm-bufio buffer is NOT RELEASED
+ *
+ * Lock the tree lock before calling this function.
  */
+
 static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 	int level, bool skip_unverified, struct data_block **dmb, int *tokens)
 {
@@ -2300,7 +2320,10 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 	struct shash_desc *desc;
 	bool skip_chain = false;
 
-	for (b = 0; b < io->n_blocks; b++) {
+#if COARSE_LOCK
+                mutex_lock(&v->block_tree_lock);
+#endif
+		for (b = 0; b < io->n_blocks; b++) {
 		int r;
 		int tokens;
 		u8 *result;
@@ -2319,7 +2342,9 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 			 */
 			tokens = 1;
 			mintegrity_get_memory_tokens(v, tokens);
+			//Bhu: lock tree
 			r = mintegrity_verify_level(io, data_sector, 0, true, NULL, &tokens);
+			//Bhu: unlock tree
 			if(tokens)
 				mintegrity_return_memory_tokens(v, tokens);
 			if (likely(!r)) {
@@ -2327,7 +2352,12 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 				goto test_block_hash;
 			}
 			if (r < 0)
+			{
+#if COARSE_LOCK
+		                mutex_unlock(&v->block_tree_lock);
+#endif
 				return r;
+			}
 		}
 
 		memcpy(io_want_digest(v, io), v->root_digest, v->digest_size);
@@ -2339,10 +2369,15 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 		tokens = v->levels;
 		mintegrity_get_memory_tokens(v, tokens);
 
+		//Bhu: lock tree
 		for (i = v->levels - 1; i >= 0; i--) {
 			int r = mintegrity_verify_level(io, data_sector, i, false,
 				dm_buffers + i, &tokens);
 			if (unlikely(r)) {
+#if COARSE_LOCK
+				mutex_unlock(&v->block_tree_lock);
+#endif
+
 				if(tokens)
 					mintegrity_return_memory_tokens(v, tokens);
 				for (j = v->levels - 1; j > i; j--) {
@@ -2351,6 +2386,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 				return r;
 			}
 		}
+		//Bhu: unlock tree
 		if(tokens)
 			mintegrity_return_memory_tokens(v, tokens);
 
@@ -2446,10 +2482,16 @@ test_block_hash:
 			}
 		}
 	}
+#if COARSE_LOCK
+        mutex_unlock(&v->block_tree_lock);
+#endif
 
 	return 0;
 
 	release_ret_r:
+#if COARSE_LOCK
+                mutex_unlock(&v->block_tree_lock);
+#endif
 		if (!skip_chain) {
 			for (i = v->levels - 1; i >= 0; i--) {
 				block_release(dm_buffers[i]);
@@ -2465,7 +2507,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 	struct data_block *data_block, *d;
 	struct dm_mintegrity *v = io->v;
 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
-	int hpb = v->dev_block_bytes / (2 * v->digest_size);
+	//int hpb = v->dev_block_bytes / (2 * v->digest_size);
 
 	for (b = 0; b < io->n_blocks; b++) {
 		int r;
@@ -2509,6 +2551,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			// Safe to return because nothing needs to be cleaned up here
 			if(tokens)
 				mintegrity_return_memory_tokens(v, tokens);
+			DMERR("Get journal buffer error!!\n");
 			return -EIO;
 		}
 
@@ -2518,12 +2561,19 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		// Read levels, TOP DOWN and compare to io want, which is set after
 		// every successive read
 		io->previous_hash = v->root_digest;
-
+		
+		//Bhu: lock tree
+#if COARSE_LOCK
+		mutex_lock(&v->block_tree_lock);
+#endif
 		for (i = v->levels - 1; i >= 0; i--) {
 			r = mintegrity_verify_level(io, sector, i, false,
 					dm_buffers + i, &tokens);
 			if (unlikely(r)) {
 				DMERR("failed write read layers");
+#if COARSE_LOCK
+				mutex_unlock(&v->block_tree_lock);
+#endif
 				for (j = v->levels - 1; j > i; j--) {
 					atomic_dec(&dm_buffers[j]->writers);
 					block_release(dm_buffers[j]);
@@ -2538,6 +2588,11 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		}
 		// Get ready to write to disk
 		data_block = block_get(v, sector + v->data_start, BLOCK_DATA, &tokens);
+		//Bhu: unlock tree
+#if COARSE_LOCK
+		mutex_unlock(&v->block_tree_lock);
+#endif
+
 		if(tokens)
 			mintegrity_return_memory_tokens(v, tokens);
 		block_mark_dirty(data_block);
@@ -2765,10 +2820,14 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 			if (unlikely(hash_block_end >= v->hash_blocks))
 				hash_block_end = v->hash_blocks - 1;
 		}
-*/	no_prefetch_cluster:
-		for (s = hash_block_start; s < hash_block_end + 1; s++) {
+	no_prefetch_cluster:
+*/		//Bhu: lock tree
+#if COARSE_LOCK
+		mutex_lock(&v->block_tree_lock);
+#endif
+		for (s = hash_block_start; s < hash_block_end - hash_block_start + 1; s++) {
 			int tokens = 1;
-
+			//Bhu: no need for lock?
 			down_write(&v->j_lock);
 			if (atomic_dec_return(&v->block_tokens) < 0) {
 				// Couldn't get a token, everything is used up, avoid making
@@ -2784,6 +2843,10 @@ static void mintegrity_prefetch_io(struct work_struct *work)
 			if(tokens)
 				mintegrity_return_memory_tokens(v, tokens);
 		}
+		//Bhu: unlock tree
+#if COARSE_LOCK
+		mutex_unlock(&v->block_tree_lock);
+#endif
 	}
 
 	kfree(pw);
@@ -2883,6 +2946,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			sector_t block_idx = 0;
 			struct bio *split = NULL;
 			int split_sectors = 0;
+			char *data;
 
 			// last block state
 			// 0: no last block
@@ -2890,6 +2954,10 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			// 2: last block not in buffer
 			int last_block = 0;
 
+			//Bhu: lock tree
+#if COARSE_LOCK
+			mutex_lock(&v->block_tree_lock);
+#endif
 			// printk(KERN_CRIT "Start map read...\n");
 			for (block_idx = 0; block_idx < io->n_blocks; block_idx += 1) {
 				tokens = 1;
@@ -2914,7 +2982,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 					bio_for_each_segment(bv, bio, iter) {
 						BUG_ON(bv.bv_len > todo);
-						char *data = bvec_kmap_irq(&bv, &flags);
+						data = bvec_kmap_irq(&bv, &flags);
 						memcpy(data, b->data + v->dev_block_bytes - todo, bv.bv_len);
 						flush_dcache_page(bv.bv_page);
 						bvec_kunmap_irq(data, &flags);
@@ -2951,6 +3019,10 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 					last_block = 2;
 				}
 			}
+			//Bhu: unlock tree
+#if COARSE_LOCK
+			mutex_unlock(&v->block_tree_lock);
+#endif
 
 			if (all_in_memory || last_block == 1) {
 				// got all pages from buffer, or last block is from buffer, finalize read request
@@ -3591,7 +3663,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
 	v->workqueue = alloc_workqueue("kmintegrityd",
-		WQ_HIGHPRI | WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, 64);
+		 WQ_CPU_INTENSIVE | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
 	if (!v->workqueue) {
 		ti->error = "Cannot allocate read workqueue";
 		r = -ENOMEM;
@@ -3599,7 +3671,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	}
 
         v->prefetch_workqueue = alloc_workqueue("kmintegrityd-prefetch",
-                 WQ_MEM_RECLAIM | WQ_UNBOUND, 512);
+                 WQ_HIGHPRI | WQ_MEM_RECLAIM | WQ_UNBOUND, num_online_cpus());
         if (!v->prefetch_workqueue) {
                 ti->error = "Cannot allocate prefetch workqueue";
                 r = -ENOMEM;
