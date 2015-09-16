@@ -28,6 +28,7 @@
 #include <linux/gfp.h>
 
 #include <asm/smp.h>
+#include <asm/page.h>
 
 #define USE_RADIX 1
 #define CHECKPOINT 1
@@ -361,7 +362,8 @@ struct dm_mintegrity_io {
  */
 static inline bool node_not_in_list(struct list_head *node)
 {
-	return (node->next == NULL) || (node->prev == NULL)
+	return (node == NULL) || (node == LIST_POISON1) || (node == LIST_POISON2) 
+		|| (node->next == NULL) || (node->prev == NULL)
 		|| (node->next == LIST_POISON1) || (node->prev == LIST_POISON2)
 		|| list_empty(node);
 }
@@ -633,7 +635,18 @@ static inline void block_release(struct data_block *d)
 		{
 			printk(KERN_ERR "About to have a page fault!!! \n");
 		}
-*/		list_add_tail(&d->list, list);
+*/		
+                if(node_not_in_list(&d->list))
+                {
+                        INIT_LIST_HEAD(&d->list);
+                }
+                if(!virt_addr_valid(list) || !virt_addr_valid(list->prev) || !virt_addr_valid(list->next) || node_not_in_list(list))
+                {
+                        //printk("Avoiding the poison page fault. 1\n");
+                        INIT_LIST_HEAD(list);
+                }
+
+		list_add_tail(&d->list, list);
 		mutex_unlock(list_lock);
 	}
 	mutex_unlock(&v->block_list_clean_hash_lock);
@@ -1469,7 +1482,10 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 #if TRICK
 		//printk(KERN_ERR "First down_write\n");
+		up_write(&v->j_lock);
 		down_write(&v->j_commit_outstanding);
+		down_write(&v->j_lock);
+		
 #else
 		while (true) {
 			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
@@ -1523,7 +1539,9 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		}
 #if TRICK
 		//printk(KERN_ERR "First up_write\n");
+		up_write(&v->j_lock);
 		up_write(&v->j_commit_outstanding);
+		down_write(&v->j_lock);
 #endif
 	} else {
 
@@ -1538,7 +1556,9 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		//printk(KERN_ERR "Journal is totally full!!");
 #if TRICK
 		//printk(KERN_ERR "Second down_write\n");
+		up_write(&v->j_lock);
                 down_write(&v->j_commit_outstanding);
+		down_write(&v->j_lock);
 #else
 		while (true) {
 			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
@@ -1579,7 +1599,9 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
 #if TRICK
 		//printk(KERN_ERR "Second up_write\n");
+		up_write(&v->j_lock);
                 up_write(&v->j_commit_outstanding);
+		down_write(&v->j_lock);
 #endif
 	}
 
@@ -2782,7 +2804,8 @@ static void mintegrity_write_work(struct work_struct *w)
 	}
 
 	up(&io->v->request_limit);
-	bio_endio(bio, error);
+	//printk(KERN_ERR "Ending write bio %d \n", atomic_read(&bio->bi_remaining));
+	bio_endio_nodec(bio, error);
 }
 
 /*
@@ -3027,11 +3050,11 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			if (all_in_memory || last_block == 1) {
 				// got all pages from buffer, or last block is from buffer, finalize read request
 				up(&v->request_limit);
-        			if(atomic_read(&bio->bi_remaining) <= 0)
-		        	{
-					printk(KERN_ERR "Going to trigger a bug in multiblock support.\n");
+//        			if(atomic_read(&bio->bi_remaining) <= 0)
+//		        	{
+					printk(KERN_ERR "Going to trigger a bug in multiblock support %d.\n", atomic_read(&bio->bi_remaining));
 //					atomic_set(&bio->bi_remaining, 1);
-				}
+//				}
 
 				bio_endio(bio, 0);
 			}
