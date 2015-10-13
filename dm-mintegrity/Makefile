@@ -1,3 +1,5 @@
+CCFLAGS += -g -gdb -O0
+ccflags-y += -g -O0
 obj-m = dm-mintegrity.o
 KVERSION = $(shell uname -r)
 

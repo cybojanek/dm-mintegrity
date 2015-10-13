@@ -6,7 +6,7 @@ BASEDIR=$(dirname `readlink -f $0`)
 ################################################
 # CONFIGURE THIS CORRECTLY
 HDD=/dev/sda3
-SSD=/dev/sdb
+SSD=/dev/sda2
 MOUNTPOINT=/mnt/scratch
 MKMINT=${BASEDIR}/../mkmint/mkmint
 ################################################
@@ -75,8 +75,8 @@ drop_cache() {
     sleep 2
 }
 
-DD_STREAM_SIZE=1048576 # 4096 MiB
-#DD_STREAM_SIZE=5120
+#DD_STREAM_SIZE=256         # 2097152 # 1048576 # 4096 MiB
+DD_STREAM_SIZE=262144
 # Turn off and on tests here FALSE / TRUE, or comma seperater / empty
 DD=TRUE
 DATABASE=FALSE

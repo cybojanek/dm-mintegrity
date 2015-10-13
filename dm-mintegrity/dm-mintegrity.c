@@ -34,7 +34,7 @@
 #define CHECKPOINT 1
 #define DEBUG 0
 #define TRICK 1
-#define COARSE_LOCK 1
+#define COARSE_LOCK 0
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -284,8 +284,10 @@ struct dm_mintegrity {
 	// Block cache data structures
 #if USE_RADIX
 	struct radix_tree_root block_tree_root;
+	struct radix_tree_root hash_block_tree_root;
 #else
 	struct rb_root block_tree_root;
+	struct rb_root hash_block_tree_root;
 #endif
 	struct list_head block_list_clean;
 	struct list_head block_list_clean_hash;
@@ -421,6 +423,9 @@ static inline int tree_insert(struct radix_tree_root *root, struct data_block *d
 
 	if((r = radix_tree_insert(root, data->sector, data)) == -EEXIST)
 	{
+#if DEBUG
+		printk("Trying to insert the same node of sector %d and type %d again\n", (int)data->sector, (int)data->type);
+#endif
 		radix_tree_delete(root, data->sector);
 		r = radix_tree_insert(root, data->sector, data);
 	}
@@ -620,8 +625,7 @@ static inline void block_release(struct data_block *d)
 #if DEBUG
                         data_dirty_counter++;
 #endif
-
-		} else {
+} else {
 			list = &v->block_list_hash_dirty;
 			list_lock = &v->block_list_hash_dirty_lock;
 #if DEBUG
@@ -852,16 +856,20 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 	// Lock
 #if !COARSE_LOCK
-	printk(KERN_ERR "Waiting to get tree lock for sector %d.\n", sector);
+#if DEBUG
+	printk(KERN_ERR "Waiting to get tree lock for sector %d.\n", (int)sector);
+#endif
 	mutex_lock(&v->block_tree_lock);
-	printk(KERN_ERR "Got the tree lock for        sector %d.\n", sector);
+#if DEBUG
+	printk(KERN_ERR "Got the tree lock for        sector %d.\n", (int)sector);
+#endif
 #endif
 
-//	if(!data_block)
-//
+	if(!data_block)
+
 		d = tree_search(&v->block_tree_root, sector);
-//	else
-//		d = NULL;
+	else
+		d = tree_search(&v->hash_block_tree_root, sector);
 	if(d)
 		found = true;
 
@@ -943,35 +951,48 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			} 
 		}
 #endif
+		// In the rare event that we get a prefetch block to from the list
+		wait_for_completion(&d->event);
+
 		// If its part of the tree, we need to remove it
 		if (d->type != TYPE_EMPTY) {
+			if(data_block) {
 #if USE_RADIX
-		tree_delete(&v->block_tree_root, d);
+				tree_delete(&v->block_tree_root, d);
 #else
-		rb_erase(&d->node, &v->block_tree_root);
+				rb_erase(&d->node, &v->block_tree_root);
 #endif
+			}
+			else
+			{
+#if USE_RADIX
+				tree_delete(&v->hash_block_tree_root, d);
+#else
+				rb_erase(&d->node, &v->hash_block_tree_root);
+#endif
+			}
 
 #if DEBUG
-                tree_delete_counter++;
-		switch(d->type)
-		{
-			case TYPE_EMPTY:
-				tree_delete_empty_counter++;
-				ty = "Empty";
-				break;
-			case TYPE_HASH:
-                                tree_delete_hash_counter++;
-                                ty = "Hash";
-                                break;
-			case TYPE_DATA:
-                                tree_delete_data_counter++;
-                                ty = "Data";
-                                break;
-			case TYPE_JOURNAL:
-                                tree_delete_journal_counter++;
-                                ty = "Journal";
-                                break;
-		}
+                	tree_delete_counter++;
+			switch(d->type)
+			{
+				case TYPE_EMPTY:
+					tree_delete_empty_counter++;
+					ty = "Empty";
+					break;
+				case TYPE_HASH:
+                       		        tree_delete_hash_counter++;
+                       		        ty = "Hash";
+                        	        break;
+				case TYPE_DATA:
+                        	        tree_delete_data_counter++;
+                               		ty = "Data";
+                                	break;
+				case TYPE_JOURNAL:
+                                	tree_delete_journal_counter++;
+                                	ty = "Journal";
+                                	break;
+			}
 //		printk("Deleting node of type %s.\n", ty);
 #endif
 		}
@@ -994,8 +1015,10 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		else
 			d->is_prefetch = false;
 		init_rwsem(&d->lock);
-//		if(!data_block)
+		if(data_block)
 			tree_insert(&v->block_tree_root, d);
+		else
+			tree_insert(&v->hash_block_tree_root, d);
 
 		// Set up bio
 		// Only send it out if its a read
@@ -1012,7 +1035,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			bio->bi_private = d;
 			bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
 #if DEBUG
-                bio_add_page_read_counter+=v->dev_block_bytes;
+                	bio_add_page_read_counter+=v->dev_block_bytes;
 #endif
 
 			generic_make_request(bio);
@@ -1081,7 +1104,6 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 	// TODO: prefetch? move to tail?
 	// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 5);
-
 	// Unlock
 #if !COARSE_LOCK
 	mutex_unlock(&v->block_tree_lock);
@@ -2337,7 +2359,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 	struct dm_mintegrity *v = io->v;
 	struct bio *bio = dm_bio_from_per_bio_data(io, v->ti->per_bio_data_size);
 	unsigned b;
-	int i, j, r;
+	int i, j, r = 0;
 	struct data_block **dm_buffers = io_dm_buffers(v, io);
 	struct shash_desc *desc;
 	bool skip_chain = false;
@@ -3060,6 +3082,11 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			}
 			// printk(KERN_CRIT "End map read...\n");
 		}
+	}
+	
+	if(bio_data_dir(bio) & REQ_SYNC)
+	{
+		mintegrity_commit_journal(v, true);
 	}
 
 	return DM_MAPIO_SUBMITTED;
