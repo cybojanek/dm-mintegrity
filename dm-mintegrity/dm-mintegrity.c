@@ -896,9 +896,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
                 BUG_ON(list_empty(v->block_list_clean.next) && list_empty(v->block_list_clean_hash.next) && list_empty(v->block_list_prefetch.next));
 #endif
 
-		if(!list_empty(v->block_list_clean.next))		
+		if(!list_empty(&v->block_list_clean))
 			d = list_entry(v->block_list_clean.next, struct data_block, list);
-		else if(list_empty(v->block_list_prefetch.next))
+		else if(!list_empty(&v->block_list_prefetch))
 		{
 #if DEBUG
 			prefetch_reuse++;
