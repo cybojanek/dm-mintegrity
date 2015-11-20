@@ -33,7 +33,7 @@
 #define USE_RADIX 1
 #define CHECKPOINT 1
 #define DEBUG 0
-#define TRICK 1
+#define TRICK 0
 #define COARSE_LOCK 0
 
 #define DM_MSG_PREFIX			"mintegrity"
@@ -319,7 +319,7 @@ struct dm_mintegrity {
 
 struct dm_mintegrity_io {
 	struct dm_mintegrity *v;  /* dm-mintegrity instance info */
-    struct bvec_iter iter;
+	struct bvec_iter iter;
 	sector_t block;     /* Start of block IO */
 
 	uint32_t n_blocks;  /* Number of blocks in IO */
@@ -369,8 +369,6 @@ static inline bool node_not_in_list(struct list_head *node)
 		|| (node->next == LIST_POISON1) || (node->prev == LIST_POISON2)
 		|| list_empty(node);
 }
-
-
 
 
 #if USE_RADIX
@@ -625,7 +623,7 @@ static inline void block_release(struct data_block *d)
 #if DEBUG
                         data_dirty_counter++;
 #endif
-} else {
+		} else {
 			list = &v->block_list_hash_dirty;
 			list_lock = &v->block_list_hash_dirty_lock;
 #if DEBUG
@@ -756,7 +754,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		BUG_ON(atomic_read(&d->ref_count) < 0);
 		if(atomic_read(&d->ref_count) != 0 && d->dirty)
 		{
-			printk(KERN_ERR "This shouldnt happen. The ref count of d is %d.\n", atomic_read(&d->ref_count));
+			printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu.\n", atomic_read(&d->ref_count), d->sector);
 			list_del(&d->list);
 			INIT_LIST_HEAD(&d->list);
 			continue;
@@ -865,20 +863,21 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 #endif
 #endif
 
-	if(!data_block)
-
+	if (data_block)
 		d = tree_search(&v->block_tree_root, sector);
 	else
 		d = tree_search(&v->hash_block_tree_root, sector);
-	if(d)
+	if (d) {
 		found = true;
+		BUG_ON(d->sector != sector);
+	}
 
 #if DEBUG
-	if(found && !prefetch && d->is_prefetch)
+	if (found && !prefetch && d->is_prefetch)
 		prefetch_useful++;
-	if(!found && data_block)
+	if (!found && data_block)
 		search_data_missing_counter++;
-	else if(!found && !data_block)
+	else if (!found && !data_block)
 		search_hash_missing_counter++;
 #endif
 
@@ -956,20 +955,21 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 		// If its part of the tree, we need to remove it
 		if (d->type != TYPE_EMPTY) {
-			if(data_block) {
+			if (d->type == TYPE_DATA) {
 #if USE_RADIX
 				tree_delete(&v->block_tree_root, d);
 #else
 				rb_erase(&d->node, &v->block_tree_root);
 #endif
-			}
-			else
-			{
+			} else if (d->type == TYPE_HASH) {
 #if USE_RADIX
 				tree_delete(&v->hash_block_tree_root, d);
 #else
 				rb_erase(&d->node, &v->hash_block_tree_root);
 #endif
+			} else {
+				printk(KERN_WARNING "%s %d: unexpected data_block type %d\n",
+						__func__, __LINE__, d->type);
 			}
 
 #if DEBUG
@@ -1427,7 +1427,6 @@ static void mintegrity_init_journal_block(struct journal_block **jb,
 	struct journal_block *j;
 	*jb = j = mempool_alloc(v->journal_block_mempool, GFP_NOIO);
 	j->data = mempool_alloc(v->journal_page_mempool, GFP_NOIO);
-	BUG_ON(j->data == NULL);
 	j->v = v;
 	j->size = size;
 	j->event = NULL;
@@ -1579,7 +1578,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 #if TRICK
 		//printk(KERN_ERR "Second down_write\n");
 		up_write(&v->j_lock);
-                down_write(&v->j_commit_outstanding);
+		down_write(&v->j_commit_outstanding);
 		down_write(&v->j_lock);
 #else
 		while (true) {
@@ -1588,7 +1587,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 				break;
 			}
 			if (i != 0 && i % 10000000 == 0 ) {
-				 printk(KERN_CRIT "2: 10 millions: %d, %d, wait_counter: %llu",
+				 printk(KERN_CRIT "2: 10 millions: %d, %d, wait_counter: %llu\n",
 				 		i / 10000000, atomic_read(&v->j_commit_outstanding), wait_counter);
 			}
 			i++;
@@ -1622,7 +1621,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 #if TRICK
 		//printk(KERN_ERR "Second up_write\n");
 		up_write(&v->j_lock);
-                up_write(&v->j_commit_outstanding);
+		up_write(&v->j_commit_outstanding);
 		down_write(&v->j_lock);
 #endif
 	}
@@ -1839,7 +1838,6 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 		// Check for space - need blocks chunk + commit block
 		if (atomic_read(&v->j_fill) + 1 + J_PAGE_CHUNK_SIZE >= v->journal_blocks - 1) {
 			// Make space in journal
-			printk(KERN_ERR "Making space in the jornal\n");
 			mintegrity_commit_journal(v, true);
 			mintegrity_checkpoint_journal(v);
 		}
@@ -2284,7 +2282,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 	d = block_get(v, hash_block,
 			BLOCK_READ | (skip_unverified ? BLOCK_MEMORY : 0), tokens);
 	if (!d) {
-		printk(KERN_ERR "block_get returned null\n");
+		//printk(KERN_ERR "block_get returned null\n");
 		return 1;
 	}
 
@@ -2293,7 +2291,9 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 
 		if (skip_unverified) {
 			r = 1;
-			printk(KERN_ERR "Skipping unverified!\n");
+			//printk(KERN_ERR "Skipping unverified!\n");
+			//DMERR_LIMIT("metadata block %llu is skipped, block %llu, level %d, offset %u",
+			//		(unsigned long long)hash_block, block, level, offset);
 			goto release_ret_r;
 		}
 
@@ -2322,9 +2322,10 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))
 					&& !ACCESS_ONCE(d->verified)) {
 				printk(KERN_ERR "Metadata block is corrupted!\n");
-				DMERR_LIMIT("metadata block %llu is corrupted",
-					(unsigned long long)hash_block);
+				DMERR_LIMIT("metadata block %llu is corrupted, block %llu, level %d, offset %u",
+					(unsigned long long)hash_block, block, level, offset);
 				v->hash_failed = 1;
+				dump_stack();
 				r = -EIO;
 				goto release_ret_r;
 			}
@@ -2346,7 +2347,6 @@ normal_return:
 	return 0;
 
 	release_ret_r:
-		printk(KERN_ERR "The integrity chain didnt hold up!!!\n");
 		block_release(d);
 		return r;
 }
@@ -2815,6 +2815,8 @@ static void mintegrity_write_work(struct work_struct *w)
 	struct dm_mintegrity_io *io = container_of(w, struct dm_mintegrity_io, work);
 	struct bio *bio = dm_bio_from_per_bio_data(io, io->v->ti->per_bio_data_size);
 
+	//printk(KERN_ERR "%s[%d] (%d) processing one write work\n",
+	//		__func__, __LINE__, smp_processor_id());
 	error = mintegrity_verify_write_io(io);
 
 	// FIXME: should this happen before?
@@ -2827,7 +2829,9 @@ static void mintegrity_write_work(struct work_struct *w)
 
 	up(&io->v->request_limit);
 	//printk(KERN_ERR "Ending write bio %d \n", atomic_read(&bio->bi_remaining));
-	bio_endio_nodec(bio, error);
+	bio_endio(bio, error);
+	//printk(KERN_ERR "%s[%d] (%d) finished processing one write work\n",
+	//		__func__, __LINE__, smp_processor_id());
 }
 
 /*
@@ -3007,7 +3011,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			for (block_idx = 0; block_idx < io->n_blocks; block_idx += 1) {
 				tokens = 1;
 				mintegrity_get_memory_tokens(v, tokens);
-				b = block_get(v, io->block + block_idx + v->data_start, BLOCK_MEMORY | BLOCK_READ, &tokens);
+				b = block_get(v, io->block + block_idx + v->data_start, BLOCK_MEMORY | BLOCK_READ | BLOCK_DATA, &tokens);
 				if(tokens)
 					mintegrity_return_memory_tokens(v, tokens);
 				if (b) {
@@ -3074,7 +3078,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 				up(&v->request_limit);
 //        			if(atomic_read(&bio->bi_remaining) <= 0)
 //		        	{
-					printk(KERN_ERR "Going to trigger a bug in multiblock support %d.\n", atomic_read(&bio->bi_remaining));
+					//printk(KERN_ERR "Going to trigger a bug in multiblock support %d.\n", atomic_read(&bio->bi_remaining));
 //					atomic_set(&bio->bi_remaining, 1);
 //				}
 
