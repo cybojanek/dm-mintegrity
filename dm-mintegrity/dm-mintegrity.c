@@ -33,7 +33,7 @@
 #define USE_RADIX 1
 #define CHECKPOINT 1
 #define DEBUG 0
-#define TRICK 0
+#define TRICK 1
 #define COARSE_LOCK 0
 
 #define DM_MSG_PREFIX			"mintegrity"
@@ -267,7 +267,8 @@ struct dm_mintegrity {
 	struct semaphore request_limit;
 	atomic_t j_fill;     /* Number of blocks in journal - need atomic due to writeback */
 #if TRICK
-	struct rw_semaphore j_commit_outstanding;
+	atomic_t j_pending_commit;
+	struct completion j_pending_event;
 #else
 	atomic_t j_commit_outstanding;
 #endif
@@ -581,17 +582,14 @@ static inline void block_release(struct data_block *d)
 {
 	int ref_count;
 	struct dm_mintegrity *v = d->v;
+
 	mutex_lock(&v->block_list_clean_lock);
 	mutex_lock(&v->block_list_clean_hash_lock);
 	ref_count = atomic_dec_return(&d->ref_count);
-	if (ref_count < 0) {
-		printk(KERN_ERR "%s %d: sector %lu ref_count %d writers %d type %d dirty %d verified %d\n",
-			__FILE__, __LINE__, d->sector, ref_count, atomic_read(&d->writers), d->type, d->dirty, d->verified);
-	}
 	BUG_ON(ref_count < 0);
 	if (ref_count == 0 && !d->dirty) {
 #if DEBUG
-                        clean_counter++;
+		clean_counter++;
 #endif
 #if DEBUG
 //                tree_delete_counter++;
@@ -607,6 +605,7 @@ static inline void block_release(struct data_block *d)
 //			mutex_unlock(&v->block_tree_lock);
 //		}
 #endif
+
 		if(d->type == TYPE_HASH)
 			list_add_tail(&d->list, &v->block_list_clean_hash);
 		else
@@ -754,7 +753,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		BUG_ON(atomic_read(&d->ref_count) < 0);
 		if(atomic_read(&d->ref_count) != 0 && d->dirty)
 		{
-			printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu.\n", atomic_read(&d->ref_count), d->sector);
+			printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu, data %d.\n", atomic_read(&d->ref_count), (unsigned long long)d->sector, data);
 			list_del(&d->list);
 			INIT_LIST_HEAD(&d->list);
 			continue;
@@ -804,7 +803,10 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		generic_make_request(bio);
 		dirty_blocks++;
 	}
-	printk(KERN_ERR "Written %llu Dirty blocks.\n", dirty_blocks);
+#if DEBUG
+	if (dirty_blocks > 0)
+		printk(KERN_ERR "Written %llu Dirty blocks.\n", dirty_blocks);
+#endif
 
 	mutex_unlock(list_lock);
 	mutex_unlock(&v->block_list_prefetch_lock);
@@ -863,21 +865,21 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 #endif
 #endif
 
-	if (data_block)
+	if(data_block)
 		d = tree_search(&v->block_tree_root, sector);
 	else
 		d = tree_search(&v->hash_block_tree_root, sector);
-	if (d) {
+	if(d) {
 		found = true;
 		BUG_ON(d->sector != sector);
 	}
 
 #if DEBUG
-	if (found && !prefetch && d->is_prefetch)
+	if(found && !prefetch && d->is_prefetch)
 		prefetch_useful++;
-	if (!found && data_block)
+	if(!found && data_block)
 		search_data_missing_counter++;
-	else if (!found && !data_block)
+	else if(!found && !data_block)
 		search_hash_missing_counter++;
 #endif
 
@@ -1055,26 +1057,25 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			return NULL;
 		}
 	} else if (found && !prefetch) {
-		int ref_count = atomic_inc_return(&d->ref_count);
+		int ref_count =  0;
+
+		ref_count = atomic_inc_return(&d->ref_count);
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 4);
 		if (ref_count >= 1 && d->dirty && !node_not_in_list(&d->list)) {
 			//printk(KERN_CRIT "%s %d %s: sector %llu flags %x\n",
 			//	__FILE__, __LINE__, __func__, sector, flags);
 			struct mutex *lock;
-			if (d->type == TYPE_HASH)
-{
+			if (d->type == TYPE_HASH) {
 				lock = &v->block_list_hash_dirty_lock;
 #if DEBUG
 		                hash_dirty_counter--;
 #endif
-}
-			else
-{
+			} else {
 				lock = &v->block_list_data_dirty_lock;
 #if DEBUG
 		                data_dirty_counter--;
 #endif
-}
+			}
 
 			mutex_lock(lock);
 			list_del(&d->list);
@@ -1469,6 +1470,31 @@ static void mintegrity_read_journal_block(struct journal_block **jb,
 	printk(KERN_ERR "3: Done waiting in mintegrity_read_journal_block\n");
 }
 
+#if TRICK
+
+static inline int mintegrity_get_journal_ref(struct dm_mintegrity *v)
+{
+	return atomic_inc_return(&v->j_pending_commit);
+}
+
+static inline int mintegrity_put_journal_ref(struct dm_mintegrity *v)
+{
+	int ref_count = atomic_dec_return(&v->j_pending_commit);
+
+	if (ref_count == 0)
+		complete_all(&v->j_pending_event);
+
+	return ref_count;
+}
+
+static inline void mintegrity_init_journal_ref(struct dm_mintegrity *v)
+{
+	init_completion(&v->j_pending_event);
+	atomic_set(&v->j_pending_commit, 0);
+}
+
+#endif
+
 static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 {
 #if !TRICK
@@ -1502,11 +1528,13 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		toFree = (v->jbs->size - 1) - which;
 
 #if TRICK
-		//printk(KERN_ERR "First down_write\n");
-		up_write(&v->j_lock);
-		down_write(&v->j_commit_outstanding);
-		down_write(&v->j_lock);
-		
+		init_completion(&v->j_pending_event);
+		while (true) {
+			if (atomic_read(&v->j_pending_commit) == 0)
+				break;
+
+			wait_for_completion(&v->j_pending_event);
+		}
 #else
 		while (true) {
 			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
@@ -1559,10 +1587,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 			}
 		}
 #if TRICK
-		//printk(KERN_ERR "First up_write\n");
-		up_write(&v->j_lock);
-		up_write(&v->j_commit_outstanding);
-		down_write(&v->j_lock);
+
 #endif
 	} else {
 
@@ -1576,10 +1601,13 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 		//printk(KERN_ERR "Journal is totally full!!");
 #if TRICK
-		//printk(KERN_ERR "Second down_write\n");
-		up_write(&v->j_lock);
-		down_write(&v->j_commit_outstanding);
-		down_write(&v->j_lock);
+		init_completion(&v->j_pending_event);
+		while (true) {
+			if (atomic_read(&v->j_pending_commit) == 0)
+				break;
+
+			wait_for_completion(&v->j_pending_event);
+		}
 #else
 		while (true) {
 			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
@@ -1619,10 +1647,6 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		mintegrity_do_journal_block_io(v->j_ds_buffer);
 		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
 #if TRICK
-		//printk(KERN_ERR "Second up_write\n");
-		up_write(&v->j_lock);
-		up_write(&v->j_commit_outstanding);
-		down_write(&v->j_lock);
 #endif
 	}
 
@@ -1723,8 +1747,7 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 		mintegrity_do_journal_block_io(journal_buffer);
 	}
 #if TRICK
-	//printk(KERN_ERR "up_read\n");
-	up_read(&v->j_commit_outstanding);
+	mintegrity_put_journal_ref(v);
 #else
 	atomic_dec(&v->j_commit_outstanding);
 #endif
@@ -1909,8 +1932,7 @@ static int mintegrity_get_journal_buffer(struct dm_mintegrity *v,
 	// Unlock journal
 	up_write(&v->j_lock);
 #if TRICK
-	//printk(KERN_ERR "down_read\n");
-	down_read(&v->j_commit_outstanding);
+	mintegrity_get_journal_ref(v);
 #endif
 	return r;
 }
@@ -2234,7 +2256,7 @@ Sector journal:
 	atomic_set(&v->j_fill, 0);
 
 #if TRICK
-	init_rwsem(&(v->j_commit_outstanding));
+	mintegrity_init_journal_ref(v);
 #else
 	atomic_set(&v->j_commit_outstanding, 0);
 #endif
@@ -2323,7 +2345,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 					&& !ACCESS_ONCE(d->verified)) {
 				printk(KERN_ERR "Metadata block is corrupted!\n");
 				DMERR_LIMIT("metadata block %llu is corrupted, block %llu, level %d, offset %u",
-					(unsigned long long)hash_block, block, level, offset);
+					(unsigned long long)hash_block, (unsigned long long)block, level, offset);
 				v->hash_failed = 1;
 				dump_stack();
 				r = -EIO;
