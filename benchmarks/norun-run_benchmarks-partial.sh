@@ -6,7 +6,7 @@ BASEDIR=$(dirname `readlink -f $0`)
 ################################################
 # CONFIGURE THIS CORRECTLY
 HDD=/dev/sdb1
-SSD=/dev/sdc
+SSD=/dev/sdb1
 MOUNTPOINT=/mnt/scratch
 MKMINT=${BASEDIR}/../mkmint/mkmint
 ################################################
@@ -83,7 +83,7 @@ DATABASE=FALSE
 LINUX_UNTAR=FALSE
 #FILEBENCHMARKS="filemicro_rread.f filemicro_rwritefsync.f filemicro_seqread.f filemicro_seqwritefsync.f varmail.f"
 FILEBENCHMARKS=""
-MODES="sector_hdd"
+MODES="sector_ssd"
 
 for MODE in $MODES; do
     echo "Running tests for ${MODE}"

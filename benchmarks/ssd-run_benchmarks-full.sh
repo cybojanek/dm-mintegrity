@@ -6,7 +6,7 @@ BASEDIR=$(dirname `readlink -f $0`)
 ################################################
 # CONFIGURE THIS CORRECTLY
 HDD=/dev/sdb1
-SSD=/dev/sdc
+SSD=/dev/sdb1
 MOUNTPOINT=/mnt/scratch
 MKMINT=${BASEDIR}/../mkmint/mkmint
 ################################################
@@ -45,7 +45,7 @@ block_devices["full_shdd"]="/dev/mapper/meow"
 declare -A mkmint_devices
 mkmint_devices["sector_ssd"]="$SSD $SSD"
 mkmint_devices["sector_hdd"]="$HDD $HDD"
-mkmint_devices["full_ssd"]="$SSD"
+mkmint_devices["full_ssd"]="$SSD $SSD"
 mkmint_devices["full_hdd"]="$HDD $HDD"
 mkmint_devices["sector_shdd"]="$SSD $HDD"
 mkmint_devices["full_shdd"]="$SSD $HDD"
@@ -53,7 +53,7 @@ mkmint_devices["full_shdd"]="$SSD $HDD"
 declare -A journal_modes
 journal_modes["sector_ssd"]="sector"
 journal_modes["sector_hdd"]="sector"
-journal_modes["full_ssd"]=""
+journal_modes["full_ssd"]="full"
 journal_modes["full_hdd"]="full"
 journal_modes["sector_shdd"]="sector"
 journal_modes["full_shdd"]=""
@@ -82,13 +82,14 @@ DD=FALSE
 DATABASE=FALSE
 LINUX_UNTAR=FALSE
 #FILEBENCHMARKS="filemicro_rread.f filemicro_rwritefsync.f filemicro_seqread.f filemicro_seqwritefsync.f varmail.f"
-FILEBENCHMARKS=""
-MODES="sector_hdd"
+FILEBENCHMARKS="filemicro_rread.f filemicro_rwritefsync.f filemicro_seqread.f filemicro_seqwritefsync.f"
+MODES="full_ssd"
 
 for MODE in $MODES; do
     echo "Running tests for ${MODE}"
-    DIRECTORY=${BASEDIR}/results
     FILE_PREFIX=${MODE}
+    DATE=`date +%Y%m%d-%H%M%S`
+    DIRECTORY=${BASEDIR}/${FILE_PREFIX}_results_${DATE}
     BLOCK_DEVICE=${block_devices[${MODE}]}
 
     if [ ! -d $DIRECTORY ]; then
@@ -232,26 +233,26 @@ for MODE in $MODES; do
         done
 
         # Unmount
-        #sudo umount ${MOUNTPOINT}
-        #if [ $? -ne 0 ]; then
-        #    echo "Failed to unmount filesystem"
-        #fi
+        sudo umount ${MOUNTPOINT}
+        if [ $? -ne 0 ]; then
+            echo "Failed to unmount filesystem"
+        fi
     done
 
     sync
 
 
-    #if [ ${mkmint_devices[$MODE]+_} ]; then
-    #    sudo dmsetup suspend meow
-    #    if [ $? -ne 0 ]; then
-    #        echo "Failed to suspend device mapper"
-    #        exit 1;
-    #    fi
-    #
-    #    sudo dmsetup remove meow
-    #    if [ $? -ne 0 ]; then
-    #        echo "Failed to remove device mapper"
-    #        exit 1;
-    #    fi
-    #fi
+    if [ ${mkmint_devices[$MODE]+_} ]; then
+        sudo dmsetup suspend meow
+        if [ $? -ne 0 ]; then
+            echo "Failed to suspend device mapper"
+            exit 1;
+        fi
+    
+        sudo dmsetup remove meow
+        if [ $? -ne 0 ]; then
+            echo "Failed to remove device mapper"
+            exit 1;
+        fi
+    fi
 done    
