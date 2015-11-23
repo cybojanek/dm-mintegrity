@@ -36,6 +36,8 @@
 #define TRICK 1
 #define COARSE_LOCK 0
 
+#define FEATURE_PREFETCH 0
+
 #define DM_MSG_PREFIX			"mintegrity"
 
 #define DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE	524288
@@ -2856,6 +2858,7 @@ static void mintegrity_write_work(struct work_struct *w)
 	//		__func__, __LINE__, smp_processor_id());
 }
 
+#if FEATURE_PREFETCH
 /*
  * Prefetch buffers for the specified io. The root buffer is not prefetched,
  * it is assumed that it will be cached all the time. At the lowest level,
@@ -2949,6 +2952,7 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
 	pending_prefetch++;
 #endif
 }
+#endif
 
 /*
  * Bio map function. It allocates dm_mintegrity_io structure and bio vector and
@@ -2999,8 +3003,10 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		// Limit the number of requests
 		down(&v->request_limit);
 
+#if FEATURE_PREFETCH
 		// Prefetch blocks
 		mintegrity_submit_prefetch(v, io);
+#endif
 
 		if (bio_data_dir(bio) == WRITE) {
 			INIT_WORK(&(io->work), mintegrity_write_work);
