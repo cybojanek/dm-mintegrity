@@ -1528,11 +1528,11 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		toFree = (v->jbs->size - 1) - which;
 
 #if TRICK
-		init_completion(&v->j_pending_event);
 		while (true) {
 			if (atomic_read(&v->j_pending_commit) == 0)
 				break;
 
+			init_completion(&v->j_pending_event);
 			wait_for_completion(&v->j_pending_event);
 		}
 #else
@@ -1601,11 +1601,11 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 		//printk(KERN_ERR "Journal is totally full!!");
 #if TRICK
-		init_completion(&v->j_pending_event);
 		while (true) {
 			if (atomic_read(&v->j_pending_commit) == 0)
 				break;
 
+			init_completion(&v->j_pending_event);
 			wait_for_completion(&v->j_pending_event);
 		}
 #else
