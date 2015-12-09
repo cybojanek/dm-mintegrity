@@ -38,6 +38,8 @@
 
 #define FEATURE_PREFETCH 0
 
+#define PROFILE_DUMMY_HASH 0
+
 #define DM_MSG_PREFIX			"mintegrity"
 
 #define DM_MINTEGRITY_DEFAULT_PREFETCH_SIZE	524288
@@ -1308,6 +1310,9 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
         compute_hash_counter++;
 #endif
 
+#if PROFILE_DUMMY_HASH
+	memset(io_real_digest(v, io), 0, v->digest_size);
+#else
 	r = crypto_shash_init(desc);
 	if (unlikely(r)) {
 		DMERR("crypto_shash_init failed: %d", r);
@@ -1331,6 +1336,7 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
 		DMERR("crypto_shash_final failed: %d", r);
 		return r;
 	}
+#endif
 
 	return 0;
 }
@@ -1467,9 +1473,13 @@ static void mintegrity_read_journal_block(struct journal_block **jb,
 	init_completion(&event);
 	(*jb)->event = &event;
 	mintegrity_do_journal_block_io(*jb);
+#if DEBUG
 	printk(KERN_ERR "3: Waiting for completion in mintegrity_read_journal_block\n");
+#endif
 	wait_for_completion(&event);
+#if DEBUG
 	printk(KERN_ERR "3: Done waiting in mintegrity_read_journal_block\n");
+#endif
 }
 
 #if TRICK
@@ -1539,7 +1549,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		}
 #else
 		while (true) {
-			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
+			volatile atomic_t *a = &v->j_commit_outstanding;
 			if (atomic_read(a) == 0) {
 				break;
 			}
@@ -1612,7 +1622,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		}
 #else
 		while (true) {
-			volatile atomic_t *a = &ACCESS_ONCE(v->j_commit_outstanding);
+			volatile atomic_t *a = &v->j_commit_outstanding;
 			if (atomic_read(a) == 0) {
 				break;
 			}
@@ -1681,9 +1691,13 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		//printk(KERN_ERR "Sending to mintegrity_do_journal_block_io \n");
 		mintegrity_do_journal_block_io(jb);
 		//printk(KERN_ERR "Return from mintegrity_do_journal_block_io \n");
+#if DEBUG
 		printk(KERN_ERR "4: Waiting for completion in mintegrity_commit_journal");
+#endif
 		wait_for_completion(&event);
+#if DEBUG
 		printk(KERN_ERR "4: Done waiting in mintegrity_commit_journal");
+#endif
 		if (v->two_disks) {
 			block_write_dirty(v, true, false);
 		}
@@ -1786,7 +1800,10 @@ static void mintegrity_get_memory_tokens(struct dm_mintegrity *v, int tokens)
 	down_write(&v->j_lock);
 
 	if (atomic_read(&v->block_tokens) < tokens) {
-		printk("Not enough tokens %llu", token_counter);
+#if DEBUG
+		printk(KERN_INFO "Not enough tokens %llu\n", token_counter);
+#endif
+		printk(KERN_INFO "Not enough tokens %llu\n", token_counter);
 		token_counter++;
 		// Not enough memory - commit everything
 		//down_write(&v->j_lock);
@@ -2217,6 +2234,9 @@ Sector journal:
 			mintegrity_return_memory_tokens(v, tokens);
 		mintegrity_buffer_hash(io, h->data, v->dev_block_bytes);
 
+#if PROFILE_DUMMY_HASH
+		/* Assume the hash value always match */
+#else
 		if (memcmp(v->root_digest, io_real_digest(v, io), v->digest_size)) {
 			printk(KERN_CRIT "Root node doesn't match!");
 
@@ -2232,6 +2252,7 @@ Sector journal:
 				mintegrity_hmac_hash(v);
 			}
 		}
+#endif
 		block_release(h);
 	}
 
@@ -2329,8 +2350,13 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 
 		result = io_real_digest(v, io);
 
+#if PROFILE_DUMMY_HASH
+		/* Assume the hash value always match */
+#else
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			// Retry once in case of write race condition
+			printk(KERN_DEBUG "%s %d: digest mis-match for the first try (meta %llu block %llu level %d offset %u\n",
+					__func__, __LINE__, (unsigned long long)hash_block, (unsigned long long)block, level, offset);
 			if (ACCESS_ONCE(d->verified)) {
 				// FIXME: should we just cast the data_block?
 				goto normal_return;
@@ -2354,6 +2380,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 				goto release_ret_r;
 			}
 		}
+#endif
 		d->verified = true;
 	}
 
@@ -2506,6 +2533,9 @@ test_block_hash:
 			goto release_ret_r;
 		}
 
+#if PROFILE_DUMMY_HASH
+		/* Assume the hash value always match */
+#else
 		if (memcmp(result, io_want_digest(v, io), v->digest_size)) {
 			// If zero digest is enabled and it matches the wanted digest
 			if (v->zero_digest && !memcmp(io_want_digest(v, io),
@@ -2543,6 +2573,7 @@ test_block_hash:
 				goto release_ret_r;
 			}
 		}
+#endif
 
 		if (!skip_chain) {
 			for (i = v->levels - 1; i >= 0; i--) {
@@ -3740,7 +3771,9 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 		d->is_prefetch = false;
 	}
 
+#if DEBUG
 	printk(KERN_CRIT "ALLOCATED MEMORY");
+#endif
 
 	// Read queue
 	/* WQ_UNBOUND greatly improves performance when running on ramdisk */
@@ -3785,6 +3818,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	v->created = 1;
 	barrier();
+#if DEBUG
         printk(KERN_DEBUG "dm-mintegrity init:\n"
                         "\thash_start = %lu\n"
                         "\tjournal_start = %lu\n"
@@ -3810,6 +3844,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
                         v->levels);
 	for (i = v->levels-1; i >= 0; i--)
 		printk(KERN_DEBUG "\tlevel[%d] = %lu\n", i, v->hash_level_block[i]);
+#endif
 	return 0;
 
 bad:
