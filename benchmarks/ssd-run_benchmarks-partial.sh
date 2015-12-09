@@ -96,6 +96,15 @@ for MODE in $MODES; do
         mkdir $DIRECTORY
     fi
 
+    # pre-conditioning SSD
+    if [ "$MODE" == "sector_ssd" ] || [ "$MODE" == "full_ssd" ];
+    then
+	    eval "sudo mkfs.ext4 -E discard $SSD"
+	    eval "sudo mount $SSD $MOUNTPOINT"
+	    eval "sudo fstrim -v $MOUNTPOINT"
+	    eval "sudo umount $MOUNTPOINT"
+    fi
+
     if [ ${mkmint_devices[$MODE]+_} ]; then
         echo "Mkmint formatting disk..."
         COMMAND=`eval sudo ${MKMINT} ${mkmint_devices[$MODE]} ${BLOCK_SIZE} ${JOURNAL_BLOCKS} ${ALGORITHM_HASH} ${SALT} ${ALGORITHM_HMAC} ${SECRET} lazy ${journal_modes[$MODE]} | tail -1`
