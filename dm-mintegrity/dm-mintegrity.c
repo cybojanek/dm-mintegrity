@@ -37,6 +37,7 @@
 #define COARSE_LOCK 0
 
 #define FEATURE_PREFETCH 0
+#define FEATURE_EVICTOR 1
 
 #define PROFILE_DUMMY_HASH 0
 
@@ -82,6 +83,11 @@ module_param_named(prefetch_cluster, dm_mintegrity_prefetch_cluster, uint, S_IRU
 #define TYPE_HASH 1
 #define TYPE_DATA 2
 #define TYPE_JOURNAL 3
+
+#if FEATURE_EVICTOR
+#define EVICT_H_THRLD 8
+#define EVICT_L_THRLD 4
+#endif
 
 // #define DEBUG_READ_ONLY
 // #define DEBUG_NOP_JOURNAL_WRITE
@@ -319,6 +325,11 @@ struct dm_mintegrity {
 #if CHECKPOINT
 	struct delayed_work delayed_work;  /* Work instance for commit and checkpointing */
 	struct workqueue_struct *delayed_workqueue;     /* workqueue for processing writes */
+#endif
+
+#if FEATURE_EVICTOR
+	struct task_struct *evict_task;
+	struct completion evict_wait;
 #endif
 };
 
@@ -1797,9 +1808,12 @@ static void mintegrity_get_memory_tokens(struct dm_mintegrity *v, int tokens)
 {
 	// Lock journal
 	// Bhu: move the lock in the if?
+	int cur_tokens;
 	down_write(&v->j_lock);
 
-	if (atomic_read(&v->block_tokens) < tokens) {
+	cur_tokens = atomic_read(&v->block_tokens);
+
+	if (cur_tokens < tokens) {
 #if DEBUG
 		printk(KERN_INFO "Not enough tokens %llu\n", token_counter);
 #endif
@@ -1810,6 +1824,9 @@ static void mintegrity_get_memory_tokens(struct dm_mintegrity *v, int tokens)
 		mintegrity_commit_journal(v, true);
 		//up_write(&v->j_lock);
 		mintegrity_checkpoint_journal(v);
+	} else if ((cur_tokens * 10) <= (DM_MINTEGRITY_BLOCK_TOKENS * EVICT_L_THRLD)) {
+		/* Activate evict task */
+		complete_all(&v->evict_wait);
 	}
 	BUG_ON(atomic_read(&v->block_tokens) < tokens);
 	BUG_ON(atomic_sub_return(tokens, &v->block_tokens) < 0);
@@ -2985,6 +3002,142 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
 }
 #endif
 
+#if FEATURE_EVICTOR
+/* background evictor thread */
+static int mintegrity_evitor(void *ptr)
+{
+	struct dm_mintegrity *v = ptr;
+
+	struct mutex *list_lock;
+	struct list_head *pos, *n, *list;
+	struct block_device *dev;
+
+	while (1) {
+		bool evict_finished;
+		printk(KERN_WARNING "evictor thread started, waiting for wake up\n");
+		init_completion(&v->evict_wait);
+		wait_for_completion(&v->evict_wait);
+
+		/* Exit evictor thread */
+		if (kthread_should_stop()) {
+			return 0;
+		}
+
+		evict_finished = 0;
+
+		/* First try to write out data blocks */
+		list = &v->block_list_data_dirty;
+		list_lock = &v->block_list_data_dirty_lock;
+		dev = (v->data_dev) ? v->data_dev->bdev : v->dev->bdev;
+
+		mutex_lock(&v->block_list_clean_lock);
+		mutex_lock(list_lock);
+		list_for_each_safe(pos, n, list) {
+			struct bio *bio;
+			struct data_block *d;
+			int new_token;
+
+			d = container_of(pos, struct data_block, list);
+
+			if(atomic_read(&d->ref_count) != 0 && d->dirty) {
+				printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu\n",
+						atomic_read(&d->ref_count), (unsigned long long)d->sector);
+				list_del(&d->list);
+				INIT_LIST_HEAD(&d->list);
+				continue;
+			}
+
+			list_del(&d->list);
+			init_completion(&d->event);
+			d->completion_initialized = true;
+
+			list_add_tail(&d->list, &v->block_list_clean);
+
+			d->dirty = false;
+
+			bio = &d->bio;
+			bio_init(bio);
+			bio->bi_iter.bi_sector = d->sector << (v->dev_block_bits - SECTOR_SHIFT);
+			bio->bi_bdev = dev;
+			bio->bi_rw = WRITE;
+			bio->bi_max_vecs = 1;
+			bio->bi_io_vec = &d->bio_vec;
+			bio->bi_end_io = block_end_io;
+			bio->bi_private = d;
+			bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
+			generic_make_request(bio);
+
+
+			new_token = atomic_inc_return(&v->block_tokens);
+			if ((new_token * 10) > (DM_MINTEGRITY_BLOCK_TOKENS * EVICT_H_THRLD)) {
+				evict_finished = 1;
+				break;
+			}
+		}
+		mutex_unlock(list_lock);
+		mutex_unlock(&v->block_list_clean_lock);
+
+		if (evict_finished)
+			continue;
+
+		/* Then try to write out hash blocks */
+		list = &v->block_list_hash_dirty;
+		list_lock = &v->block_list_hash_dirty_lock;
+		dev = (v->data_dev) ? v->data_dev->bdev : v->dev->bdev;
+
+		mutex_lock(&v->block_list_clean_hash_lock);
+		mutex_lock(list_lock);
+		list_for_each_safe(pos, n, list) {
+			struct bio *bio;
+			struct data_block *d;
+			int new_token;
+
+			d = container_of(pos, struct data_block, list);
+
+			if(atomic_read(&d->ref_count) != 0 && d->dirty) {
+				printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu\n",
+						atomic_read(&d->ref_count), (unsigned long long)d->sector);
+				list_del(&d->list);
+				INIT_LIST_HEAD(&d->list);
+				continue;
+			}
+
+			list_del(&d->list);
+			init_completion(&d->event);
+			d->completion_initialized = true;
+
+			list_add_tail(&d->list, &v->block_list_clean_hash);
+
+			d->dirty = false;
+
+			bio = &d->bio;
+			bio_init(bio);
+			bio->bi_iter.bi_sector = d->sector << (v->dev_block_bits - SECTOR_SHIFT);
+			bio->bi_bdev = dev;
+			bio->bi_rw = WRITE;
+			bio->bi_max_vecs = 1;
+			bio->bi_io_vec = &d->bio_vec;
+			bio->bi_end_io = block_end_io;
+			bio->bi_private = d;
+			bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
+			generic_make_request(bio);
+
+
+			new_token = atomic_inc_return(&v->block_tokens);
+			if ((new_token * 10) > (DM_MINTEGRITY_BLOCK_TOKENS * EVICT_H_THRLD)) {
+				evict_finished = 1;
+				break;
+			}
+		}
+		mutex_unlock(list_lock);
+		mutex_unlock(&v->block_list_clean_hash_lock);
+
+
+	}
+	return 0;
+}
+#endif
+
 /*
  * Bio map function. It allocates dm_mintegrity_io structure and bio vector and
  * fills them. Then it issues prefetches and the I/O.
@@ -3282,6 +3435,12 @@ static void mintegrity_dtr(struct dm_target *ti)
 		flush_workqueue(v->prefetch_workqueue);
 		destroy_workqueue(v->prefetch_workqueue);
         }
+
+#if FEATURE_EVICTOR
+	/* Stop evict thread */
+	kthread_stop(v->evict_task);
+	complete_all(&v->evict_wait);
+#endif
 
 #if CHECKPOINT
 	cancel_delayed_work(&v->delayed_work);
@@ -3818,6 +3977,11 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 
 	v->created = 1;
 	barrier();
+
+#if FEATURE_EVICTOR
+	v->evict_task = kthread_run(mintegrity_evitor, v, "dmm_evictor-%p", v);
+#endif
+
 #if DEBUG
         printk(KERN_DEBUG "dm-mintegrity init:\n"
                         "\thash_start = %lu\n"
