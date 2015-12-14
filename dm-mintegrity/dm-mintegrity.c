@@ -31,7 +31,7 @@
 #include <asm/page.h>
 
 #define USE_RADIX 1
-#define CHECKPOINT 1
+#define CHECKPOINT 0
 #define DEBUG 0
 #define TRICK 1
 #define COARSE_LOCK 0
@@ -1824,9 +1824,11 @@ static void mintegrity_get_memory_tokens(struct dm_mintegrity *v, int tokens)
 		mintegrity_commit_journal(v, true);
 		//up_write(&v->j_lock);
 		mintegrity_checkpoint_journal(v);
+#if FEATURE_EVICTOR
 	} else if ((cur_tokens * 10) <= (DM_MINTEGRITY_BLOCK_TOKENS * EVICT_L_THRLD)) {
 		/* Activate evict task */
 		complete_all(&v->evict_wait);
+#endif
 	}
 	BUG_ON(atomic_read(&v->block_tokens) < tokens);
 	BUG_ON(atomic_sub_return(tokens, &v->block_tokens) < 0);
@@ -3003,6 +3005,8 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
 #endif
 
 #if FEATURE_EVICTOR
+
+#define EVICTOR_TIMEOUT 20
 /* background evictor thread */
 static int mintegrity_evitor(void *ptr)
 {
@@ -3014,14 +3018,16 @@ static int mintegrity_evitor(void *ptr)
 
 	while (1) {
 		bool evict_finished;
-		printk(KERN_WARNING "evictor thread started, waiting for wake up\n");
+		//printk(KERN_WARNING "evictor thread started, waiting for wake up\n");
 		init_completion(&v->evict_wait);
-		wait_for_completion(&v->evict_wait);
+		wait_for_completion_interruptible_timeout(&v->evict_wait, EVICTOR_TIMEOUT);
 
 		/* Exit evictor thread */
 		if (kthread_should_stop()) {
 			return 0;
 		}
+
+		printk(KERN_WARNING "evictor activated, tokens: %d / %d\n", atomic_read(&v->block_tokens), DM_MINTEGRITY_BLOCK_TOKENS);
 
 		evict_finished = 0;
 
