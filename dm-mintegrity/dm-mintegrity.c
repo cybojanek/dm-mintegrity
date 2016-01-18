@@ -40,6 +40,7 @@
 #define FEATURE_EVICTOR 1
 
 #define PROFILE_DUMMY_HASH 0
+#define PROFILE_IO_HASH_COUNT 0
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -142,6 +143,13 @@ static uint64_t pending_prefetch = 0;
 static uint64_t token_counter = 0;
 static uint64_t checkpoint_work_counter = 0;
 static uint64_t wait_counter = 0;
+
+#if PROFILE_DUMMY_HASH
+static uint64_t map_block_read_counter = 0;
+static uint64_t map_block_write_counter = 0;
+static uint64_t block_issued = 0;
+static uint64_t hash_counter = 0;
+#endif
 
 struct mint_journal_header {
 	uint32_t magic;     /* 0x594c494c */
@@ -817,6 +825,9 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 #endif
 //		printk(KERN_ERR "Write dirty making request. \n");
 		generic_make_request(bio);
+#if PROFILE_IO_HASH_COUNT
+		block_issued += 1;
+#endif
 		dirty_blocks++;
 	}
 #if DEBUG
@@ -1057,6 +1068,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 #endif
 
 			generic_make_request(bio);
+#if PROFILE_IO_HASH_COUNT
+			block_issued += 1;
+#endif
 		} else {
 			// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 3);
 			// Complete the write event, so others know it can be used
@@ -1321,6 +1335,9 @@ static int mintegrity_buffer_hash(struct dm_mintegrity_io *io, const u8 *data,
 #if DEBUG
         compute_hash_counter++;
 #endif
+#if PROFILE_IO_HASH_COUNT
+	hash_counter += 1;
+#endif
 
 #if PROFILE_DUMMY_HASH
 	memset(io_real_digest(v, io), 0, v->digest_size);
@@ -1437,6 +1454,9 @@ static void mintegrity_do_journal_block_io(struct journal_block *j)
 //		bio_add_page_read_counter = bio_add_page_read_counter + j->bio.bi_max_vecs;
 #endif
 	generic_make_request(&j->bio);
+#if PROFILE_IO_HASH_COUNT
+	block_issued += 1;
+#endif
 }
 
 static void mintegrity_init_journal_block(struct journal_block **jb,
@@ -2547,6 +2567,9 @@ test_block_hash:
 #if DEBUG
 	        compute_hash_counter++;
 #endif
+#if PROFILE_IO_HASH_COUNT
+		hash_counter += 1;
+#endif
 		r = crypto_shash_final(desc, result);
 		if (r) {
 			DMERR("crypto_shash_final failed: %d", r);
@@ -3073,7 +3096,9 @@ static int mintegrity_evitor(void *ptr)
 			bio->bi_private = d;
 			bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
 			generic_make_request(bio);
-
+#if PROFILE_IO_HASH_COUNT
+			block_issued += 1;
+#endif
 
 			new_token = atomic_inc_return(&v->block_tokens);
 			if ((new_token * 10) > (DM_MINTEGRITY_BLOCK_TOKENS * EVICT_H_THRLD)) {
@@ -3128,7 +3153,9 @@ static int mintegrity_evitor(void *ptr)
 			bio->bi_private = d;
 			bio_add_page(bio, virt_to_page(d->data), v->dev_block_bytes, 0);
 			generic_make_request(bio);
-
+#if PROFILE_IO_HASH_COUNT
+			block_issued += 1;
+#endif
 
 			new_token = atomic_inc_return(&v->block_tokens);
 			if ((new_token * 10) > (DM_MINTEGRITY_BLOCK_TOKENS * EVICT_H_THRLD)) {
@@ -3246,6 +3273,9 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 						split = bio_split(bio, split_sectors, GFP_NOIO, fs_bio_set);
 						bio_chain(split, bio);
 						generic_make_request(split);
+#if PROFILE_IO_HASH_COUNT
+						block_issued += split_sectors;
+#endif
 						split = NULL;
 						split_sectors = 0;
 					}
@@ -3285,6 +3315,9 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 					if (split_sectors == bio_sectors(bio)) {
 						// last block, directly send down
 						generic_make_request(bio);
+#if PROFILE_IO_HASH_COUNT
+						block_issued += split_sectors;
+#endif
 					}
 					last_block = 2;
 				}
@@ -3486,6 +3519,9 @@ static void mintegrity_dtr(struct dm_target *ti)
                 }
 
 	}
+#if PROFILE_IO_HASH_COUNT
+	printk(KERN_WARNING "%s %d: map read block %llu map write block %llu hash block %llu block issued %llu block_tokens %d\n", __func__, __LINE__, map_block_read_counter, map_block_write_counter, hash_counter, block_issued, atomic_read(&v->block_tokens));
+#endif
 
 	if (v->journal_page_mempool) {
 		mempool_destroy(v->journal_page_mempool);
