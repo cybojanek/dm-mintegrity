@@ -726,7 +726,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	struct data_block *d;
 	struct list_head *pos, *n;
 	struct list_head *list;
-	struct mutex *list_lock;
+	struct mutex *list_lock, *list_clean_lock;
 	struct block_device *dev;
 #if DEBUG
 	uint64_t *counter;
@@ -736,6 +736,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	if (data) {
 		list = &v->block_list_data_dirty;
 		list_lock = &v->block_list_data_dirty_lock;
+		list_clean_lock = &v->block_list_clean_lock;
 		dev = (v->data_dev) ? v->data_dev->bdev : v->dev->bdev;
 #if DEBUG
 		counter = &data_dirty_counter;
@@ -743,6 +744,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 	} else {
 		list = &v->block_list_hash_dirty;
 		list_lock = &v->block_list_hash_dirty_lock;
+		list_clean_lock = &v->block_list_clean_hash_lock;
 		dev = v->dev->bdev;
 #if DEBUG
                 counter = &hash_dirty_counter;
@@ -752,9 +754,8 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 #if USE_RADIX	
 //	mutex_lock(&v->block_tree_lock);
 #endif
-	mutex_lock(&v->block_list_clean_lock);
-	mutex_lock(&v->block_list_clean_hash_lock);
 	mutex_lock(&v->block_list_prefetch_lock);
+	mutex_lock(list_clean_lock);
 	mutex_lock(list_lock);
 
 	// TODO: sort this?
@@ -824,9 +825,9 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 #endif
 
 	mutex_unlock(list_lock);
+	mutex_unlock(list_clean_lock);
 	mutex_unlock(&v->block_list_prefetch_lock);
-	mutex_unlock(&v->block_list_clean_hash_lock);
-	mutex_unlock(&v->block_list_clean_lock);
+
 #if USE_RADIX
 //	mutex_unlock(&v->block_tree_lock);
 #endif
@@ -2435,9 +2436,9 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 	bool skip_chain = false;
 
 #if COARSE_LOCK
-                mutex_lock(&v->block_tree_lock);
+	mutex_lock(&v->block_tree_lock);
 #endif
-		for (b = 0; b < io->n_blocks; b++) {
+	for (b = 0; b < io->n_blocks; b++) {
 		int r;
 		int tokens;
 		u8 *result;
@@ -3006,7 +3007,7 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
 
 #if FEATURE_EVICTOR
 
-#define EVICTOR_TIMEOUT 20
+#define EVICTOR_TIMEOUT 100
 /* background evictor thread */
 static int mintegrity_evitor(void *ptr)
 {
@@ -3027,7 +3028,7 @@ static int mintegrity_evitor(void *ptr)
 			return 0;
 		}
 
-		printk(KERN_WARNING "evictor activated, tokens: %d / %d\n", atomic_read(&v->block_tokens), DM_MINTEGRITY_BLOCK_TOKENS);
+		//printk(KERN_WARNING "evictor activated, tokens: %d / %d\n", atomic_read(&v->block_tokens), DM_MINTEGRITY_BLOCK_TOKENS);
 
 		evict_finished = 0;
 
@@ -3201,6 +3202,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		if (bio_data_dir(bio) == WRITE) {
 			INIT_WORK(&(io->work), mintegrity_write_work);
 			queue_work(io->v->workqueue, &io->work);
+			//map_block_write_counter += io->n_blocks;
 #if DEBUG
 		        pending_write++;
 #endif
@@ -3221,6 +3223,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			// 2: last block not in buffer
 			int last_block = 0;
 
+			//map_block_read_counter += io->n_blocks;
 			//Bhu: lock tree
 #if COARSE_LOCK
 			mutex_lock(&v->block_tree_lock);
@@ -3432,6 +3435,7 @@ static void mintegrity_dtr(struct dm_target *ti)
 	printk(KERN_ERR "journal_release_counter: %llu.\n journal_write_complete_counter: %llu.\n journal_commit_counter: %llu. \n journal_checkpoint_counter: %llu.\n", journal_release_counter, journal_write_complete_counter, journal_commit_counter, journal_checkpoint_counter);
 	printk(KERN_ERR "verify_level_counter: %llu. \n prefetch_counter: %llu. \n", verify_level_counter, prefetch_counter);
 #endif
+
 	if (v->workqueue) {
 		flush_workqueue(v->workqueue);
 		destroy_workqueue(v->workqueue);
