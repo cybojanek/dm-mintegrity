@@ -39,6 +39,8 @@
 #define FEATURE_PREFETCH 0
 #define FEATURE_EVICTOR 1
 
+#define FEATURE_DEALY_HASH 1
+
 #define PROFILE_DUMMY_HASH 0
 #define PROFILE_IO_HASH_COUNT 0
 
@@ -190,6 +192,13 @@ struct journal_block {
 
 }__attribute__((aligned(8)));
 
+enum dblock_state {
+	DBLOCK_STATE_NONE	= 0,
+	DBLOCK_STATE_VERIFIED	= 1,
+	DBLOCK_STATE_DELAYED	= 2,
+	DBLOCK_STATE_DIRTY	= 4,
+};
+
 struct data_block {
 	struct dm_mintegrity *v;
 
@@ -208,9 +217,15 @@ struct data_block {
 	atomic_t writers;
 	atomic_t ref_count;
 
+#if FEATURE_DEALY_HASH
+	struct data_block *parent;
+	int level;
+	unsigned offset;	/* Offset into upper-level hash vector */
+#endif
+
 	int type;
 	bool dirty;
-	bool verified;
+	uint16_t status;
 	bool completion_initialized;
 	bool is_prefetch;
 };
@@ -314,6 +329,11 @@ struct dm_mintegrity {
 	struct list_head block_list_hash_dirty;
 	struct list_head block_list_data_dirty;
 
+#if FEATURE_DEALY_HASH
+	struct list_head delay_hash_queue;
+	struct mutex delay_queue_lock;
+#endif
+
 	// Locks for block cache
 	struct mutex block_tree_lock;
 	struct mutex block_list_clean_lock;
@@ -382,6 +402,16 @@ struct dm_mintegrity_io {
 	 * boundaries.
 	 */
 }__attribute__((aligned(8)));
+
+#if FEATURE_DEALY_HASH
+struct dm_hashq_entry {
+	struct data_block *data_block;
+	struct list_head node;
+	struct data_block *parent;
+};
+
+static int __mintegrity_buffer_hash(struct dm_mintegrity *v, u8 *buf, const u8 *data, unsigned int len);
+#endif
 
 /*
  * Test if node is not in any list
@@ -601,16 +631,24 @@ static inline int tree_insert(struct rb_root *root, struct data_block *data)
 #endif /*USE_RADIX*/
 /* Release block
  */
-static inline void block_release(struct data_block *d)
+static inline void block_release(struct data_block *d, bool no_lock)
 {
 	int ref_count;
 	struct dm_mintegrity *v = d->v;
 
-	mutex_lock(&v->block_list_clean_lock);
-	mutex_lock(&v->block_list_clean_hash_lock);
+	if (!no_lock) {
+		if (d->type == TYPE_HASH)
+			mutex_lock(&v->block_list_clean_hash_lock);
+		else
+			mutex_lock(&v->block_list_clean_lock);
+	}
 	ref_count = atomic_dec_return(&d->ref_count);
 	BUG_ON(ref_count < 0);
+#if FEATURE_DEALY_HASH
+	if (ref_count == 0 && d->status != DBLOCK_STATE_DELAYED) {
+#else
 	if (ref_count == 0 && !d->dirty) {
+#endif
 #if DEBUG
 		clean_counter++;
 #endif
@@ -673,14 +711,21 @@ static inline void block_release(struct data_block *d)
 		list_add_tail(&d->list, list);
 		mutex_unlock(list_lock);
 	}
-	mutex_unlock(&v->block_list_clean_hash_lock);
-	mutex_unlock(&v->block_list_clean_lock);
+	if (!no_lock) {
+		if (d->type == TYPE_HASH)
+			mutex_unlock(&v->block_list_clean_hash_lock);
+		else
+			mutex_unlock(&v->block_list_clean_lock);
+	}
 }
 
-static inline void block_mark_dirty(struct data_block *d)
+static inline void block_mark_status(struct data_block *d, uint16_t status)
 {
 	// RACE: 123
-	d->dirty = true;
+	if (status == DBLOCK_STATE_DIRTY)
+		d->dirty = true;
+	else
+		d->status = status;
 }
 
 static void block_end_io(struct bio *bio, int error)
@@ -805,6 +850,18 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		else
 			list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
+
+		// FIXME: rehash block
+		BUG_ON(d->parent == NULL && d->level != v->levels);
+		BUG_ON(d->parent == NULL);
+		BUG_ON(d->level == v->levels);
+
+		if (d->parent)
+			__mintegrity_buffer_hash(v, d->parent->data + d->offset, d->data, v->dev_block_bytes);
+		if (data)
+			block_release(d->parent, false);
+		else
+			block_release(d->parent, true);
 
 
 		// RACE: 123
@@ -1083,7 +1140,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 #if !COARSE_LOCK
 			mutex_unlock(&v->block_tree_lock);
 #endif
-			block_release(d);
+			block_release(d, false);
 			return NULL;
 		}
 	} else if (found && !prefetch) {
@@ -1319,6 +1376,53 @@ static unsigned mintegrity_hash_buffer_offset(struct dm_mintegrity *v,
 	idx = position & ((1 << v->hash_per_block_bits) - 1);
 	return idx << (v->dev_block_bits - v->hash_per_block_bits);
 }
+
+#if FEATURE_DEALY_HASH
+static int __mintegrity_buffer_hash(struct dm_mintegrity *v, u8 *buf, const u8 *data, unsigned int len)
+{
+	struct shash_desc desc;
+	int r;
+
+	desc.tfm = v->tfm;
+	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+
+#if DEBUG
+        compute_hash_counter++;
+#endif
+#if PROFILE_IO_HASH_COUNT
+	hash_counter += 1;
+#endif
+
+#if PROFILE_DUMMY_HASH
+	memset(buf, 0, v->digest_size);
+#else
+	r = crypto_shash_init(&desc);
+	if (unlikely(r)) {
+		DMERR("crypto_shash_init failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_update(&desc, v->salt, v->salt_size);
+	if (unlikely(r)) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_update(&desc, data, len);
+	if (unlikely(r)) {
+		DMERR("crypto_shash_update failed: %d", r);
+		return r;
+	}
+
+	r = crypto_shash_final(&desc, buf);
+	if (unlikely(r)) {
+		DMERR("crypto_shash_final failed: %d", r);
+		return r;
+	}
+#endif
+	return r;
+}
+#endif
 
 /*
  * Calculate hash of buffer and put it in io_real_digest
@@ -1747,6 +1851,13 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 	memcpy(v->j_ds_buffer->data, &mjh, sizeof(struct mint_journal_header));
 }
 
+#if FEATURE_DEALY_HASH
+static void queue_delayed_block(struct dm_mintegrity *v, struct data_block *block, struct data_block *parents)
+{
+	return;
+}
+#endif
+
 static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 	sector_t sector, struct data_block **data_buffers,
 	struct journal_block *journal_buffer, int error, char *tag_ptr,
@@ -1760,13 +1871,6 @@ static void mintegrity_add_buffer_to_journal(struct dm_mintegrity *v,
 		0
 	};
 	int hpb = v->dev_block_bytes / (2 * v->digest_size);
-
-	if (likely(data_buffers)) {
-		for (i = 0; i < v->levels; i++) {
-			block_mark_dirty(data_buffers[i]);
-			block_release(data_buffers[i]);
-		}
-	}
 
 /*	if (unlikely(v->full_journal && !memcmp(journal_buffer->data + (v->dev_block_bytes * which),
 			magic, 4))) {
@@ -2158,7 +2262,7 @@ Sector journal:
 				mintegrity_journal_release(data_jb);
 
 				r = mintegrity_buffer_hash(io, d->data, v->dev_block_bytes);
-				block_release(d);
+				block_release(d, false);
 				if (r) {
 					mintegrity_journal_release(desc_jb);
 					mintegrity_journal_release(jb);
@@ -2176,7 +2280,7 @@ Sector journal:
 					h = block_get(v, hash_block, BLOCK_READ, &tokens);
 					memcpy(h->data + offset, io_real_digest(v, io), v->digest_size);
 					r = mintegrity_buffer_hash(io, h->data, v->dev_block_bytes);
-					block_release(h);
+					block_release(h, false);
 					if (r) {
 						mintegrity_journal_release(desc_jb);
 						mintegrity_journal_release(jb);
@@ -2293,7 +2397,7 @@ Sector journal:
 			}
 		}
 #endif
-		block_release(h);
+		block_release(h, false);
 	}
 
 	kfree(io);
@@ -2371,7 +2475,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		return 1;
 	}
 
-	if (!ACCESS_ONCE(d->verified)) {
+	if (ACCESS_ONCE(d->status) != DBLOCK_STATE_VERIFIED) {
 		u8 *result;
 
 		if (skip_unverified) {
@@ -2397,7 +2501,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			// Retry once in case of write race condition
 			printk(KERN_DEBUG "%s %d: digest mis-match for the first try (meta %llu block %llu level %d offset %u\n",
 					__func__, __LINE__, (unsigned long long)hash_block, (unsigned long long)block, level, offset);
-			if (ACCESS_ONCE(d->verified)) {
+			if (ACCESS_ONCE(d->status) == DBLOCK_STATE_VERIFIED) {
 				// FIXME: should we just cast the data_block?
 				goto normal_return;
 			}
@@ -2410,7 +2514,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			result = io_real_digest(v, io);
 
 			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))
-					&& !ACCESS_ONCE(d->verified)) {
+					&& (ACCESS_ONCE(d->status) != DBLOCK_STATE_VERIFIED)) {
 				printk(KERN_ERR "Metadata block is corrupted!\n");
 				DMERR_LIMIT("metadata block %llu is corrupted, block %llu, level %d, offset %u",
 					(unsigned long long)hash_block, (unsigned long long)block, level, offset);
@@ -2421,7 +2525,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			}
 		}
 #endif
-		d->verified = true;
+		d->status = DBLOCK_STATE_VERIFIED;
 	}
 
 normal_return:
@@ -2432,13 +2536,13 @@ normal_return:
 	if (dmb) {
 		*dmb = d;
 	} else {
-		block_release(d);
+		block_release(d, false);
 	}
 
 	return 0;
 
 	release_ret_r:
-		block_release(d);
+		block_release(d, false);
 		return r;
 }
 
@@ -2516,7 +2620,7 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 				if(tokens)
 					mintegrity_return_memory_tokens(v, tokens);
 				for (j = v->levels - 1; j > i; j--) {
-					block_release(dm_buffers[j]);
+					block_release(dm_buffers[j], false);
 				}
 				return r;
 			}
@@ -2620,7 +2724,7 @@ test_block_hash:
 
 		if (!skip_chain) {
 			for (i = v->levels - 1; i >= 0; i--) {
-				block_release(dm_buffers[i]);
+				block_release(dm_buffers[i], false);
 			}
 		}
 	}
@@ -2636,7 +2740,7 @@ test_block_hash:
 #endif
 		if (!skip_chain) {
 			for (i = v->levels - 1; i >= 0; i--) {
-				block_release(dm_buffers[i]);
+				block_release(dm_buffers[i], false);
 			}
 		}
 		return r;
@@ -2718,7 +2822,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 #endif
 				for (j = v->levels - 1; j > i; j--) {
 					atomic_dec(&dm_buffers[j]->writers);
-					block_release(dm_buffers[j]);
+					block_release(dm_buffers[j], false);
 				}
 				mintegrity_add_buffer_to_journal(v, sector, NULL, j_buffer,
 					-EIO, tag, which);
@@ -2737,7 +2841,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 
 		if(tokens)
 			mintegrity_return_memory_tokens(v, tokens);
-		block_mark_dirty(data_block);
+		block_mark_status(data_block, DBLOCK_STATE_DIRTY);
 		data = data_block->data;
 
 		// Copy from bio vector to journal data buffer
@@ -2760,10 +2864,13 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			todo -= len;
 		} while (todo);
 
+#if FEATURE_DEALY_HASH
+		data_block->status = DBLOCK_STATE_DELAYED;
+#else
 		// Hash new data
 		r = mintegrity_buffer_hash(io, data, v->dev_block_bytes);
 		if (unlikely(r)) {
-			block_release(data_block);
+			block_release(data_block, false);
 			goto bad;
 		}
 		result = io_real_digest(v, io);
@@ -2798,7 +2905,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 				r = mintegrity_buffer_hash(io, d->data, v->dev_block_bytes);
 				if (unlikely(r)) {
 					up_write(&d->lock);
-					block_release(data_block);
+					block_release(data_block, false);
 					DMERR("failed to calculate write buffer hash for level");
 					goto bad;
 				}
@@ -2818,7 +2925,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			r = mintegrity_buffer_hash(io, d->data, v->dev_block_bytes);
 			if (unlikely(r < 0)) {
 				up_write(&d->lock);
-				block_release(data_block);
+				block_release(data_block, false);
 				DMERR("failed to calculate write buffer hash for level");
 				goto bad;
 			}
@@ -2827,14 +2934,52 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 			up_write(&d->lock);
 		}
 
-		block_release(data_block);
-		mintegrity_add_buffer_to_journal(v, sector, dm_buffers, j_buffer,
+
+#endif
+		block_release(data_block, false);
+#if FEATURE_DEALY_HASH
+		data_block->parent = dm_buffers[0];
+		data_block->level = 0;
+		data_block->offset = mintegrity_hash_buffer_offset(v, sector, 0);
+		for (j = 0; j < v->levels; j++) {
+			// Don't release block for delayed hash
+			block_mark_status(dm_buffers[j], DBLOCK_STATE_DELAYED);
+			queue_delayed_block(v, data_block, dm_buffers[j]);
+			dm_buffers[j]->level = j + 1;
+			dm_buffers[j]->offset = mintegrity_hash_buffer_offset(v, sector, j+1);
+			if ((j+1) < v->levels)
+				dm_buffers[j]->parent = dm_buffers[j-1];
+		}
+#else
+		for (j = 0; j < v->levels; j++) {
+			block_mark_status(dm_buffers[j], DBLOCK_STATE_DIRTY);
+			block_release(dm_buffers[j], false);
+		}
+#endif
+		mintegrity_add_buffer_to_journal(v, sector, NULL, j_buffer,
 			0, tag, which);
 		continue;
 
 	bad:
 		DMERR("ERROR at end of write work");
-		mintegrity_add_buffer_to_journal(v, sector, dm_buffers, j_buffer,
+#if FEATURE_DEALY_HASH
+		/* FIXME: Not implemented yet */
+		BUG();
+		data_block->parent = dm_buffers[0];
+		for (j = 0; j < v->levels; j++) {
+			// Don't release block for delayed hash
+			block_mark_status(dm_buffers[j], DBLOCK_STATE_DELAYED);
+			queue_delayed_block(v, data_block, dm_buffers[j]);
+			if ((j + 1) < v->levels)
+				dm_buffers[j]->parent = dm_buffers[j+1];
+		}
+#else
+		for (j = 0; j < v->levels; j++) {
+			block_mark_status(dm_buffers[j], DBLOCK_STATE_DIRTY);
+			block_release(dm_buffers[j], false);
+		}
+#endif
+		mintegrity_add_buffer_to_journal(v, sector, NULL, j_buffer,
 			-EIO, tag, which);
 		return -EIO;
 	}
@@ -3295,7 +3440,7 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 
 					bio_advance_iter(bio, &bio->bi_iter, copied);
 
-					block_release(b);
+					block_release(b, false);
 					last_block = 1;
 
 				} else {
@@ -3901,6 +4046,12 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	INIT_LIST_HEAD(&v->block_list_prefetch);
 	INIT_LIST_HEAD(&v->block_list_hash_dirty);
 	INIT_LIST_HEAD(&v->block_list_data_dirty);
+
+#if FEATURE_DEALY_HASH
+	mutex_init(&v->delay_queue_lock);
+	INIT_LIST_HEAD(&v->delay_hash_queue);
+#endif
+
 #if DEBUG
 	search_counter = 0;
 	search_hash_counter = 0;
@@ -4028,7 +4179,6 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	v->evict_task = kthread_run(mintegrity_evitor, v, "dmm_evictor-%p", v);
 #endif
 
-#if DEBUG
         printk(KERN_DEBUG "dm-mintegrity init:\n"
                         "\thash_start = %lu\n"
                         "\tjournal_start = %lu\n"
@@ -4054,7 +4204,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
                         v->levels);
 	for (i = v->levels-1; i >= 0; i--)
 		printk(KERN_DEBUG "\tlevel[%d] = %lu\n", i, v->hash_level_block[i]);
-#endif
+
 	return 0;
 
 bad:
