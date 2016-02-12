@@ -42,7 +42,7 @@
 #define FEATURE_DEALY_HASH 1
 
 #define PROFILE_DUMMY_HASH 0
-#define PROFILE_IO_HASH_COUNT 0
+#define PROFILE_IO_HASH_COUNT 1
 
 #define DM_MSG_PREFIX			"mintegrity"
 
@@ -146,7 +146,7 @@ static uint64_t token_counter = 0;
 static uint64_t checkpoint_work_counter = 0;
 static uint64_t wait_counter = 0;
 
-#if PROFILE_DUMMY_HASH
+#if PROFILE_IO_HASH_COUNT
 static uint64_t map_block_read_counter = 0;
 static uint64_t map_block_write_counter = 0;
 static uint64_t block_issued = 0;
@@ -645,7 +645,7 @@ static inline void block_release(struct data_block *d, bool no_lock)
 	ref_count = atomic_dec_return(&d->ref_count);
 	BUG_ON(ref_count < 0);
 #if FEATURE_DEALY_HASH
-	if (ref_count == 0 && d->status != DBLOCK_STATE_DELAYED) {
+	if (ref_count == 0 && d->status == DBLOCK_STATE_NONE) {
 #else
 	if (ref_count == 0 && !d->dirty) {
 #endif
@@ -856,16 +856,19 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		BUG_ON(d->parent == NULL);
 		BUG_ON(d->level == v->levels);
 
-		if (d->parent)
+		/* FIXME: assume we never reach root node */
+		if (d->parent && d->status == DBLOCK_STATE_DELAYED) {
 			__mintegrity_buffer_hash(v, d->parent->data + d->offset, d->data, v->dev_block_bytes);
-		if (data)
-			block_release(d->parent, false);
-		else
-			block_release(d->parent, true);
+			if (data)
+				block_release(d->parent, false);
+			else
+				block_release(d->parent, true);
+		}
 
 
 		// RACE: 123
 		d->dirty = false;
+		d->status = DBLOCK_STATE_NONE;
 
 		bio = &d->bio;
 		bio_init(bio);
@@ -1380,11 +1383,14 @@ static unsigned mintegrity_hash_buffer_offset(struct dm_mintegrity *v,
 #if FEATURE_DEALY_HASH
 static int __mintegrity_buffer_hash(struct dm_mintegrity *v, u8 *buf, const u8 *data, unsigned int len)
 {
-	struct shash_desc desc;
+	struct shash_desc *desc;
 	int r;
 
-	desc.tfm = v->tfm;
-	desc.flags = CRYPTO_TFM_REQ_MAY_SLEEP;
+	/* FIXME: use mempool to be faster? */
+	desc = kmalloc(sizeof(struct shash_desc) +
+			crypto_shash_descsize(v->tfm), GFP_KERNEL);
+	desc->tfm = v->tfm;
+	desc->flags = CRYPTO_TFM_REQ_MAY_SLEEP;
 
 #if DEBUG
         compute_hash_counter++;
@@ -1396,30 +1402,31 @@ static int __mintegrity_buffer_hash(struct dm_mintegrity *v, u8 *buf, const u8 *
 #if PROFILE_DUMMY_HASH
 	memset(buf, 0, v->digest_size);
 #else
-	r = crypto_shash_init(&desc);
+	r = crypto_shash_init(desc);
 	if (unlikely(r)) {
 		DMERR("crypto_shash_init failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(&desc, v->salt, v->salt_size);
+	r = crypto_shash_update(desc, v->salt, v->salt_size);
 	if (unlikely(r)) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_update(&desc, data, len);
+	r = crypto_shash_update(desc, data, len);
 	if (unlikely(r)) {
 		DMERR("crypto_shash_update failed: %d", r);
 		return r;
 	}
 
-	r = crypto_shash_final(&desc, buf);
+	r = crypto_shash_final(desc, buf);
 	if (unlikely(r)) {
 		DMERR("crypto_shash_final failed: %d", r);
 		return r;
 	}
 #endif
+	kfree(desc);
 	return r;
 }
 #endif
@@ -2475,7 +2482,8 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		return 1;
 	}
 
-	if (ACCESS_ONCE(d->status) != DBLOCK_STATE_VERIFIED) {
+	/* XXX: Here we skip all verified, recently updated nodes */
+	if (ACCESS_ONCE(d->status) == DBLOCK_STATE_NONE) {
 		u8 *result;
 
 		if (skip_unverified) {
@@ -2936,21 +2944,29 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 
 
 #endif
-		block_release(data_block, false);
 #if FEATURE_DEALY_HASH
 		data_block->parent = dm_buffers[0];
 		data_block->level = 0;
 		data_block->offset = mintegrity_hash_buffer_offset(v, sector, 0);
+		block_release(data_block, false);
 		for (j = 0; j < v->levels; j++) {
 			// Don't release block for delayed hash
+			if (dm_buffers[j]->status == DBLOCK_STATE_DELAYED)
+				continue;
 			block_mark_status(dm_buffers[j], DBLOCK_STATE_DELAYED);
 			queue_delayed_block(v, data_block, dm_buffers[j]);
 			dm_buffers[j]->level = j + 1;
 			dm_buffers[j]->offset = mintegrity_hash_buffer_offset(v, sector, j+1);
 			if ((j+1) < v->levels)
-				dm_buffers[j]->parent = dm_buffers[j-1];
+				dm_buffers[j]->parent = dm_buffers[j+1];
+			else
+				dm_buffers[j]->parent = NULL;
+
+			if (dm_buffers[j]->level == 1 && dm_buffers[j]->sector == 50227)
+				printk("DEBUG j %d parent level %d sector %llu ptr %p\n", j, dm_buffers[j-1]->level, dm_buffers[j-1]->sector, dm_buffers[j-1]);
 		}
 #else
+		block_release(data_block, false);
 		for (j = 0; j < v->levels; j++) {
 			block_mark_status(dm_buffers[j], DBLOCK_STATE_DIRTY);
 			block_release(dm_buffers[j], false);
@@ -3374,7 +3390,9 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 		if (bio_data_dir(bio) == WRITE) {
 			INIT_WORK(&(io->work), mintegrity_write_work);
 			queue_work(io->v->workqueue, &io->work);
-			//map_block_write_counter += io->n_blocks;
+#if PROFILE_IO_HASH_COUNT
+			map_block_write_counter += io->n_blocks;
+#endif
 #if DEBUG
 		        pending_write++;
 #endif
@@ -3395,7 +3413,9 @@ static int mintegrity_map(struct dm_target *ti, struct bio *bio)
 			// 2: last block not in buffer
 			int last_block = 0;
 
-			//map_block_read_counter += io->n_blocks;
+#if PROFILE_IO_HASH_COUNT
+			map_block_read_counter += io->n_blocks;
+#endif
 			//Bhu: lock tree
 #if COARSE_LOCK
 			mutex_lock(&v->block_tree_lock);
@@ -3530,6 +3550,9 @@ static void mintegrity_status(struct dm_target *ti, status_type_t type,
 		}
 		break;
 	}
+#if PROFILE_IO_HASH_COUNT
+	printk(KERN_WARNING "%s %d: map read block %llu map write block %llu hash block %llu block issued %llu block_tokens %d\n", __func__, __LINE__, map_block_read_counter, map_block_write_counter, hash_counter, block_issued, atomic_read(&v->block_tokens));
+#endif
 }
 
 static int mintegrity_ioctl(struct dm_target *ti, unsigned cmd,
