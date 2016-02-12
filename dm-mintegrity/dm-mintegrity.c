@@ -37,7 +37,7 @@
 #define COARSE_LOCK 0
 
 #define FEATURE_PREFETCH 0
-#define FEATURE_EVICTOR 1
+#define FEATURE_EVICTOR 0
 
 #define FEATURE_DEALY_HASH 1
 
@@ -224,7 +224,6 @@ struct data_block {
 #endif
 
 	int type;
-	bool dirty;
 	uint16_t status;
 	bool completion_initialized;
 	bool is_prefetch;
@@ -412,6 +411,11 @@ struct dm_hashq_entry {
 
 static int __mintegrity_buffer_hash(struct dm_mintegrity *v, u8 *buf, const u8 *data, unsigned int len);
 #endif
+
+static inline bool dblock_clean(struct data_block *d)
+{
+	return d->status == DBLOCK_STATE_NONE;
+}
 
 /*
  * Test if node is not in any list
@@ -710,6 +714,9 @@ static inline void block_release(struct data_block *d, bool no_lock)
 
 		list_add_tail(&d->list, list);
 		mutex_unlock(list_lock);
+	} else if (ref_count == 0) {
+		// this shouldn't happen
+		BUG();
 	}
 	if (!no_lock) {
 		if (d->type == TYPE_HASH)
@@ -722,9 +729,9 @@ static inline void block_release(struct data_block *d, bool no_lock)
 static inline void block_mark_status(struct data_block *d, uint16_t status)
 {
 	// RACE: 123
-	if (status == DBLOCK_STATE_DIRTY)
-		d->dirty = true;
-	else
+	if (status == DBLOCK_STATE_DIRTY) {
+		d->status = DBLOCK_STATE_DIRTY;
+	} else
 		d->status = status;
 }
 
@@ -820,7 +827,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 
 		d = container_of(pos, struct data_block, list);
 		BUG_ON(atomic_read(&d->ref_count) < 0);
-		if(atomic_read(&d->ref_count) != 0 && d->dirty)
+		if(atomic_read(&d->ref_count) != 0 && !dblock_clean(d))
 		{
 			printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu, data %d.\n", atomic_read(&d->ref_count), (unsigned long long)d->sector, data);
 			list_del(&d->list);
@@ -852,8 +859,11 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		atomic_inc(&v->block_tokens);
 
 		// FIXME: rehash block
-		BUG_ON(d->parent == NULL && d->level != v->levels);
-		BUG_ON(d->parent == NULL);
+		if (d->parent == NULL) {
+			printk("DEBUG null parent encountered: d->type %d d->sector %llu d->level %d d->status %d\n",
+					d->type, d->sector, d->level, d->status);
+			BUG_ON(d->status == DBLOCK_STATE_DELAYED && d->parent == NULL && d->level != v->levels);
+		}
 		BUG_ON(d->level == v->levels);
 
 		/* FIXME: assume we never reach root node */
@@ -867,7 +877,6 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 
 
 		// RACE: 123
-		d->dirty = false;
 		d->status = DBLOCK_STATE_NONE;
 
 		bio = &d->bio;
@@ -1088,6 +1097,8 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 		// Store data pointer, for easier zeroization
 		data = d->data;
+		if (d->status != DBLOCK_STATE_NONE)
+			BUG_ON(d->status != DBLOCK_STATE_NONE);
 		memset(d, 0, sizeof(struct data_block));
 		// Restore pointers
 		d->v = v;
@@ -1151,7 +1162,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 
 		ref_count = atomic_inc_return(&d->ref_count);
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 4);
-		if (ref_count >= 1 && d->dirty && !node_not_in_list(&d->list)) {
+		if (ref_count >= 1 && !dblock_clean(d) && !node_not_in_list(&d->list)) {
 			//printk(KERN_CRIT "%s %d %s: sector %llu flags %x\n",
 			//	__FILE__, __LINE__, __func__, sector, flags);
 			struct mutex *lock;
@@ -1177,7 +1188,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		mutex_lock(&v->block_list_clean_lock);
 		mutex_lock(&v->block_list_clean_hash_lock);
 		mutex_lock(&v->block_list_prefetch_lock);
-		if (ref_count == 1 && !d->dirty) {
+		if (ref_count == 1 && d->status == DBLOCK_STATE_NONE) {
 			// we're the first to get it and its clean, so we need to move it
 			// out of the free list
 			list_del(&d->list);
@@ -1210,6 +1221,9 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		wait_for_completion_io(&d->event);
 		//printk(KERN_ERR "2: Done waiting in block_get\n");
 	}
+
+	if (d && d->sector >= v->data_start && d->sector < v->data_start+10)
+		printk("DEBUG d->sector %llu\n", d->sector);
 	
 	return d;
 
@@ -3230,7 +3244,7 @@ static int mintegrity_evitor(void *ptr)
 
 			d = container_of(pos, struct data_block, list);
 
-			if(atomic_read(&d->ref_count) != 0 && d->dirty) {
+			if(atomic_read(&d->ref_count) != 0 && !dblock_clean(d)) {
 				printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu\n",
 						atomic_read(&d->ref_count), (unsigned long long)d->sector);
 				list_del(&d->list);
@@ -3244,7 +3258,7 @@ static int mintegrity_evitor(void *ptr)
 
 			list_add_tail(&d->list, &v->block_list_clean);
 
-			d->dirty = false;
+			d->status = DBLOCK_STATE_NONE;
 
 			bio = &d->bio;
 			bio_init(bio);
