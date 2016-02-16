@@ -412,9 +412,34 @@ struct dm_hashq_entry {
 static int __mintegrity_buffer_hash(struct dm_mintegrity *v, u8 *buf, const u8 *data, unsigned int len);
 #endif
 
-static inline bool dblock_clean(struct data_block *d)
+static inline bool dblock_state_none(struct data_block *d)
 {
 	return d->status == DBLOCK_STATE_NONE;
+}
+
+static inline bool dblock_state_dirty(struct data_block *d)
+{
+	return d->status & DBLOCK_STATE_DIRTY;
+}
+
+static inline bool dblock_state_clean(struct data_block *d)
+{
+	return !(d->status & DBLOCK_STATE_DIRTY);
+}
+
+static inline bool dblock_state_delay(struct data_block *d)
+{
+	return d->status & DBLOCK_STATE_DELAYED;
+}
+
+static inline bool dblock_state_verified(struct data_block *d)
+{
+	return d->status & DBLOCK_STATE_VERIFIED;
+}
+
+static inline bool dblock_state_free(struct data_block *d)
+{
+	return !((d->status & DBLOCK_STATE_DIRTY) || (d->status & DBLOCK_STATE_DELAYED));
 }
 
 /*
@@ -633,7 +658,9 @@ static inline int tree_insert(struct rb_root *root, struct data_block *data)
 }
 
 #endif /*USE_RADIX*/
+
 /* Release block
+ * FIXME: should hold write_lock on this data node?
  */
 static inline void block_release(struct data_block *d, bool no_lock)
 {
@@ -646,13 +673,14 @@ static inline void block_release(struct data_block *d, bool no_lock)
 		else
 			mutex_lock(&v->block_list_clean_lock);
 	}
+
 	ref_count = atomic_dec_return(&d->ref_count);
 	BUG_ON(ref_count < 0);
-#if FEATURE_DEALY_HASH
-	if (ref_count == 0 && d->status == DBLOCK_STATE_NONE) {
-#else
-	if (ref_count == 0 && !d->dirty) {
-#endif
+
+	if (ref_count > 0)
+		goto unlock_return;
+
+	if (dblock_state_clean(d)) {
 #if DEBUG
 		clean_counter++;
 #endif
@@ -676,7 +704,7 @@ static inline void block_release(struct data_block *d, bool no_lock)
 		else
 			list_add_tail(&d->list, &v->block_list_clean);
 		atomic_inc(&v->block_tokens);
-	} else if (ref_count == 0 && node_not_in_list(&d->list)) {
+	} else if (node_not_in_list(&d->list)) {
 		// Last one holding onto it, its dirty, and its not in the dirty list
 		struct list_head *list;
 		struct mutex *list_lock;
@@ -714,10 +742,14 @@ static inline void block_release(struct data_block *d, bool no_lock)
 
 		list_add_tail(&d->list, list);
 		mutex_unlock(list_lock);
-	} else if (ref_count == 0) {
+	} else {
 		// this shouldn't happen
-		BUG();
+		printk("DEBUG no operation at release: d->type %d d->sector %llu d->status %d\n",
+				d->type, d->sector, d->status);
 	}
+
+unlock_return:
+
 	if (!no_lock) {
 		if (d->type == TYPE_HASH)
 			mutex_unlock(&v->block_list_clean_hash_lock);
@@ -729,10 +761,7 @@ static inline void block_release(struct data_block *d, bool no_lock)
 static inline void block_mark_status(struct data_block *d, uint16_t status)
 {
 	// RACE: 123
-	if (status == DBLOCK_STATE_DIRTY) {
-		d->status = DBLOCK_STATE_DIRTY;
-	} else
-		d->status = status;
+	d->status |= status;
 }
 
 static void block_end_io(struct bio *bio, int error)
@@ -827,7 +856,7 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 
 		d = container_of(pos, struct data_block, list);
 		BUG_ON(atomic_read(&d->ref_count) < 0);
-		if(atomic_read(&d->ref_count) != 0 && !dblock_clean(d))
+		if(atomic_read(&d->ref_count) != 0)
 		{
 			printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu, data %d.\n", atomic_read(&d->ref_count), (unsigned long long)d->sector, data);
 			list_del(&d->list);
@@ -860,20 +889,28 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 
 		// FIXME: rehash block
 		if (d->parent == NULL) {
-			printk("DEBUG null parent encountered: d->type %d d->sector %llu d->level %d d->status %d\n",
-					d->type, d->sector, d->level, d->status);
-			BUG_ON(d->status == DBLOCK_STATE_DELAYED && d->parent == NULL && d->level != v->levels);
+			printk("DEBUG null parent encountered: d->type %d d->sector %llu d->ref_count %d d->level %d d->status %d\n",
+					d->type, d->sector, d->ref_count.counter, d->level, d->status);
+			BUG_ON(dblock_state_delay(d) && d->parent == NULL && d->level != v->levels);
 		}
 		BUG_ON(d->level == v->levels);
 
+		down_write(&d->parent->lock);
+		down_read(&d->lock);
+
 		/* FIXME: assume we never reach root node */
-		if (d->parent && d->status == DBLOCK_STATE_DELAYED) {
+		if (d->parent && dblock_state_delay(d)) {
 			__mintegrity_buffer_hash(v, d->parent->data + d->offset, d->data, v->dev_block_bytes);
-			if (data)
+			block_mark_status(d->parent, DBLOCK_STATE_DIRTY | DBLOCK_STATE_DELAYED);
+			if (data) {
 				block_release(d->parent, false);
-			else
+			} else {
 				block_release(d->parent, true);
+			}
 		}
+
+		up_read(&d->lock);
+		up_write(&d->parent->lock);
 
 
 		// RACE: 123
@@ -967,7 +1004,6 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		d = tree_search(&v->hash_block_tree_root, sector);
 	if(d) {
 		found = true;
-		BUG_ON(d->sector != sector);
 	}
 
 #if DEBUG
@@ -1095,10 +1131,11 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 #endif
 		}
 
+		// XXX
+		BUG_ON(!dblock_state_free(d));
+
 		// Store data pointer, for easier zeroization
 		data = d->data;
-		if (d->status != DBLOCK_STATE_NONE)
-			BUG_ON(d->status != DBLOCK_STATE_NONE);
 		memset(d, 0, sizeof(struct data_block));
 		// Restore pointers
 		d->v = v;
@@ -1161,8 +1198,13 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		int ref_count =  0;
 
 		ref_count = atomic_inc_return(&d->ref_count);
+
+		if (ref_count == 1 && node_not_in_list(&d->list)) {
+			printk("DEBUG not a floating node d->sector %llu d->type %d d->status %d\n",
+					d->sector, d->type, d->status);
+		}
 		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 4);
-		if (ref_count >= 1 && !dblock_clean(d) && !node_not_in_list(&d->list)) {
+		if (ref_count >= 1 && !dblock_state_clean(d) && !node_not_in_list(&d->list)) {
 			//printk(KERN_CRIT "%s %d %s: sector %llu flags %x\n",
 			//	__FILE__, __LINE__, __func__, sector, flags);
 			struct mutex *lock;
@@ -1188,7 +1230,7 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		mutex_lock(&v->block_list_clean_lock);
 		mutex_lock(&v->block_list_clean_hash_lock);
 		mutex_lock(&v->block_list_prefetch_lock);
-		if (ref_count == 1 && d->status == DBLOCK_STATE_NONE) {
+		if (ref_count == 1 && dblock_state_free(d)) {
 			// we're the first to get it and its clean, so we need to move it
 			// out of the free list
 			list_del(&d->list);
@@ -1222,9 +1264,6 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 		//printk(KERN_ERR "2: Done waiting in block_get\n");
 	}
 
-	if (d && d->sector >= v->data_start && d->sector < v->data_start+10)
-		printk("DEBUG d->sector %llu\n", d->sector);
-	
 	return d;
 
 	// printk(KERN_CRIT "block_get end: %ld, %d, %d\n", sector, flags, *tokens);
@@ -1934,14 +1973,16 @@ static void mintegrity_checkpoint_journal(struct dm_mintegrity *v)
 #endif
 	//printk(KERN_ERR "Checkpointing!! \n");
 	if (v->full_journal) {
-		block_write_dirty(v, false, false);
+		// XXX: write data first, then hash block
 		block_write_dirty(v, true, true);
+		block_write_dirty(v, false, false);
 		if (v->two_disks) {
 			blkdev_issue_flush(v->dev->bdev, GFP_KERNEL, NULL);
 		}
 	} else {
-		block_write_dirty(v, false, true);
+		// XXX: write data first, then hash block
 		block_write_dirty(v, true, true);
+		block_write_dirty(v, false, true);
 		if (v->two_disks) {
 			blkdev_issue_flush(v->dev->bdev, GFP_KERNEL, NULL);
 		}
@@ -2496,8 +2537,8 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 		return 1;
 	}
 
-	/* XXX: Here we skip all verified, recently updated nodes */
-	if (ACCESS_ONCE(d->status) == DBLOCK_STATE_NONE) {
+	/* XXX: Here we skip all verified, or recently updated nodes */
+	if (dblock_state_none(d)) {
 		u8 *result;
 
 		if (skip_unverified) {
@@ -2523,7 +2564,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			// Retry once in case of write race condition
 			printk(KERN_DEBUG "%s %d: digest mis-match for the first try (meta %llu block %llu level %d offset %u\n",
 					__func__, __LINE__, (unsigned long long)hash_block, (unsigned long long)block, level, offset);
-			if (ACCESS_ONCE(d->status) == DBLOCK_STATE_VERIFIED) {
+			if (dblock_state_verified(d)) {
 				// FIXME: should we just cast the data_block?
 				goto normal_return;
 			}
@@ -2536,7 +2577,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			result = io_real_digest(v, io);
 
 			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))
-					&& (ACCESS_ONCE(d->status) != DBLOCK_STATE_VERIFIED)) {
+					&& (!dblock_state_verified(d))) {
 				printk(KERN_ERR "Metadata block is corrupted!\n");
 				DMERR_LIMIT("metadata block %llu is corrupted, block %llu, level %d, offset %u",
 					(unsigned long long)hash_block, (unsigned long long)block, level, offset);
@@ -2547,7 +2588,7 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			}
 		}
 #endif
-		d->status = DBLOCK_STATE_VERIFIED;
+		block_mark_status(d, DBLOCK_STATE_VERIFIED);
 	}
 
 normal_return:
@@ -2563,9 +2604,9 @@ normal_return:
 
 	return 0;
 
-	release_ret_r:
-		block_release(d, false);
-		return r;
+release_ret_r:
+	block_release(d, false);
+	return r;
 }
 
 /*
@@ -2887,7 +2928,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		} while (todo);
 
 #if FEATURE_DEALY_HASH
-		data_block->status = DBLOCK_STATE_DELAYED;
+		block_mark_status(data_block, DBLOCK_STATE_DELAYED | DBLOCK_STATE_DIRTY);
 #else
 		// Hash new data
 		r = mintegrity_buffer_hash(io, data, v->dev_block_bytes);
@@ -2965,7 +3006,7 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 		block_release(data_block, false);
 		for (j = 0; j < v->levels; j++) {
 			// Don't release block for delayed hash
-			if (dm_buffers[j]->status == DBLOCK_STATE_DELAYED)
+			if (dblock_state_delay(dm_buffers[j]))
 				continue;
 			block_mark_status(dm_buffers[j], DBLOCK_STATE_DELAYED);
 			queue_delayed_block(v, data_block, dm_buffers[j]);
@@ -2975,9 +3016,6 @@ static int mintegrity_verify_write_io(struct dm_mintegrity_io *io)
 				dm_buffers[j]->parent = dm_buffers[j+1];
 			else
 				dm_buffers[j]->parent = NULL;
-
-			if (dm_buffers[j]->level == 1 && dm_buffers[j]->sector == 50227)
-				printk("DEBUG j %d parent level %d sector %llu ptr %p\n", j, dm_buffers[j-1]->level, dm_buffers[j-1]->sector, dm_buffers[j-1]);
 		}
 #else
 		block_release(data_block, false);
