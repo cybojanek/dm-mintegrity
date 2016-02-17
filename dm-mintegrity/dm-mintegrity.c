@@ -723,7 +723,8 @@ static inline void block_release(struct data_block *d, bool no_lock)
 #endif
 		}
 
-		mutex_lock(list_lock);
+		if (!no_lock)
+			mutex_lock(list_lock);
 /*		printk(KERN_ERR "Checking for page fault. D type is %d \n", d->type);
 		if(!list->prev || !list->prev->next || !list->next || !list->next->prev)
 		{
@@ -741,7 +742,8 @@ static inline void block_release(struct data_block *d, bool no_lock)
                 }
 
 		list_add_tail(&d->list, list);
-		mutex_unlock(list_lock);
+		if (!no_lock)
+			mutex_unlock(list_lock);
 	} else {
 		// this shouldn't happen
 		printk("DEBUG no operation at release: d->type %d d->sector %llu d->status %d\n",
@@ -895,7 +897,6 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		}
 		BUG_ON(d->level == v->levels);
 
-		down_write(&d->parent->lock);
 		down_read(&d->lock);
 
 		/* FIXME: assume we never reach root node */
@@ -910,7 +911,6 @@ static void block_write_dirty(struct dm_mintegrity *v, bool data, bool flush)
 		}
 
 		up_read(&d->lock);
-		up_write(&d->parent->lock);
 
 
 		// RACE: 123
@@ -1195,55 +1195,63 @@ static struct data_block *block_get(struct dm_mintegrity *v, sector_t sector,
 			return NULL;
 		}
 	} else if (found && !prefetch) {
-		int ref_count =  0;
+		int ref_count = 0;
 
-		ref_count = atomic_inc_return(&d->ref_count);
-
-		if (ref_count == 1 && node_not_in_list(&d->list)) {
-			printk("DEBUG not a floating node d->sector %llu d->type %d d->status %d\n",
-					d->sector, d->type, d->status);
-		}
-		// printk(KERN_CRIT "block_get: %ld, %d\n", sector, 4);
-		if (ref_count >= 1 && !dblock_state_clean(d) && !node_not_in_list(&d->list)) {
-			//printk(KERN_CRIT "%s %d %s: sector %llu flags %x\n",
-			//	__FILE__, __LINE__, __func__, sector, flags);
+		if (!dblock_state_clean(d)) {
 			struct mutex *lock;
-			if (d->type == TYPE_HASH) {
+			if (d->type == TYPE_HASH)
 				lock = &v->block_list_hash_dirty_lock;
-#if DEBUG
-		                hash_dirty_counter--;
-#endif
-			} else {
+			else
 				lock = &v->block_list_data_dirty_lock;
+
+			mutex_lock(lock);
+
+			ref_count = atomic_inc_return(&d->ref_count);
+
+			if (ref_count == 1 && node_not_in_list(&d->list)) {
+				printk("DEBUG not a floating node d->sector %llu d->type %d d->status %d\n",
+						d->sector, d->type, d->status);
+			}
+
+			if (ref_count == 1) {
 #if DEBUG
-		                data_dirty_counter--;
+				if (d->type == TYPE_HASH) {
+					hash_dirty_counter--;
+				} else {
+					data_dirty_counter--;
+				}
+#endif
+				list_del(&d->list);
+				INIT_LIST_HEAD(&d->list);
+			}
+
+			mutex_unlock(lock);
+		} else {
+			mutex_lock(&v->block_list_clean_lock);
+			mutex_lock(&v->block_list_clean_hash_lock);
+			mutex_lock(&v->block_list_prefetch_lock);
+
+			ref_count = atomic_inc_return(&d->ref_count);
+
+			if (ref_count == 1 && node_not_in_list(&d->list)) {
+				printk("DEBUG not a floating node d->sector %llu d->type %d d->status %d\n",
+						d->sector, d->type, d->status);
+			}
+
+			if (ref_count == 1) {
+				list_del(&d->list);
+				INIT_LIST_HEAD(&d->list);
+				*tokens -= 1;
+#if DEBUG
+				clean_counter--;
 #endif
 			}
 
-			mutex_lock(lock);
-			list_del(&d->list);
-			INIT_LIST_HEAD(&d->list);
-			mutex_unlock(lock);
+			mutex_unlock(&v->block_list_prefetch_lock);
+			mutex_unlock(&v->block_list_clean_hash_lock);
+			mutex_unlock(&v->block_list_clean_lock);
 		}
 
-		// Its in our buffer, its not a prefetch, so reuse it
-		mutex_lock(&v->block_list_clean_lock);
-		mutex_lock(&v->block_list_clean_hash_lock);
-		mutex_lock(&v->block_list_prefetch_lock);
-		if (ref_count == 1 && dblock_state_free(d)) {
-			// we're the first to get it and its clean, so we need to move it
-			// out of the free list
-			list_del(&d->list);
-			INIT_LIST_HEAD(&d->list);
-			*tokens -= 1;
-#if DEBUG
-	                clean_counter--;
-#endif
-		}
-
-		mutex_unlock(&v->block_list_prefetch_lock);
-		mutex_unlock(&v->block_list_clean_hash_lock);
-		mutex_unlock(&v->block_list_clean_lock);
 	}
 
 	// TODO: prefetch? move to tail?
@@ -1737,11 +1745,14 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 
 #if TRICK
 		while (true) {
+			long wait_result;
 			if (atomic_read(&v->j_pending_commit) == 0)
 				break;
 
 			init_completion(&v->j_pending_event);
-			wait_for_completion(&v->j_pending_event);
+			wait_result = wait_for_completion_timeout(&v->j_pending_event, 10000);
+			if (wait_result == 0)
+				printk("DEBUG time_out used up pending = %d\n", atomic_read(&v->j_pending_commit));
 		}
 #else
 		while (true) {
@@ -1810,11 +1821,14 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 		//printk(KERN_ERR "Journal is totally full!!");
 #if TRICK
 		while (true) {
+			long wait_result;
 			if (atomic_read(&v->j_pending_commit) == 0)
 				break;
 
 			init_completion(&v->j_pending_event);
-			wait_for_completion(&v->j_pending_event);
+			wait_result = wait_for_completion_timeout(&v->j_pending_event, 10000);
+			if (wait_result == 0)
+				printk("DEBUG time_out used up pending = %d\n", atomic_read(&v->j_pending_commit));
 		}
 #else
 		while (true) {
