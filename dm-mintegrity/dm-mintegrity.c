@@ -37,7 +37,8 @@
 #define COARSE_LOCK 0
 
 #define FEATURE_PREFETCH 0
-#define FEATURE_EVICTOR 0
+
+#define FEATURE_EVICTOR 1
 
 #define FEATURE_DEALY_HASH 1
 
@@ -2578,8 +2579,8 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 #else
 		if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))) {
 			// Retry once in case of write race condition
-			printk(KERN_DEBUG "%s %d: digest mis-match for the first try (meta %llu block %llu level %d offset %u\n",
-					__func__, __LINE__, (unsigned long long)hash_block, (unsigned long long)block, level, offset);
+			printk(KERN_DEBUG "%s %d: digest mis-match for the first try (meta %llu block %llu level %d offset %u status %d\n",
+					__func__, __LINE__, (unsigned long long)hash_block, (unsigned long long)block, level, offset, d->status);
 			if (dblock_state_verified(d)) {
 				// FIXME: should we just cast the data_block?
 				goto normal_return;
@@ -2595,8 +2596,8 @@ static int mintegrity_verify_level(struct dm_mintegrity_io *io, sector_t block,
 			if (unlikely(memcmp(result, io_want_digest(v, io), v->digest_size))
 					&& (!dblock_state_verified(d))) {
 				printk(KERN_ERR "Metadata block is corrupted!\n");
-				DMERR_LIMIT("metadata block %llu is corrupted, block %llu, level %d, offset %u",
-					(unsigned long long)hash_block, (unsigned long long)block, level, offset);
+				DMERR_LIMIT("metadata block %llu is corrupted, block %llu, level %d, offset %u status %d",
+					(unsigned long long)hash_block, (unsigned long long)block, level, offset, d->status);
 				v->hash_failed = 1;
 				dump_stack();
 				r = -EIO;
@@ -2695,6 +2696,9 @@ static int mintegrity_verify_read_io(struct dm_mintegrity_io *io)
 #if COARSE_LOCK
 				mutex_unlock(&v->block_tree_lock);
 #endif
+
+				printk("DEBUG hash level %d verification failed, d->sector %llu d->type %d d->status %d\n",
+						i, data_sector, 0, 0);
 
 				if(tokens)
 					mintegrity_return_memory_tokens(v, tokens);
@@ -3259,9 +3263,9 @@ static void mintegrity_submit_prefetch(struct dm_mintegrity *v,
 
 #if FEATURE_EVICTOR
 
-#define EVICTOR_TIMEOUT 100
+#define EVICTOR_TIMEOUT 1000
 /* background evictor thread */
-static int mintegrity_evitor(void *ptr)
+static int mintegrity_evictor(void *ptr)
 {
 	struct dm_mintegrity *v = ptr;
 
@@ -3298,7 +3302,7 @@ static int mintegrity_evitor(void *ptr)
 
 			d = container_of(pos, struct data_block, list);
 
-			if(atomic_read(&d->ref_count) != 0 && !dblock_clean(d)) {
+			if(atomic_read(&d->ref_count) != 0 && !dblock_state_clean(d)) {
 				printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu\n",
 						atomic_read(&d->ref_count), (unsigned long long)d->sector);
 				list_del(&d->list);
@@ -3309,6 +3313,23 @@ static int mintegrity_evitor(void *ptr)
 			list_del(&d->list);
 			init_completion(&d->event);
 			d->completion_initialized = true;
+
+#if FEATURE_DEALY_HASH
+			if (d->parent == NULL) {
+				printk("DEBUG null parent encountered: d->type %d d->sector %llu d->ref_count %d d->level %d d->status %d\n",
+						d->type, d->sector, d->ref_count.counter, d->level, d->status);
+				BUG_ON(dblock_state_delay(d) && d->parent == NULL && d->level != v->levels);
+			}
+			BUG_ON(d->level == v->levels);
+
+			down_read(&d->lock);
+			if (d->parent && dblock_state_delay(d)) {
+				__mintegrity_buffer_hash(v, d->parent->data + d->offset, d->data, v->dev_block_bytes);
+				block_mark_status(d->parent, DBLOCK_STATE_DIRTY | DBLOCK_STATE_DELAYED);
+				block_release(d->parent, false);
+			}
+			up_read(&d->lock);
+#endif
 
 			list_add_tail(&d->list, &v->block_list_clean);
 
@@ -3355,7 +3376,7 @@ static int mintegrity_evitor(void *ptr)
 
 			d = container_of(pos, struct data_block, list);
 
-			if(atomic_read(&d->ref_count) != 0 && d->dirty) {
+			if(atomic_read(&d->ref_count) != 0 && dblock_state_dirty(d)) {
 				printk(KERN_ERR "This shouldnt happen. The ref count of d is %d, sector %llu\n",
 						atomic_read(&d->ref_count), (unsigned long long)d->sector);
 				list_del(&d->list);
@@ -3369,7 +3390,24 @@ static int mintegrity_evitor(void *ptr)
 
 			list_add_tail(&d->list, &v->block_list_clean_hash);
 
-			d->dirty = false;
+#if FEATURE_DEALY_HASH
+			if (d->parent == NULL) {
+				printk("DEBUG null parent encountered: d->type %d d->sector %llu d->ref_count %d d->level %d d->status %d\n",
+						d->type, d->sector, d->ref_count.counter, d->level, d->status);
+				BUG_ON(dblock_state_delay(d) && d->parent == NULL && d->level != v->levels);
+			}
+			BUG_ON(d->level == v->levels);
+
+			down_read(&d->lock);
+			if (d->parent && dblock_state_delay(d)) {
+				__mintegrity_buffer_hash(v, d->parent->data + d->offset, d->data, v->dev_block_bytes);
+				block_mark_status(d->parent, DBLOCK_STATE_DIRTY | DBLOCK_STATE_DELAYED);
+				block_release(d->parent, true);
+			}
+			up_read(&d->lock);
+#endif
+
+			d->status = DBLOCK_STATE_NONE;
 
 			bio = &d->bio;
 			bio_init(bio);
@@ -4267,7 +4305,7 @@ static int mintegrity_ctr(struct dm_target *ti, unsigned argc, char **argv)
 	barrier();
 
 #if FEATURE_EVICTOR
-	v->evict_task = kthread_run(mintegrity_evitor, v, "dmm_evictor-%p", v);
+	v->evict_task = kthread_run(mintegrity_evictor, v, "dmm_evictor-%p", v);
 #endif
 
         printk(KERN_DEBUG "dm-mintegrity init:\n"
