@@ -1688,6 +1688,8 @@ static void mintegrity_read_journal_block(struct journal_block **jb,
 
 #if TRICK
 
+#define J_PENDING_TIMEOUT	100
+
 static inline int mintegrity_get_journal_ref(struct dm_mintegrity *v)
 {
 	return atomic_inc_return(&v->j_pending_commit);
@@ -1750,7 +1752,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 				break;
 
 			init_completion(&v->j_pending_event);
-			wait_result = wait_for_completion_timeout(&v->j_pending_event, 10000);
+			wait_result = wait_for_completion_interruptible_timeout(&v->j_pending_event, J_PENDING_TIMEOUT);
 			if (wait_result == 0)
 				printk("DEBUG time_out used up pending = %d\n", atomic_read(&v->j_pending_commit));
 		}
@@ -1826,7 +1828,7 @@ static void mintegrity_commit_journal(struct dm_mintegrity *v, bool flush)
 				break;
 
 			init_completion(&v->j_pending_event);
-			wait_result = wait_for_completion_timeout(&v->j_pending_event, 10000);
+			wait_result = wait_for_completion_interruptible_timeout(&v->j_pending_event, J_PENDING_TIMEOUT);
 			if (wait_result == 0)
 				printk("DEBUG time_out used up pending = %d\n", atomic_read(&v->j_pending_commit));
 		}
